@@ -75,6 +75,13 @@ pub enum MenuSection {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuTabAction {
+    MoveSection(isize),
+    SwitchAccount(isize),
+    SwitchFeed(isize),
+}
+
 impl MenuSection {
     pub fn label(self) -> &'static str {
         match self {
@@ -101,6 +108,15 @@ impl MenuSection {
             Self::Feeds => Self::Accounts,
             Self::Settings => Self::Feeds,
         }
+    }
+}
+
+fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
+    let delta = if reverse { -1 } else { 1 };
+    match section {
+        MenuSection::Accounts => MenuTabAction::SwitchAccount(delta),
+        MenuSection::Feeds => MenuTabAction::SwitchFeed(delta),
+        MenuSection::Keys | MenuSection::Settings => MenuTabAction::MoveSection(delta),
     }
 }
 
@@ -236,6 +252,11 @@ enum AppEvent {
     WriteCompleted {
         result: AppTaskResult<WriteResult>,
     },
+    NotificationCountLoaded {
+        request_id: RequestId,
+        account_did: String,
+        result: AppTaskResult<u64>,
+    },
 }
 
 type AppTaskResult<T> = std::result::Result<T, String>;
@@ -310,21 +331,26 @@ pub struct App {
     pub active_feed: usize,
     pub home_feed_prefs: HomeFeedPrefs,
     pub status: String,
+    status_expires_at: Option<Instant>,
     pub input_mode: InputMode,
     pub overlay: Option<Overlay>,
     pub should_quit: bool,
     pub pending_new_items: Vec<FeedItem>,
+    pub unread_notifications: u64,
     events_tx: UnboundedSender<AppEvent>,
     events_rx: UnboundedReceiver<AppEvent>,
     next_request_id: RequestId,
     pending_feed: Option<RequestId>,
     pending_pagination: Option<RequestId>,
     pending_refresh: Option<RequestId>,
+    pending_notification_count: Option<RequestId>,
     pending_thread: Option<RequestId>,
     pending_account: Option<RequestId>,
     pending_writes: usize,
     last_refresh: Instant,
     refresh_interval: Duration,
+    last_notification_poll: Instant,
+    notification_interval: Duration,
     last_video_frame: Instant,
 }
 
@@ -359,6 +385,7 @@ impl App {
         let status = session_status
             .or(pref_status)
             .unwrap_or_else(|| format!("Logged in as @{handle}"));
+        let now = Instant::now();
         Ok(Self {
             client,
             nav: NavigationStack::new(timeline),
@@ -368,22 +395,27 @@ impl App {
             active_feed: 0,
             home_feed_prefs,
             status,
+            status_expires_at: Some(now + Duration::from_secs(2)),
             input_mode: InputMode::Normal,
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
+            unread_notifications: 0,
             events_tx,
             events_rx,
             next_request_id: 1,
             pending_feed: None,
             pending_pagination: None,
             pending_refresh: None,
+            pending_notification_count: None,
             pending_thread: None,
             pending_account: None,
             pending_writes: 0,
-            last_refresh: Instant::now(),
+            last_refresh: now,
             refresh_interval: Duration::from_secs(60),
-            last_video_frame: Instant::now(),
+            last_notification_poll: now - Duration::from_secs(60),
+            notification_interval: Duration::from_secs(60),
+            last_video_frame: now,
         })
     }
 
@@ -411,12 +443,36 @@ impl App {
         });
     }
 
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.status_expires_at = Some(Instant::now() + Duration::from_secs(2));
+    }
+
+    pub fn visible_status(&self) -> Option<&str> {
+        if self.status.is_empty() {
+            return None;
+        }
+        if self
+            .status_expires_at
+            .is_some_and(|expires_at| Instant::now() <= expires_at)
+        {
+            Some(&self.status)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn expire_status_for_test(&mut self) {
+        self.status_expires_at = Some(Instant::now() - Duration::from_secs(1));
+    }
+
     fn apply_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
             AppEvent::ImageLoaded { url, result } => {
                 self.media.finish_load(url.clone(), result);
                 if matches!(self.media.state_name(&url), "ready") {
-                    self.status = "Image loaded".into();
+                    self.set_status("Image loaded");
                 }
             }
             AppEvent::VideoLoaded {
@@ -424,11 +480,11 @@ impl App {
                 result,
             } => {
                 self.media.finish_video_load(playlist_url.clone(), result);
-                self.status = match self.media.video_state_name(&playlist_url) {
-                    "ready" => "Video frames ready".into(),
-                    "failed" => "Video decode failed".into(),
-                    _ => self.status.clone(),
-                };
+                match self.media.video_state_name(&playlist_url) {
+                    "ready" => self.set_status("Video frames ready"),
+                    "failed" => self.set_status("Video decode failed"),
+                    _ => {}
+                }
             }
             AppEvent::FeedLoaded {
                 request_id,
@@ -477,12 +533,27 @@ impl App {
                 }
             }
             AppEvent::LinkOpened { uri, result } => match result {
-                Ok(()) => self.status = format!("Opened {uri}"),
-                Err(error) => self.status = format!("Could not open link: {error}"),
+                Ok(()) => self.set_status(format!("Opened {uri}")),
+                Err(error) => self.set_status(format!("Could not open link: {error}")),
             },
             AppEvent::WriteCompleted { result } => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 self.apply_write_result(result);
+            }
+            AppEvent::NotificationCountLoaded {
+                request_id,
+                account_did,
+                result,
+            } => {
+                if self.pending_notification_count == Some(request_id) {
+                    self.pending_notification_count = None;
+                    if account_did == self.client.session().did {
+                        match result {
+                            Ok(count) => self.unread_notifications = count,
+                            Err(_) => self.unread_notifications = 0,
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -496,15 +567,15 @@ impl App {
                 InputMode::Search { buffer } => match key.code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
-                        self.status = "Search cancelled".into();
+                        self.set_status("Search cancelled");
                     }
                     KeyCode::Enter => {
                         let query = buffer.clone();
                         self.input_mode = InputMode::Normal;
                         if self.nav.current_mut().search_next(&query) {
-                            self.status = format!("Search: {query}");
+                            self.set_status(format!("Search: {query}"));
                         } else {
-                            self.status = format!("No match: {query}");
+                            self.set_status(format!("No match: {query}"));
                         }
                     }
                     KeyCode::Backspace => {
@@ -552,12 +623,18 @@ impl App {
                 }
                 KeyCode::Char('j') | KeyCode::Down => state.next(),
                 KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                KeyCode::Char(' ') => match state.section {
-                    MenuSection::Accounts => action = Action::SwitchAccount(1),
-                    MenuSection::Feeds => action = Action::SwitchFeed(1),
-                    MenuSection::Keys | MenuSection::Settings => {}
-                },
-                KeyCode::Char('a') => action = Action::SwitchAccount(1),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    match menu_tab_action(state.section, matches!(key.code, KeyCode::BackTab)) {
+                        MenuTabAction::MoveSection(delta) if delta > 0 => state.next(),
+                        MenuTabAction::MoveSection(_) => state.previous(),
+                        MenuTabAction::SwitchAccount(delta) => {
+                            action = Action::SwitchAccount(delta);
+                        }
+                        MenuTabAction::SwitchFeed(delta) => {
+                            action = Action::SwitchFeed(delta);
+                        }
+                    }
+                }
                 KeyCode::Char('[') => action = Action::SwitchFeed(-1),
                 KeyCode::Char(']') => action = Action::SwitchFeed(1),
                 _ => {}
@@ -630,14 +707,14 @@ impl App {
                 if let Some(uri) = uri {
                     self.open_uri(uri);
                 } else {
-                    self.status = "No external media URL for selected item".into();
+                    self.set_status("No external media URL for selected item");
                 }
             }
             Action::PlayVideo(video) => {
                 if let Some(video) = video {
                     self.queue_video_load(&video);
                 } else {
-                    self.status = "Selected media is not a video".into();
+                    self.set_status("Selected media is not a video");
                 }
             }
             Action::SubmitComposer(state) => {
@@ -677,23 +754,23 @@ impl App {
                 self.input_mode = InputMode::Search {
                     buffer: String::new(),
                 };
-                self.status = "Search current view".into();
+                self.set_status("Search current view");
             }
             KeyCode::Char('n') => {
                 let query = self.nav.current().search_query.clone();
                 if let Some(query) = query {
                     if self.nav.current_mut().search_next(&query) {
-                        self.status = format!("Search: {query}");
+                        self.set_status(format!("Search: {query}"));
                     } else {
-                        self.status = format!("No match: {query}");
+                        self.set_status(format!("No match: {query}"));
                     }
                 }
             }
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                 if self.nav.pop() {
-                    self.status = "Back".into();
+                    self.set_status("Back");
                 } else {
-                    self.status = "Already at timeline".into();
+                    self.set_status("Already at timeline");
                 }
             }
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
@@ -712,18 +789,18 @@ impl App {
 
     async fn open_media_overlay_for_selected(&mut self) -> Result<()> {
         let Some(item) = self.nav.current().selected_item().cloned() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return Ok(());
         };
         let media = preview_media(&item);
         if media.is_empty() {
-            self.status = "No media on selected post".into();
+            self.set_status("No media on selected post");
             return Ok(());
         }
 
         self.queue_media_thumbnail_loads(&media);
         self.overlay = Some(Overlay::Media(MediaOverlayState::new(media)));
-        self.status = "Media preview".into();
+        self.set_status("Media preview");
         Ok(())
     }
 
@@ -761,9 +838,9 @@ impl App {
     fn queue_video_load(&mut self, video: &PreviewVideo) {
         if !self.media.should_load_video(video) {
             match self.media.video_state_name(&video.playlist_url) {
-                "ready" => self.status = "Video frames ready".into(),
-                "loading" => self.status = "Video decode already running".into(),
-                "failed" => self.status = "Video decode previously failed".into(),
+                "ready" => self.set_status("Video frames ready"),
+                "loading" => self.set_status("Video decode already running"),
+                "failed" => self.set_status("Video decode previously failed"),
                 _ => {}
             }
             return;
@@ -771,10 +848,10 @@ impl App {
 
         self.media.mark_video_loading(video);
         let Some(job) = self.media.video_job(video) else {
-            self.status = "Video rendering disabled".into();
+            self.set_status("Video rendering disabled");
             return;
         };
-        self.status = "Decoding video frames".into();
+        self.set_status("Decoding video frames");
         self.spawn_event(async move {
             let (playlist_url, result) = job.run().await;
             AppEvent::VideoLoaded {
@@ -786,12 +863,12 @@ impl App {
 
     fn open_links_for_selected(&mut self) {
         let Some(item) = self.nav.current().selected_item() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return;
         };
         let links = item_links(item);
         match links.len() {
-            0 => self.status = "No links on selected post".into(),
+            0 => self.set_status("No links on selected post"),
             1 => self.open_link(links.into_iter().next().expect("one link")),
             _ => self.overlay = Some(Overlay::Links(LinkPickerState::new(links))),
         }
@@ -802,7 +879,7 @@ impl App {
     }
 
     fn open_uri(&mut self, uri: String) {
-        self.status = format!("Opening {uri}");
+        self.set_status(format!("Opening {uri}"));
         self.spawn_event(async move {
             let opened_uri = uri.clone();
             #[cfg(test)]
@@ -821,7 +898,7 @@ impl App {
 
     async fn switch_feed_delta(&mut self, delta: isize) -> Result<()> {
         if self.feeds.len() <= 1 {
-            self.status = "No other feeds saved".into();
+            self.set_status("No other feeds saved");
             return Ok(());
         }
 
@@ -837,7 +914,7 @@ impl App {
 
     async fn switch_account_delta(&mut self, delta: isize) -> Result<()> {
         if self.accounts.len() <= 1 {
-            self.status = "No other accounts saved".into();
+            self.set_status("No other accounts saved");
             return Ok(());
         }
 
@@ -858,7 +935,7 @@ impl App {
         let id = self.next_request_id();
         self.pending_feed = Some(id);
         self.nav.current_mut().loading = true;
-        self.status = status;
+        self.set_status(status);
         let mut client = self.client.clone();
         let prefs = self.home_feed_prefs;
         self.spawn_event(async move {
@@ -877,7 +954,7 @@ impl App {
         let id = self.next_request_id();
         let uri = action.root_uri().to_owned();
         self.pending_thread = Some(id);
-        self.status = action.loading_status();
+        self.set_status(action.loading_status());
         let mut client = self.client.clone();
         self.spawn_event(async move {
             let result = client
@@ -896,7 +973,7 @@ impl App {
     fn queue_account_switch(&mut self, account: AccountSession) {
         let id = self.next_request_id();
         self.pending_account = Some(id);
-        self.status = format!("Switching to @{}", account.session.handle);
+        self.set_status(format!("Switching to @{}", account.session.handle));
         let store = self.client.store();
         self.spawn_event(async move {
             let mut client = BskyClient::new(account.session.clone(), store);
@@ -943,11 +1020,11 @@ impl App {
                 self.nav = NavigationStack::new(view);
                 self.pending_new_items.clear();
                 self.last_refresh = Instant::now();
-                self.status = format!("Loaded {}", source.label);
+                self.set_status(format!("Loaded {}", source.label));
             }
             Err(error) => {
                 self.nav.current_mut().error = Some(error);
-                self.status = "Feed load failed".into();
+                self.set_status("Feed load failed");
             }
         }
     }
@@ -969,11 +1046,11 @@ impl App {
                 current.items.append(&mut items);
                 current.layout_cache.clear();
                 current.cursor = cursor;
-                self.status = "Loaded more timeline posts".into();
+                self.set_status("Loaded more timeline posts");
             }
             Err(error) => {
                 current.error = Some(error);
-                self.status = "Pagination failed".into();
+                self.set_status("Pagination failed");
             }
         }
     }
@@ -995,7 +1072,7 @@ impl App {
         let refreshed = match result {
             Ok(items) => items,
             Err(error) => {
-                self.status = format!("Refresh check failed: {error}");
+                self.set_status(format!("Refresh check failed: {error}"));
                 return;
             }
         };
@@ -1013,7 +1090,10 @@ impl App {
         if self.is_current_timeline_at_top() {
             self.merge_pending_new_items(false);
         } else {
-            self.status = format!("{} new posts pending", self.pending_new_items.len());
+            self.set_status(format!(
+                "{} new posts pending",
+                self.pending_new_items.len()
+            ));
         }
     }
 
@@ -1039,7 +1119,7 @@ impl App {
                         }
                     }
                 });
-                self.status = if liked { "Liked post" } else { "Removed like" }.into();
+                self.set_status(if liked { "Liked post" } else { "Removed like" });
             }
             Ok(WriteResult::Repost {
                 target_uri,
@@ -1061,18 +1141,17 @@ impl App {
                         }
                     }
                 });
-                self.status = if reposted {
+                self.set_status(if reposted {
                     "Reposted"
                 } else {
                     "Removed repost"
-                }
-                .into();
+                });
             }
             Ok(WriteResult::Posted { uri }) => {
-                self.status = format!("Posted {uri}");
+                self.set_status(format!("Posted {uri}"));
                 self.last_refresh = Instant::now() - self.refresh_interval;
             }
-            Err(error) => self.status = format!("Write failed: {error}"),
+            Err(error) => self.set_status(format!("Write failed: {error}")),
         }
     }
 
@@ -1083,14 +1162,14 @@ impl App {
                 title,
                 kind,
             } => match result {
-                Ok(items) if items.is_empty() => self.status = "No replies available".into(),
+                Ok(items) if items.is_empty() => self.set_status("No replies available"),
                 Ok(items) => {
                     let mut view = ViewState::new(title, kind, items);
                     view.select_uri(&selected_uri);
                     self.nav.push(view);
-                    self.status = "Thread loaded".into();
+                    self.set_status("Thread loaded");
                 }
-                Err(error) => self.status = format!("Thread load failed: {error}"),
+                Err(error) => self.set_status(format!("Thread load failed: {error}")),
             },
             ThreadAction::OpenQuote { quote } => match result {
                 Ok(mut items) => {
@@ -1106,7 +1185,7 @@ impl App {
                     );
                     view.select_uri(&quote.uri);
                     self.nav.push(view);
-                    self.status = "Quote loaded".into();
+                    self.set_status("Quote loaded");
                 }
                 Err(error) => {
                     self.nav.push(ViewState::new(
@@ -1116,7 +1195,7 @@ impl App {
                         },
                         vec![feed_item_from_quote(*quote, 0)],
                     ));
-                    self.status = format!("Quote preview only: {error}");
+                    self.set_status(format!("Quote preview only: {error}"));
                 }
             },
             ThreadAction::Reload {
@@ -1130,9 +1209,9 @@ impl App {
                         selected_uri.as_deref(),
                         Some(&root_uri),
                     );
-                    self.status = "View refreshed".into();
+                    self.set_status("View refreshed");
                 }
-                Err(error) => self.status = format!("Refresh failed: {error}"),
+                Err(error) => self.set_status(format!("Refresh failed: {error}")),
             },
         }
     }
@@ -1151,22 +1230,24 @@ impl App {
                     data.feeds
                 };
                 self.active_feed = 0;
+                self.unread_notifications = 0;
                 let mut view =
                     ViewState::new(self.feeds[0].label.clone(), ViewKind::Timeline, data.items);
                 view.cursor = data.cursor;
                 self.nav = NavigationStack::new(view);
                 self.pending_new_items.clear();
                 self.last_refresh = Instant::now();
-                self.status = format!("Switched to @{}", self.client.session().handle);
+                self.last_notification_poll = Instant::now() - self.notification_interval;
+                self.set_status(format!("Switched to @{}", self.client.session().handle));
             }
-            Err(error) => self.status = format!("Account switch failed: {error}"),
+            Err(error) => self.set_status(format!("Account switch failed: {error}")),
         }
         Ok(())
     }
 
     async fn open_thread_for_selected(&mut self) -> Result<()> {
         let Some(selected) = self.nav.current().selected_item().cloned() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return Ok(());
         };
 
@@ -1187,7 +1268,7 @@ impl App {
             .selected_item()
             .and_then(|item| item.quote.clone())
         else {
-            self.status = "Selected post has no quote embed".into();
+            self.set_status("Selected post has no quote embed");
             return Ok(());
         };
 
@@ -1200,7 +1281,7 @@ impl App {
                 },
                 vec![item],
             ));
-            self.status = "Opened quoted post preview".into();
+            self.set_status("Opened quoted post preview");
             return Ok(());
         }
 
@@ -1237,16 +1318,16 @@ impl App {
             kind: ComposerKind::Post,
             buffer: String::new(),
         }));
-        self.status = "Compose post".into();
+        self.set_status("Compose post");
     }
 
     fn open_reply_composer(&mut self) {
         let Some(item) = self.nav.current().selected_item().cloned() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return;
         };
         let Some(parent) = post_ref_from_item(&item) else {
-            self.status = "Selected post is missing a CID; cannot reply".into();
+            self.set_status("Selected post is missing a CID; cannot reply");
             return;
         };
         let root = item.reply_root.clone().unwrap_or_else(|| parent.clone());
@@ -1258,16 +1339,16 @@ impl App {
             },
             buffer: String::new(),
         }));
-        self.status = "Compose reply".into();
+        self.set_status("Compose reply");
     }
 
     fn open_quote_composer(&mut self) {
         let Some(item) = self.nav.current().selected_item().cloned() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return;
         };
         let Some(quote) = post_ref_from_item(&item) else {
-            self.status = "Selected post is missing a CID; cannot quote".into();
+            self.set_status("Selected post is missing a CID; cannot quote");
             return;
         };
         self.overlay = Some(Overlay::Composer(ComposerState {
@@ -1277,17 +1358,17 @@ impl App {
             },
             buffer: String::new(),
         }));
-        self.status = "Compose quote".into();
+        self.set_status("Compose quote");
     }
 
     fn submit_composer(&mut self, state: ComposerState) {
         let text = state.buffer.trim().to_owned();
         if text.is_empty() {
-            self.status = "Post text is empty".into();
+            self.set_status("Post text is empty");
             return;
         }
         if text.chars().count() > 300 {
-            self.status = "Post is over 300 characters".into();
+            self.set_status("Post is over 300 characters");
             return;
         }
 
@@ -1299,7 +1380,7 @@ impl App {
 
         self.overlay = None;
         self.pending_writes = self.pending_writes.saturating_add(1);
-        self.status = "Posting".into();
+        self.set_status("Posting");
         let mut client = self.client.clone();
         self.spawn_event(async move {
             let result = client
@@ -1313,20 +1394,20 @@ impl App {
 
     fn toggle_like_selected(&mut self) {
         let Some(item) = self.nav.current().selected_item().cloned() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return;
         };
         let Some(subject) = post_ref_from_item(&item) else {
-            self.status = "Selected post is missing a CID; cannot like".into();
+            self.set_status("Selected post is missing a CID; cannot like");
             return;
         };
 
         self.pending_writes = self.pending_writes.saturating_add(1);
-        self.status = if item.viewer_like.is_some() {
-            "Removing like".into()
+        self.set_status(if item.viewer_like.is_some() {
+            "Removing like"
         } else {
-            "Liking post".into()
-        };
+            "Liking post"
+        });
         let target_uri = item.uri.clone();
         let existing = item.viewer_like.clone();
         let mut client = self.client.clone();
@@ -1356,20 +1437,20 @@ impl App {
 
     fn toggle_repost_selected(&mut self) {
         let Some(item) = self.nav.current().selected_item().cloned() else {
-            self.status = "No selected post".into();
+            self.set_status("No selected post");
             return;
         };
         let Some(subject) = post_ref_from_item(&item) else {
-            self.status = "Selected post is missing a CID; cannot repost".into();
+            self.set_status("Selected post is missing a CID; cannot repost");
             return;
         };
 
         self.pending_writes = self.pending_writes.saturating_add(1);
-        self.status = if item.viewer_repost.is_some() {
-            "Removing repost".into()
+        self.set_status(if item.viewer_repost.is_some() {
+            "Removing repost"
         } else {
-            "Reposting".into()
-        };
+            "Reposting"
+        });
         let target_uri = item.uri.clone();
         let existing = item.viewer_repost.clone();
         let mut client = self.client.clone();
@@ -1461,6 +1542,31 @@ impl App {
         });
     }
 
+    pub fn maybe_poll_notifications(&mut self) {
+        if self.pending_notification_count.is_some()
+            || self.last_notification_poll.elapsed() < self.notification_interval
+        {
+            return;
+        }
+
+        let id = self.next_request_id();
+        self.pending_notification_count = Some(id);
+        self.last_notification_poll = Instant::now();
+        let account_did = self.client.session().did.clone();
+        let mut client = self.client.clone();
+        self.spawn_event(async move {
+            let result = client
+                .get_unread_notification_count()
+                .await
+                .map_err(|error| format!("{error:#}"));
+            AppEvent::NotificationCountLoaded {
+                request_id: id,
+                account_did,
+                result,
+            }
+        });
+    }
+
     fn is_current_timeline_at_top(&self) -> bool {
         let current = self.nav.current();
         matches!(current.kind, ViewKind::Timeline) && current.selected == 0 && current.scroll == 0
@@ -1471,7 +1577,7 @@ impl App {
             || !matches!(self.nav.current().kind, ViewKind::Timeline)
         {
             if explicit {
-                self.status = "No pending posts".into();
+                self.set_status("No pending posts");
             }
             return;
         }
@@ -1484,7 +1590,7 @@ impl App {
         current.selected = 0;
         current.scroll = 0;
         current.layout_cache.clear();
-        self.status = format!("Loaded {count} new posts");
+        self.set_status(format!("Loaded {count} new posts"));
     }
 
     pub fn pending_new_count(&self) -> usize {
@@ -1495,9 +1601,30 @@ impl App {
         self.pending_feed.is_some()
             || self.pending_pagination.is_some()
             || self.pending_refresh.is_some()
+            || self.pending_notification_count.is_some()
             || self.pending_thread.is_some()
             || self.pending_account.is_some()
             || self.pending_writes > 0
+    }
+
+    pub fn pending_task_label(&self) -> Option<&'static str> {
+        if self.pending_account.is_some() {
+            Some("Switching account")
+        } else if self.pending_feed.is_some() {
+            Some("Loading feed")
+        } else if self.pending_thread.is_some() {
+            Some("Loading thread")
+        } else if self.pending_pagination.is_some() {
+            Some("Loading more")
+        } else if self.pending_writes > 0 {
+            Some("Writing")
+        } else if self.pending_refresh.is_some() {
+            Some("Refreshing")
+        } else if self.pending_notification_count.is_some() {
+            Some("Checking notifications")
+        } else {
+            None
+        }
     }
 
     pub fn current_position_label(&self) -> String {
@@ -1605,6 +1732,7 @@ pub async fn run_tui(
     loop {
         app.drain_events()?;
         app.maybe_refresh_active_feed();
+        app.maybe_poll_notifications();
         app.advance_video_frame();
         terminal.draw(|frame| ui::render(frame, &mut app))?;
         if app.should_quit {
@@ -1680,6 +1808,26 @@ mod tests {
         assert_eq!(state.section, MenuSection::Feeds);
         state.previous();
         assert_eq!(state.section, MenuSection::Accounts);
+    }
+
+    #[test]
+    fn menu_tab_maps_to_section_account_and_feed_actions() {
+        assert_eq!(
+            menu_tab_action(MenuSection::Keys, false),
+            MenuTabAction::MoveSection(1)
+        );
+        assert_eq!(
+            menu_tab_action(MenuSection::Settings, true),
+            MenuTabAction::MoveSection(-1)
+        );
+        assert_eq!(
+            menu_tab_action(MenuSection::Accounts, false),
+            MenuTabAction::SwitchAccount(1)
+        );
+        assert_eq!(
+            menu_tab_action(MenuSection::Feeds, true),
+            MenuTabAction::SwitchFeed(-1)
+        );
     }
 
     #[tokio::test]
@@ -1774,6 +1922,64 @@ mod tests {
         assert_eq!(app.pending_writes, 0);
     }
 
+    #[test]
+    fn status_messages_expire() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+
+        app.set_status("Loaded 1 new post");
+        assert_eq!(app.visible_status(), Some("Loaded 1 new post"));
+        app.expire_status_for_test();
+
+        assert_eq!(app.visible_status(), None);
+    }
+
+    #[test]
+    fn pending_task_label_survives_expired_status() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+
+        app.set_status("Loading Following");
+        app.expire_status_for_test();
+        app.pending_feed = Some(1);
+
+        assert_eq!(app.visible_status(), None);
+        assert_eq!(app.pending_task_label(), Some("Loading feed"));
+    }
+
+    #[test]
+    fn stale_notification_count_events_are_ignored() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.pending_notification_count = Some(2);
+
+        app.apply_event(AppEvent::NotificationCountLoaded {
+            request_id: 1,
+            account_did: "did:plc:alice".into(),
+            result: Ok(5),
+        })
+        .unwrap();
+
+        assert_eq!(app.unread_notifications, 0);
+        assert_eq!(app.pending_notification_count, Some(2));
+
+        app.apply_event(AppEvent::NotificationCountLoaded {
+            request_id: 2,
+            account_did: "did:plc:other".into(),
+            result: Ok(5),
+        })
+        .unwrap();
+
+        assert_eq!(app.unread_notifications, 0);
+
+        app.pending_notification_count = Some(3);
+        app.apply_event(AppEvent::NotificationCountLoaded {
+            request_id: 3,
+            account_did: "did:plc:alice".into(),
+            result: Ok(7),
+        })
+        .unwrap();
+
+        assert_eq!(app.unread_notifications, 7);
+    }
+
     fn app_with_items(items: Vec<FeedItem>) -> App {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::from_path(dir.path().join("accounts.json"));
@@ -1794,21 +2000,26 @@ mod tests {
             active_feed: 0,
             home_feed_prefs: HomeFeedPrefs::default(),
             status: String::new(),
+            status_expires_at: None,
             input_mode: InputMode::Normal,
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
+            unread_notifications: 0,
             events_tx,
             events_rx,
             next_request_id: 1,
             pending_feed: None,
             pending_pagination: None,
             pending_refresh: None,
+            pending_notification_count: None,
             pending_thread: None,
             pending_account: None,
             pending_writes: 0,
             last_refresh: Instant::now(),
             refresh_interval: Duration::from_secs(60),
+            last_notification_poll: Instant::now(),
+            notification_interval: Duration::from_secs(60),
             last_video_frame: Instant::now(),
         }
     }

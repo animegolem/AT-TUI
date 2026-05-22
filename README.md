@@ -23,6 +23,8 @@ A Bluesky terminal client prototype.
 - Experimental terminal video frame decoding through `ffmpeg`.
 - Link extraction from external cards, rich-text facets, and plain URLs, with `u` to open in the default browser.
 - Like/unlike, repost/unrepost, text posts, replies, and quote posts.
+- Filled/outline heart state for liked posts and highlighted repost state.
+- Unread notification count polling in the statusline.
 - Image fetching and terminal image rendering through `ratatui-image`.
 - Image protocol selection with `--image-protocol auto|kitty|sixel|iterm2|halfblocks`.
 - `--no-images` fallback mode.
@@ -79,6 +81,15 @@ cargo run -- --no-images
 - `r`: reload current view
 - `?`: menu with keys, account, feed, and image settings
 - `q`: quit
+
+Menu:
+
+- `j` / Down: next section
+- `k` / Up: previous section
+- Tab: next account/feed when the Accounts or Feeds section is selected
+- Shift-Tab: previous account/feed when the Accounts or Feeds section is selected
+- `[` / `]`: previous/next feed
+- Esc / `?` / Enter / `q`: close menu
 
 Media overlay:
 

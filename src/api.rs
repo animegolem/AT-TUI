@@ -110,6 +110,14 @@ impl BskyClient {
         self.get("app.bsky.feed.getPostThread", &query).await
     }
 
+    pub async fn get_unread_notification_count(&mut self) -> Result<u64> {
+        let query: Vec<(String, String)> = Vec::new();
+        let root = self
+            .get("app.bsky.notification.getUnreadCount", &query)
+            .await?;
+        unread_notification_count(&root)
+    }
+
     pub async fn refresh_session(&mut self) -> Result<()> {
         let response = self
             .http
@@ -377,6 +385,13 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Bluesky response did not include {field}"))
 }
 
+fn unread_notification_count(value: &Value) -> Result<u64> {
+    value
+        .get("count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("Bluesky response did not include notification count"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +504,11 @@ mod tests {
         let quote = post_record_json("quote text", None, Some(subject));
         assert_eq!(quote["embed"]["$type"], "app.bsky.embed.record");
         assert_eq!(quote["embed"]["record"]["cid"], "postcid");
+    }
+
+    #[test]
+    fn parses_unread_notification_count() {
+        assert_eq!(unread_notification_count(&json!({"count": 4})).unwrap(), 4);
+        assert!(unread_notification_count(&json!({})).is_err());
     }
 }

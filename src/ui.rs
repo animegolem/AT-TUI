@@ -161,7 +161,21 @@ fn rendered_height(view: &ViewState, start: usize, end: usize, width: usize) -> 
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    frame.render_widget(Paragraph::new(status_line(app)), area);
+    frame.render_widget(
+        Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(Color::DarkGray)),
+        area,
+    );
+
+    let left = status_left_line(app);
+    let right = status_right_line(app);
+    let right_width = line_width(&right).min(area.width as usize) as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_width)])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(left), chunks[0]);
+    frame.render_widget(Paragraph::new(right), chunks[1]);
 }
 
 fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -215,7 +229,9 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: M
             account.label, account.session.handle
         )));
     }
-    lines.push(Line::from("  a or Space on this section: next account"));
+    lines.push(Line::from(
+        "  Tab next account · Shift-Tab previous account",
+    ));
     lines.push(Line::from(""));
 
     lines.push(section_line(MenuSection::Feeds, selected));
@@ -224,7 +240,7 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: M
         lines.push(Line::from(format!("  {marker} {}", feed.label)));
     }
     lines.push(Line::from(
-        "  [ previous feed, ] or Space on this section: next feed",
+        "  Tab next feed · Shift-Tab previous feed · [ and ] also switch feeds",
     ));
     lines.push(Line::from(""));
 
@@ -405,7 +421,7 @@ fn active_feed_label(app: &App) -> &str {
         .unwrap_or("Following")
 }
 
-fn status_line(app: &App) -> Line<'static> {
+fn status_left_line(app: &App) -> Line<'static> {
     let mut spans = vec![
         segment(
             format!(" @{} ", app.client.session().handle),
@@ -418,13 +434,16 @@ fn status_line(app: &App) -> Line<'static> {
             Color::Black,
             Color::Yellow,
         ),
-        Span::raw(" "),
-        segment(
-            format!(" {} ", app.nav.breadcrumb()),
+    ];
+
+    if let Some(context) = status_context_label(app) {
+        spans.push(Span::raw(" "));
+        spans.push(segment(
+            format!(" {context} "),
             Color::White,
             Color::DarkGray,
-        ),
-    ];
+        ));
+    }
 
     if app.pending_new_count() > 0 {
         spans.push(Span::raw(" "));
@@ -435,14 +454,28 @@ fn status_line(app: &App) -> Line<'static> {
         ));
     }
 
+    if app.unread_notifications > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(segment(
+            format!(" ! {} ", app.unread_notifications),
+            Color::Black,
+            Color::LightRed,
+        ));
+    }
+
     if app.has_pending_tasks() {
         spans.push(Span::raw(" "));
         spans.push(segment(" … ".to_owned(), Color::Black, Color::Magenta));
     }
 
-    let status = match &app.input_mode {
-        InputMode::Normal => app.status.clone(),
-        InputMode::Search { buffer } => format!("/{buffer}"),
+    let status = match (&app.input_mode, &app.overlay) {
+        (InputMode::Search { buffer }, _) => format!("/{buffer}"),
+        (InputMode::Normal, Some(Overlay::Composer(state))) => state.title().to_owned(),
+        (InputMode::Normal, _) => app
+            .visible_status()
+            .or_else(|| app.pending_task_label())
+            .unwrap_or_default()
+            .to_owned(),
     };
     if !status.is_empty() {
         spans.push(Span::raw(" "));
@@ -452,14 +485,26 @@ fn status_line(app: &App) -> Line<'static> {
         ));
     }
 
-    spans.push(Span::raw(" "));
-    spans.push(segment(
+    Line::from(spans)
+}
+
+fn status_right_line(app: &App) -> Line<'static> {
+    Line::from(vec![segment(
         format!(" {} ", app.current_position_label()),
         Color::Black,
         Color::LightBlue,
-    ));
+    )])
+}
 
-    Line::from(spans)
+fn status_context_label(app: &App) -> Option<String> {
+    (app.nav.depth() > 1).then(|| app.nav.current().title.clone())
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
 }
 
 fn segment(text: String, fg: Color, bg: Color) -> Span<'static> {
@@ -581,10 +626,7 @@ fn render_item_lines(item: &FeedItem, selected: bool, width: usize) -> Vec<Line<
         lines.push(Line::from(format!("{body_prefix}{status}")));
     }
 
-    lines.push(Line::from(format!(
-        "{body_prefix}{}",
-        engagement_summary(item)
-    )));
+    lines.push(engagement_line(item, &body_prefix));
     lines.push(Line::from(""));
     lines
 }
@@ -644,11 +686,42 @@ fn reply_preview_lines(reply: &ReplyContext, width: usize, prefix: &str) -> Vec<
     lines
 }
 
+#[cfg(test)]
 pub(crate) fn engagement_summary(item: &FeedItem) -> String {
+    let like_symbol = if item.viewer_like.is_some() {
+        "♥"
+    } else {
+        "♡"
+    };
     format!(
-        "↩ {}  ⟳ {}  ♥ {}  ❞ {}",
-        item.reply_count, item.repost_count, item.like_count, item.quote_count
+        "↩ {}  ⟳ {}  {} {}  ❞ {}",
+        item.reply_count, item.repost_count, like_symbol, item.like_count, item.quote_count
     )
+}
+
+pub(crate) fn engagement_line(item: &FeedItem, prefix: &str) -> Line<'static> {
+    let repost_style = if item.viewer_repost.is_some() {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let like_symbol = if item.viewer_like.is_some() {
+        "♥"
+    } else {
+        "♡"
+    };
+
+    Line::from(vec![
+        Span::raw(prefix.to_owned()),
+        Span::raw(format!("↩ {}  ", item.reply_count)),
+        Span::styled(format!("⟳ {}", item.repost_count), repost_style),
+        Span::raw(format!(
+            "  {} {}  ❞ {}",
+            like_symbol, item.like_count, item.quote_count
+        )),
+    ])
 }
 
 fn render_quote_lines(
@@ -785,7 +858,22 @@ mod tests {
 
     #[test]
     fn renders_unicode_engagement_summary() {
-        assert_eq!(engagement_summary(&item()), "↩ 2  ⟳ 3  ♥ 5  ❞ 7");
+        assert_eq!(engagement_summary(&item()), "↩ 2  ⟳ 3  ♡ 5  ❞ 7");
+
+        let mut liked = item();
+        liked.viewer_like = Some("at://did:plc:viewer/app.bsky.feed.like/1".into());
+        assert_eq!(engagement_summary(&liked), "↩ 2  ⟳ 3  ♥ 5  ❞ 7");
+    }
+
+    #[test]
+    fn styles_reposted_counter() {
+        let mut item = item();
+        item.viewer_repost = Some("at://did:plc:viewer/app.bsky.feed.repost/1".into());
+
+        let line = engagement_line(&item, "");
+
+        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
+        assert!(line.spans[2].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
