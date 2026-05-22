@@ -3,57 +3,33 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::{
-    app::{App, InputMode},
+    app::{App, ComposerKind, ComposerState, InputMode, MenuSection, Overlay},
+    media::{PreviewImage, PreviewMedia},
     model::{
         ExternalRef, FeedItem, FeedReason, ImageRef, QuotePost, ReplyContext, ReplyParentStatus,
         compact_time,
     },
-    navigation::ViewState,
+    navigation::{CachedItemLines, ViewState},
 };
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
         .split(area);
 
-    render_header(frame, chunks[0], app);
-    render_body(frame, chunks[1], app);
-    render_status(frame, chunks[2], app);
-}
-
-fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let text = format!(
-        " {} | {} ",
-        app.nav.breadcrumb(),
-        app.home_feed_prefs.status_label()
-    );
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
-        area,
-    );
+    render_body(frame, chunks[0], app);
+    render_status(frame, chunks[1], app);
+    render_overlay(frame, area, app);
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    if area.width >= 112 {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(area);
-        render_feed(frame, columns[0], app);
-        render_preview(frame, columns[1], app);
-    } else {
-        render_feed(frame, area, app);
-    }
+    render_feed(frame, area, app);
 }
 
 fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -63,7 +39,7 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     } else {
         view.title.clone()
     };
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = rounded_block().title(title);
     let inner_width = area.width.saturating_sub(4).max(12) as usize;
     let available_lines = area.height.saturating_sub(2) as usize;
     let mut lines = visible_feed_lines(view, inner_width, available_lines);
@@ -83,6 +59,7 @@ fn visible_feed_lines(
     width: usize,
     available_lines: usize,
 ) -> Vec<Line<'static>> {
+    ensure_layout_cache(view, width);
     ensure_selected_rendered(view, width, available_lines);
 
     if view.items.is_empty() {
@@ -91,13 +68,13 @@ fn visible_feed_lines(
 
     let mut lines = Vec::new();
     let mut used = 0usize;
-    for (index, item) in view.items.iter().enumerate().skip(view.scroll) {
+    for index in view.scroll..view.items.len() {
         if used >= available_lines {
             break;
         }
 
         let selected = index == view.selected;
-        let item_lines = render_item_lines(item, selected, width);
+        let item_lines = cached_item_lines(view, index, selected);
 
         if used + item_lines.len() > available_lines {
             let remaining = available_lines.saturating_sub(used);
@@ -110,6 +87,36 @@ fn visible_feed_lines(
     }
 
     lines
+}
+
+fn ensure_layout_cache(view: &mut ViewState, width: usize) {
+    let needs_rebuild =
+        view.layout_cache.width != Some(width) || view.layout_cache.items.len() != view.items.len();
+    if !needs_rebuild {
+        return;
+    }
+
+    view.layout_cache.width = Some(width);
+    view.layout_cache.items = view
+        .items
+        .iter()
+        .map(|item| CachedItemLines {
+            selected: render_item_lines(item, true, width),
+            unselected: render_item_lines(item, false, width),
+        })
+        .collect();
+    view.layout_cache.builds += 1;
+}
+
+fn cached_item_lines(view: &ViewState, index: usize, selected: bool) -> Vec<Line<'static>> {
+    let Some(item) = view.layout_cache.items.get(index) else {
+        return Vec::new();
+    };
+    if selected {
+        item.selected.clone()
+    } else {
+        item.unselected.clone()
+    }
 }
 
 fn ensure_selected_rendered(view: &mut ViewState, width: usize, available_lines: usize) {
@@ -133,90 +140,389 @@ fn ensure_selected_rendered(view: &mut ViewState, width: usize, available_lines:
     }
 
     while view.scroll < view.selected
-        && rendered_height(&view.items[view.scroll..=view.selected], width) > available_lines
+        && rendered_height(view, view.scroll, view.selected, width) > available_lines
     {
         view.scroll += 1;
     }
 }
 
-fn rendered_height(items: &[FeedItem], width: usize) -> usize {
-    items
+fn rendered_height(view: &ViewState, start: usize, end: usize, width: usize) -> usize {
+    if view.layout_cache.width != Some(width) {
+        return view.items[start..=end]
+            .iter()
+            .map(|item| render_item_lines(item, false, width).len())
+            .sum();
+    }
+
+    view.layout_cache.items[start..=end]
         .iter()
-        .map(|item| render_item_lines(item, false, width).len())
+        .map(|item| item.unselected.len())
         .sum()
 }
 
-fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let selected = app.nav.current().selected_item().cloned();
-    let Some(item) = selected else {
-        frame.render_widget(
-            Paragraph::new("No selection")
-                .block(Block::default().title("Preview").borders(Borders::ALL)),
-            area,
-        );
+fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Paragraph::new(status_line(app)), area);
+}
+
+fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(overlay) = app.overlay.clone() else {
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(area);
+    match overlay {
+        Overlay::Menu(state) => render_menu_overlay(frame, area, app, state.section),
+        Overlay::Media(state) => {
+            if let Some(media) = state.selected_media().cloned() {
+                render_media_overlay(frame, area, app, &media, state.selected, state.media.len());
+            }
+        }
+        Overlay::Links(state) => render_link_overlay(frame, area, state.links, state.selected),
+        Overlay::Composer(state) => render_composer_overlay(frame, area, state),
+    }
+}
+
+fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: MenuSection) {
+    let area = centered_rect(86, 82, area);
+    frame.render_widget(Clear, area);
 
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        format!("{} @{}", item.author_name, item.author_handle),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(engagement_summary(&item)));
-    if let Some(reason) = &item.reason {
-        lines.push(Line::from(reason_text(reason)));
-    }
-    if let Some(reply) = &item.reply {
-        lines.extend(reply_preview_lines(
-            reply,
-            chunks[0].width.saturating_sub(4) as usize,
-            "",
-        ));
-    }
+    lines.push(section_line(MenuSection::Keys, selected));
+    lines.push(Line::from("  j/k or arrows: move"));
+    lines.push(Line::from("  l/Enter/Right: open thread"));
+    lines.push(Line::from("  h/Esc/Left: back"));
+    lines.push(Line::from("  Space: preview media"));
+    lines.push(Line::from(
+        "  u links, F like, R repost, p post, c reply, Q quote",
+    ));
+    lines.push(Line::from(
+        "  / search, n next, r reload, o open quote, U load pending, q quit",
+    ));
     lines.push(Line::from(""));
-    for line in wrap_text(&item.text, chunks[0].width.saturating_sub(4) as usize) {
-        lines.push(Line::from(line));
+
+    lines.push(section_line(MenuSection::Accounts, selected));
+    lines.push(Line::from(format!(
+        "  active: @{}",
+        app.client.session().handle
+    )));
+    for account in app.accounts.iter().take(6) {
+        let marker = if account.session.did == app.client.session().did {
+            "*"
+        } else {
+            " "
+        };
+        lines.push(Line::from(format!(
+            "  {marker} {} @{}",
+            account.label, account.session.handle
+        )));
     }
-    if let Some(quote) = &item.quote {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            format!("Quoted: {} @{}", quote.author_name, quote.author_handle),
-            Style::default().fg(Color::Yellow),
-        )]));
-        for line in wrap_text(&quote.text, chunks[0].width.saturating_sub(4) as usize) {
-            lines.push(Line::from(format!("> {line}")));
-        }
+    lines.push(Line::from("  a or Space on this section: next account"));
+    lines.push(Line::from(""));
+
+    lines.push(section_line(MenuSection::Feeds, selected));
+    for (index, feed) in app.feeds.iter().take(8).enumerate() {
+        let marker = if index == app.active_feed { "*" } else { " " };
+        lines.push(Line::from(format!("  {marker} {}", feed.label)));
     }
+    lines.push(Line::from(
+        "  [ previous feed, ] or Space on this section: next feed",
+    ));
+    lines.push(Line::from(""));
+
+    lines.push(section_line(MenuSection::Settings, selected));
+    lines.push(Line::from(format!(
+        "  images: {}",
+        app.media.protocol_name()
+    )));
+    lines.push(Line::from("  Esc, ?, Enter, or q closes this menu"));
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().title("Selected").borders(Borders::ALL))
+            .block(rounded_block().title("Menu"))
             .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
-    app.media.render_first_image(frame, chunks[1], &item);
-}
-
-fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let status = match &app.input_mode {
-        InputMode::Normal => format!(
-            " {} | j/k move, l/Enter replies, h back, o quote, / search, r reload, q quit | images:{} ",
-            app.status,
-            app.media.protocol_name()
-        ),
-        InputMode::Search { buffer } => format!(" /{buffer} "),
-    };
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::Black).bg(Color::Gray)),
         area,
     );
+}
+
+fn render_link_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    links: Vec<crate::model::LinkRef>,
+    selected: usize,
+) {
+    let area = centered_rect(86, 72, area);
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    for (index, link) in links.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} [{}] {}", index + 1, link.source.label(), link.label),
+            style,
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {}", link.uri),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Enter/u open · j/k move · Esc close"));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(rounded_block().title("Links"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_media_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    media: &PreviewMedia,
+    selected: usize,
+    total: usize,
+) {
+    let area = centered_rect(92, 88, area);
+    frame.render_widget(Clear, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
+
+    match media {
+        PreviewMedia::Image(image) => {
+            let title = media_title(
+                "Image",
+                selected,
+                total,
+                image.source.label(),
+                image.alt.as_deref(),
+            );
+            app.media
+                .render_preview_image(frame, chunks[0], image, title);
+        }
+        PreviewMedia::Video(video) => {
+            let title = media_title(
+                "Video",
+                selected,
+                total,
+                video.source.label(),
+                video.alt.as_deref(),
+            );
+            if app.media.video_state_name(&video.playlist_url) == "missing"
+                && let Some(thumb_url) = &video.thumb_url
+            {
+                let image = PreviewImage {
+                    url: thumb_url.clone(),
+                    alt: video.alt.clone(),
+                    source: video.source,
+                };
+                app.media
+                    .render_preview_image(frame, chunks[0], &image, title);
+            } else {
+                app.media
+                    .render_preview_video(frame, chunks[0], video, title);
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(" h/l switch · Enter/p play video · u open · Space/Esc close ")
+            .style(Style::default().fg(Color::Black).bg(Color::Gray)),
+        chunks[1],
+    );
+}
+
+fn render_composer_overlay(frame: &mut Frame<'_>, area: Rect, state: ComposerState) {
+    let area = centered_rect(82, 54, area);
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    match &state.kind {
+        ComposerKind::Post => {}
+        ComposerKind::Reply { parent_handle, .. } => {
+            lines.push(Line::from(format!("Replying to @{parent_handle}")));
+            lines.push(Line::from(""));
+        }
+        ComposerKind::Quote { quote_handle, .. } => {
+            lines.push(Line::from(format!("Quoting @{quote_handle}")));
+            lines.push(Line::from(""));
+        }
+    }
+    if state.buffer.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "Type your post...",
+            Style::default().fg(Color::DarkGray),
+        )]));
+    } else {
+        lines.extend(state.buffer.lines().map(|line| Line::from(line.to_owned())));
+    }
+    lines.push(Line::from(""));
+    let count = state.buffer.chars().count();
+    let count_style = if count > 300 {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{count}/300"), count_style),
+        Span::raw(" · Ctrl-S send · Esc cancel"),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(rounded_block().title(state.title()))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn section_line(section: MenuSection, selected: MenuSection) -> Line<'static> {
+    let style = if section == selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![Span::styled(section.label(), style)])
+}
+
+fn active_feed_label(app: &App) -> &str {
+    app.feeds
+        .get(app.active_feed)
+        .map(|feed| feed.label.as_str())
+        .unwrap_or("Following")
+}
+
+fn status_line(app: &App) -> Line<'static> {
+    let mut spans = vec![
+        segment(
+            format!(" @{} ", app.client.session().handle),
+            Color::Black,
+            Color::Cyan,
+        ),
+        Span::raw(" "),
+        segment(
+            format!(" {} ", active_feed_label(app)),
+            Color::Black,
+            Color::Yellow,
+        ),
+        Span::raw(" "),
+        segment(
+            format!(" {} ", app.nav.breadcrumb()),
+            Color::White,
+            Color::DarkGray,
+        ),
+    ];
+
+    if app.pending_new_count() > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(segment(
+            format!(" ↑ {} new ", app.pending_new_count()),
+            Color::Black,
+            Color::Green,
+        ));
+    }
+
+    if app.has_pending_tasks() {
+        spans.push(Span::raw(" "));
+        spans.push(segment(" … ".to_owned(), Color::Black, Color::Magenta));
+    }
+
+    let status = match &app.input_mode {
+        InputMode::Normal => app.status.clone(),
+        InputMode::Search { buffer } => format!("/{buffer}"),
+    };
+    if !status.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {status} "),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    spans.push(Span::raw(" "));
+    spans.push(segment(
+        format!(" {} ", app.current_position_label()),
+        Color::Black,
+        Color::LightBlue,
+    ));
+
+    Line::from(spans)
+}
+
+fn segment(text: String, fg: Color, bg: Color) -> Span<'static> {
+    Span::styled(
+        text,
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    )
+}
+
+#[cfg(test)]
+fn normal_status_text(handle: &str, feed: &str, status: &str) -> String {
+    format!(" @{handle} | {feed} | {status} ")
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+
+    let mut truncated = value
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn rounded_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+}
+
+fn media_title(
+    kind: &str,
+    selected: usize,
+    total: usize,
+    source: &str,
+    alt: Option<&str>,
+) -> String {
+    let alt = alt
+        .map(|alt| format!(" · {}", truncate(alt, 40)))
+        .unwrap_or_default();
+    format!("{kind} {}/{} · {source}{alt}", selected + 1, total)
 }
 
 fn render_item_lines(item: &FeedItem, selected: bool, width: usize) -> Vec<Line<'static>> {
@@ -263,6 +569,7 @@ fn render_item_lines(item: &FeedItem, selected: bool, width: usize) -> Vec<Line<
         &mut lines,
         &body_prefix,
         &item.images,
+        &item.videos,
         item.external.as_ref(),
     );
 
@@ -366,7 +673,13 @@ fn render_quote_lines(
     ) {
         lines.push(Line::from(format!("{quote_prefix}{line}")));
     }
-    render_media_summary(lines, &quote_prefix, &quote.images, quote.external.as_ref());
+    render_media_summary(
+        lines,
+        &quote_prefix,
+        &quote.images,
+        &quote.videos,
+        quote.external.as_ref(),
+    );
     if let Some(nested) = &quote.nested_quote {
         lines.push(Line::from(format!("{quote_prefix}nested quote: {nested}")));
     }
@@ -376,6 +689,7 @@ fn render_media_summary(
     lines: &mut Vec<Line<'static>>,
     prefix: &str,
     images: &[ImageRef],
+    videos: &[crate::model::VideoRef],
     external: Option<&ExternalRef>,
 ) {
     if !images.is_empty() {
@@ -388,6 +702,18 @@ fn render_media_summary(
         lines.push(Line::from(format!(
             "{prefix}[{} {label}{alt}]",
             images.len()
+        )));
+    }
+    if !videos.is_empty() {
+        let label = if videos.len() == 1 { "video" } else { "videos" };
+        let alt = videos
+            .first()
+            .and_then(|video| video.alt.as_ref())
+            .map(|alt| format!(": {alt}"))
+            .unwrap_or_default();
+        lines.push(Line::from(format!(
+            "{prefix}[{} {label}{alt}]",
+            videos.len()
         )));
     }
     if let Some(external) = external {
@@ -431,6 +757,8 @@ mod tests {
         FeedItem {
             uri: "at://did:plc:alice/app.bsky.feed.post/1".into(),
             cid: None,
+            viewer_like: None,
+            viewer_repost: None,
             author_did: None,
             author_name: "Alice".into(),
             author_handle: "alice.test".into(),
@@ -443,10 +771,13 @@ mod tests {
             like_count: 5,
             quote_count: 7,
             images: Vec::new(),
+            videos: Vec::new(),
             external: None,
+            links: Vec::new(),
             quote: None,
             reason: None,
             reply: None,
+            reply_root: None,
             embed_status: None,
             depth: 0,
         }
@@ -465,6 +796,16 @@ mod tests {
             indexed_at: None,
         };
         assert_eq!(reason_text(&reason), "⟳ @alice.test reposted");
+    }
+
+    #[test]
+    fn status_line_is_compact_and_has_no_footer_controls() {
+        let text = normal_status_text("alice.test", "Following", "Loaded");
+
+        assert_eq!(text, " @alice.test | Following | Loaded ");
+        assert!(!text.contains("j/k"));
+        assert!(!text.contains("replies"));
+        assert!(!text.contains("img:"));
     }
 
     #[test]
@@ -540,5 +881,24 @@ mod tests {
         let lines = visible_feed_lines(&mut view, 80, 6);
 
         assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn reuses_layout_cache_for_same_width() {
+        let mut view = ViewState::new(
+            "Timeline",
+            ViewKind::Timeline,
+            vec![item_with_text("one"), item_with_text("two")],
+        );
+
+        let _ = visible_feed_lines(&mut view, 80, 10);
+        let first_builds = view.layout_cache.builds;
+        let _ = visible_feed_lines(&mut view, 80, 10);
+
+        assert_eq!(first_builds, 1);
+        assert_eq!(view.layout_cache.builds, first_builds);
+
+        let _ = visible_feed_lines(&mut view, 40, 10);
+        assert_eq!(view.layout_cache.builds, first_builds + 1);
     }
 }

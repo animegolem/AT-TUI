@@ -1,3 +1,5 @@
+use ratatui::text::Line;
+
 use crate::model::FeedItem;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,27 @@ pub struct ViewState {
     pub loading: bool,
     pub error: Option<String>,
     pub search_query: Option<String>,
+    pub layout_cache: LayoutCache,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LayoutCache {
+    pub width: Option<usize>,
+    pub items: Vec<CachedItemLines>,
+    pub builds: usize,
+}
+
+impl LayoutCache {
+    pub fn clear(&mut self) {
+        self.width = None;
+        self.items.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedItemLines {
+    pub selected: Vec<Line<'static>>,
+    pub unselected: Vec<Line<'static>>,
 }
 
 impl ViewState {
@@ -32,6 +55,7 @@ impl ViewState {
             loading: false,
             error: None,
             search_query: None,
+            layout_cache: LayoutCache::default(),
         }
     }
 
@@ -57,6 +81,7 @@ impl ViewState {
         fallback_uri: Option<&str>,
     ) {
         self.items = items;
+        self.layout_cache.clear();
 
         let selected = preferred_uri
             .and_then(|uri| self.items.iter().position(|item| item.uri == uri))
@@ -186,6 +211,15 @@ impl NavigationStack {
             .collect::<Vec<_>>()
             .join(" / ")
     }
+
+    pub fn for_each_item_mut(&mut self, mut f: impl FnMut(&mut FeedItem)) {
+        for view in &mut self.views {
+            for item in &mut view.items {
+                f(item);
+            }
+            view.layout_cache.clear();
+        }
+    }
 }
 
 fn item_matches(item: &FeedItem, query: &str) -> bool {
@@ -207,6 +241,8 @@ mod tests {
         FeedItem {
             uri: uri.into(),
             cid: None,
+            viewer_like: None,
+            viewer_repost: None,
             author_did: None,
             author_name: "Alice".into(),
             author_handle: "alice.test".into(),
@@ -219,10 +255,13 @@ mod tests {
             like_count: 0,
             quote_count: 0,
             images: Vec::new(),
+            videos: Vec::new(),
             external: None,
+            links: Vec::new(),
             quote: None,
             reason: None,
             reply: None,
+            reply_root: None,
             embed_status: None,
             depth: 0,
         }

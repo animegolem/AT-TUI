@@ -1,10 +1,13 @@
 use chrono::{DateTime, Utc};
+use linkify::{LinkFinder, LinkKind};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedItem {
     pub uri: String,
     pub cid: Option<String>,
+    pub viewer_like: Option<String>,
+    pub viewer_repost: Option<String>,
     pub author_did: Option<String>,
     pub author_name: String,
     pub author_handle: String,
@@ -17,10 +20,13 @@ pub struct FeedItem {
     pub like_count: u64,
     pub quote_count: u64,
     pub images: Vec<ImageRef>,
+    pub videos: Vec<VideoRef>,
     pub external: Option<ExternalRef>,
+    pub links: Vec<LinkRef>,
     pub quote: Option<QuotePost>,
     pub reason: Option<FeedReason>,
     pub reply: Option<ReplyContext>,
+    pub reply_root: Option<PostRef>,
     pub embed_status: Option<String>,
     pub depth: usize,
 }
@@ -61,8 +67,16 @@ pub struct QuotePost {
     pub text: String,
     pub indexed_at: Option<String>,
     pub images: Vec<ImageRef>,
+    pub videos: Vec<VideoRef>,
     pub external: Option<ExternalRef>,
+    pub links: Vec<LinkRef>,
     pub nested_quote: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostRef {
+    pub uri: String,
+    pub cid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,11 +87,86 @@ pub struct ImageRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoRef {
+    pub playlist_url: String,
+    pub thumb_url: Option<String>,
+    pub alt: Option<String>,
+    pub cid: Option<String>,
+    pub aspect_ratio: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalRef {
     pub uri: String,
     pub title: String,
     pub description: Option<String>,
     pub thumb_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRef {
+    pub uri: String,
+    pub label: String,
+    pub source: LinkSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSource {
+    External,
+    Text,
+    QuoteExternal,
+    QuoteText,
+}
+
+impl LinkSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::External => "card",
+            Self::Text => "text",
+            Self::QuoteExternal => "quote card",
+            Self::QuoteText => "quote text",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedSource {
+    pub label: String,
+    pub kind: FeedSourceKind,
+}
+
+impl FeedSource {
+    pub fn home() -> Self {
+        Self {
+            label: "Following".into(),
+            kind: FeedSourceKind::Home,
+        }
+    }
+
+    pub fn author(handle: impl Into<String>, did: impl Into<String>) -> Self {
+        Self {
+            label: "Your Posts".into(),
+            kind: FeedSourceKind::Author {
+                handle: handle.into(),
+                did: did.into(),
+            },
+        }
+    }
+
+    pub fn uri(&self) -> Option<&str> {
+        match &self.kind {
+            FeedSourceKind::Home => None,
+            FeedSourceKind::Author { .. } => None,
+            FeedSourceKind::Generator { uri } => Some(uri),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedSourceKind {
+    Home,
+    Author { handle: String, did: String },
+    Generator { uri: String },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -157,6 +246,38 @@ impl HomeFeedPrefs {
     }
 }
 
+pub fn feed_sources_from_preferences(root: &Value) -> Vec<FeedSource> {
+    let mut sources = vec![FeedSource::home()];
+    let mut seen = std::collections::HashSet::new();
+
+    for uri in saved_feed_uris(root) {
+        if seen.insert(uri.clone()) {
+            sources.push(FeedSource {
+                label: short_feed_label(&uri),
+                kind: FeedSourceKind::Generator { uri },
+            });
+        }
+    }
+
+    sources
+}
+
+pub fn feed_sources_for_account(root: &Value, handle: &str, did: &str) -> Vec<FeedSource> {
+    let mut sources = vec![FeedSource::home(), FeedSource::author(handle, did)];
+    let mut seen = std::collections::HashSet::new();
+
+    for uri in saved_feed_uris(root) {
+        if seen.insert(uri.clone()) {
+            sources.push(FeedSource {
+                label: short_feed_label(&uri),
+                kind: FeedSourceKind::Generator { uri },
+            });
+        }
+    }
+
+    sources
+}
+
 pub fn timeline_items(root: &Value, prefs: &HomeFeedPrefs) -> (Vec<FeedItem>, Option<String>) {
     let items = root
         .get("feed")
@@ -168,6 +289,57 @@ pub fn timeline_items(root: &Value, prefs: &HomeFeedPrefs) -> (Vec<FeedItem>, Op
         .collect();
     let cursor = string_field(root, "cursor");
     (items, cursor)
+}
+
+fn saved_feed_uris(root: &Value) -> Vec<String> {
+    let mut uris = Vec::new();
+    for pref in root
+        .get("preferences")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match string_field(pref, "$type").as_deref() {
+            Some("app.bsky.actor.defs#savedFeedsPrefV2") => {
+                if let Some(items) = pref.get("items").and_then(Value::as_array) {
+                    for item in items {
+                        if string_field(item, "type").as_deref() == Some("feed")
+                            && let Some(uri) = string_field(item, "value")
+                        {
+                            uris.push(uri);
+                        }
+                    }
+                }
+            }
+            Some("app.bsky.actor.defs#savedFeedsPref") => {
+                for field in ["pinned", "saved"] {
+                    if let Some(items) = pref.get(field).and_then(Value::as_array) {
+                        uris.extend(
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .filter(|uri| is_feed_generator_uri(uri))
+                                .map(ToOwned::to_owned),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    uris
+}
+
+fn is_feed_generator_uri(uri: &str) -> bool {
+    uri.contains("/app.bsky.feed.generator/")
+}
+
+fn short_feed_label(uri: &str) -> String {
+    uri.rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(uri)
+        .to_owned()
 }
 
 pub fn thread_items(root: &Value) -> Vec<FeedItem> {
@@ -190,6 +362,7 @@ pub fn feed_item_from_feed_entry(entry: &Value) -> Option<FeedItem> {
 pub fn feed_item_from_post(post: &Value, depth: usize) -> FeedItem {
     let author = post.get("author").unwrap_or(&Value::Null);
     let mut images = Vec::new();
+    let mut videos = Vec::new();
     let mut external = None;
     let mut quote = None;
     let mut embed_status = None;
@@ -198,6 +371,7 @@ pub fn feed_item_from_post(post: &Value, depth: usize) -> FeedItem {
         parse_embed(
             embed,
             &mut images,
+            &mut videos,
             &mut external,
             &mut quote,
             &mut embed_status,
@@ -207,6 +381,8 @@ pub fn feed_item_from_post(post: &Value, depth: usize) -> FeedItem {
     FeedItem {
         uri: string_field(post, "uri").unwrap_or_default(),
         cid: string_field(post, "cid"),
+        viewer_like: viewer_record_uri(post, "like"),
+        viewer_repost: viewer_record_uri(post, "repost"),
         author_did: string_field(author, "did"),
         author_name: display_name(author),
         author_handle: string_field(author, "handle").unwrap_or_else(|| "unknown".into()),
@@ -220,10 +396,13 @@ pub fn feed_item_from_post(post: &Value, depth: usize) -> FeedItem {
         like_count: number_field(post, "likeCount"),
         quote_count: number_field(post, "quoteCount"),
         images,
+        videos,
         external,
+        links: post_links(post, LinkSource::Text),
         quote,
         reason: None,
         reply: None,
+        reply_root: post_reply_root(post),
         embed_status,
         depth,
     }
@@ -233,6 +412,8 @@ pub fn feed_item_from_quote(quote: QuotePost, depth: usize) -> FeedItem {
     FeedItem {
         uri: quote.uri,
         cid: quote.cid,
+        viewer_like: None,
+        viewer_repost: None,
         author_did: None,
         author_name: quote.author_name,
         author_handle: quote.author_handle,
@@ -245,10 +426,13 @@ pub fn feed_item_from_quote(quote: QuotePost, depth: usize) -> FeedItem {
         like_count: 0,
         quote_count: 0,
         images: quote.images,
+        videos: quote.videos,
         external: quote.external,
+        links: quote.links,
         quote: None,
         reason: None,
         reply: None,
+        reply_root: None,
         embed_status: quote.nested_quote,
         depth,
     }
@@ -388,6 +572,7 @@ fn thread_post(node: &Value) -> Option<&Value> {
 fn parse_embed(
     embed: &Value,
     images: &mut Vec<ImageRef>,
+    videos: &mut Vec<VideoRef>,
     external: &mut Option<ExternalRef>,
     quote: &mut Option<QuotePost>,
     embed_status: &mut Option<String>,
@@ -404,7 +589,7 @@ fn parse_embed(
         }
         "app.bsky.embed.recordWithMedia#view" => {
             if let Some(media) = embed.get("media") {
-                parse_embed(media, images, external, quote, embed_status);
+                parse_embed(media, images, videos, external, quote, embed_status);
             }
             if let Some((record_quote, status)) = parse_record_embed(embed.get("record")) {
                 *quote = record_quote;
@@ -412,7 +597,11 @@ fn parse_embed(
             }
         }
         "app.bsky.embed.video#view" => {
-            *embed_status = Some("[video embed omitted in this prototype]".into());
+            if let Some(video) = parse_video(embed) {
+                videos.push(video);
+            } else {
+                *embed_status = Some("[video embed unavailable]".into());
+            }
         }
         _ if !embed_type.is_empty() => {
             *embed_status = Some(format!("[unsupported embed: {embed_type}]"));
@@ -454,6 +643,7 @@ fn parse_record_embed(record: Option<&Value>) -> Option<(Option<QuotePost>, Opti
 fn quote_from_record(record: &Value) -> QuotePost {
     let author = record.get("author").unwrap_or(&Value::Null);
     let mut images = Vec::new();
+    let mut videos = Vec::new();
     let mut external = None;
     let mut nested_quote = None;
     let mut status = None;
@@ -464,12 +654,26 @@ fn quote_from_record(record: &Value) -> QuotePost {
         .and_then(|v| v.first())
     {
         let mut quote = None;
-        parse_embed(embed, &mut images, &mut external, &mut quote, &mut status);
+        parse_embed(
+            embed,
+            &mut images,
+            &mut videos,
+            &mut external,
+            &mut quote,
+            &mut status,
+        );
         nested_quote =
             quote.map(|quoted| format!("@{}: {}", quoted.author_handle, first_line(&quoted.text)));
     } else if let Some(embed) = record.get("embed") {
         let mut quote = None;
-        parse_embed(embed, &mut images, &mut external, &mut quote, &mut status);
+        parse_embed(
+            embed,
+            &mut images,
+            &mut videos,
+            &mut external,
+            &mut quote,
+            &mut status,
+        );
         nested_quote =
             quote.map(|quoted| format!("@{}: {}", quoted.author_handle, first_line(&quoted.text)));
     }
@@ -483,9 +687,43 @@ fn quote_from_record(record: &Value) -> QuotePost {
         indexed_at: string_field(record, "indexedAt")
             .or_else(|| record_value_field(record, "createdAt")),
         images,
+        videos,
         external,
+        links: quote_record_links(record),
         nested_quote: nested_quote.or(status),
     }
+}
+
+pub fn item_links(item: &FeedItem) -> Vec<LinkRef> {
+    let mut links = Vec::new();
+    if let Some(external) = &item.external
+        && !external.uri.is_empty()
+    {
+        links.push(LinkRef {
+            uri: external.uri.clone(),
+            label: external.title.clone(),
+            source: LinkSource::External,
+        });
+    }
+    links.extend(item.links.iter().cloned());
+    if let Some(quote) = &item.quote {
+        if let Some(external) = &quote.external
+            && !external.uri.is_empty()
+        {
+            links.push(LinkRef {
+                uri: external.uri.clone(),
+                label: external.title.clone(),
+                source: LinkSource::QuoteExternal,
+            });
+        }
+        links.extend(quote.links.iter().map(|link| LinkRef {
+            uri: link.uri.clone(),
+            label: link.label.clone(),
+            source: LinkSource::QuoteText,
+        }));
+    }
+
+    dedupe_links(links)
 }
 
 fn parse_images(embed: &Value) -> Vec<ImageRef> {
@@ -505,6 +743,21 @@ fn parse_images(embed: &Value) -> Vec<ImageRef> {
         .collect()
 }
 
+fn parse_video(embed: &Value) -> Option<VideoRef> {
+    Some(VideoRef {
+        playlist_url: string_field(embed, "playlist")?,
+        thumb_url: string_field(embed, "thumbnail"),
+        alt: string_field(embed, "alt").filter(|alt| !alt.is_empty()),
+        cid: string_field(embed, "cid"),
+        aspect_ratio: embed.get("aspectRatio").and_then(|ratio| {
+            Some((
+                number_field_opt(ratio, "width")?,
+                number_field_opt(ratio, "height")?,
+            ))
+        }),
+    })
+}
+
 fn parse_external(embed: &Value) -> Option<ExternalRef> {
     let external = embed.get("external")?;
     Some(ExternalRef {
@@ -517,6 +770,111 @@ fn parse_external(embed: &Value) -> Option<ExternalRef> {
 
 fn post_text(post: &Value) -> String {
     record_text_field(post, "text").unwrap_or_default()
+}
+
+fn post_links(post: &Value, source: LinkSource) -> Vec<LinkRef> {
+    let Some(record) = post.get("record") else {
+        return Vec::new();
+    };
+    let Some(text) = string_field(record, "text") else {
+        return Vec::new();
+    };
+    text_links(&text, record.get("facets"), source)
+}
+
+fn viewer_record_uri(post: &Value, field: &str) -> Option<String> {
+    post.get("viewer")
+        .and_then(|viewer| string_field(viewer, field))
+}
+
+fn post_reply_root(post: &Value) -> Option<PostRef> {
+    let root = post
+        .get("record")
+        .and_then(|record| record.get("reply"))
+        .and_then(|reply| reply.get("root"))?;
+    Some(PostRef {
+        uri: string_field(root, "uri")?,
+        cid: string_field(root, "cid")?,
+    })
+}
+
+fn quote_record_links(record: &Value) -> Vec<LinkRef> {
+    let text = record_value_text(record);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let facets = record.get("value").and_then(|value| value.get("facets"));
+    text_links(&text, facets, LinkSource::Text)
+}
+
+fn text_links(text: &str, facets: Option<&Value>, source: LinkSource) -> Vec<LinkRef> {
+    let mut candidates = facet_links(text, facets, source);
+    candidates.extend(plain_text_links(text, source));
+    candidates.sort_by_key(|candidate| candidate.start);
+    dedupe_links(
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.link)
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct LinkCandidate {
+    start: usize,
+    link: LinkRef,
+}
+
+fn facet_links(text: &str, facets: Option<&Value>, source: LinkSource) -> Vec<LinkCandidate> {
+    facets
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|facet| {
+            let index = facet.get("index")?;
+            let start = index.get("byteStart")?.as_u64()? as usize;
+            let end = index.get("byteEnd")?.as_u64()? as usize;
+            let label = text.get(start..end)?.to_owned();
+            let features = facet.get("features")?.as_array()?;
+            let uri = features.iter().find_map(|feature| {
+                let feature_type = string_field(feature, "$type").unwrap_or_default();
+                if feature_type == "app.bsky.richtext.facet#link" {
+                    string_field(feature, "uri")
+                } else {
+                    None
+                }
+            })?;
+            Some(LinkCandidate {
+                start,
+                link: LinkRef { uri, label, source },
+            })
+        })
+        .collect()
+}
+
+fn plain_text_links(text: &str, source: LinkSource) -> Vec<LinkCandidate> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder
+        .links(text)
+        .map(|link| LinkCandidate {
+            start: link.start(),
+            link: LinkRef {
+                uri: link.as_str().to_owned(),
+                label: link.as_str().to_owned(),
+                source,
+            },
+        })
+        .collect()
+}
+
+fn dedupe_links(links: Vec<LinkRef>) -> Vec<LinkRef> {
+    let mut seen = std::collections::HashSet::new();
+    links
+        .into_iter()
+        .filter(|link| !link.uri.is_empty())
+        .filter(|link| seen.insert(link.uri.clone()))
+        .collect()
 }
 
 fn record_text_field(post: &Value, field: &str) -> Option<String> {
@@ -620,8 +978,18 @@ mod tests {
                 "post": {
                     "uri": "at://did:plc:alice/app.bsky.feed.post/1",
                     "cid": "cid1",
+                    "viewer": {
+                        "like": "at://did:plc:viewer/app.bsky.feed.like/1",
+                        "repost": "at://did:plc:viewer/app.bsky.feed.repost/1"
+                    },
                     "author": {"handle": "alice.test", "displayName": "Alice"},
-                    "record": {"text": "hello terminal", "createdAt": "2026-05-22T00:00:00Z"},
+                    "record": {
+                        "text": "hello terminal",
+                        "createdAt": "2026-05-22T00:00:00Z",
+                        "reply": {
+                            "root": {"uri": "at://did:plc:root/app.bsky.feed.post/1", "cid": "rootcid"}
+                        }
+                    },
                     "replyCount": 2,
                     "repostCount": 3,
                     "likeCount": 5,
@@ -637,6 +1005,21 @@ mod tests {
         assert_eq!(items[0].author_name, "Alice");
         assert_eq!(items[0].text, "hello terminal");
         assert_eq!(items[0].reply_count, 2);
+        assert_eq!(
+            items[0].viewer_like.as_deref(),
+            Some("at://did:plc:viewer/app.bsky.feed.like/1")
+        );
+        assert_eq!(
+            items[0].viewer_repost.as_deref(),
+            Some("at://did:plc:viewer/app.bsky.feed.repost/1")
+        );
+        assert_eq!(
+            items[0].reply_root,
+            Some(PostRef {
+                uri: "at://did:plc:root/app.bsky.feed.post/1".into(),
+                cid: "rootcid".into()
+            })
+        );
     }
 
     #[test]
@@ -772,6 +1155,87 @@ mod tests {
     }
 
     #[test]
+    fn parses_saved_feeds_pref_v2_and_ignores_lists() {
+        let root = json!({
+            "preferences": [{
+                "$type": "app.bsky.actor.defs#savedFeedsPrefV2",
+                "items": [
+                    {
+                        "type": "feed",
+                        "value": "at://did:plc:alice/app.bsky.feed.generator/for-you",
+                        "pinned": true
+                    },
+                    {
+                        "type": "list",
+                        "value": "at://did:plc:alice/app.bsky.graph.list/news"
+                    },
+                    {
+                        "type": "feed",
+                        "value": "at://did:plc:alice/app.bsky.feed.generator/for-you"
+                    }
+                ]
+            }]
+        });
+
+        let sources = feed_sources_from_preferences(&root);
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0], FeedSource::home());
+        assert_eq!(sources[1].label, "for-you");
+        assert_eq!(
+            sources[1].uri(),
+            Some("at://did:plc:alice/app.bsky.feed.generator/for-you")
+        );
+    }
+
+    #[test]
+    fn adds_author_feed_for_active_account() {
+        let root = json!({
+            "preferences": [{
+                "$type": "app.bsky.actor.defs#savedFeedsPrefV2",
+                "items": [{
+                    "type": "feed",
+                    "value": "at://did:plc:alice/app.bsky.feed.generator/for-you"
+                }]
+            }]
+        });
+
+        let sources = feed_sources_for_account(&root, "alice.test", "did:plc:alice");
+
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0], FeedSource::home());
+        assert_eq!(
+            sources[1],
+            FeedSource::author("alice.test", "did:plc:alice")
+        );
+        assert_eq!(sources[2].label, "for-you");
+    }
+
+    #[test]
+    fn parses_legacy_saved_feed_preferences() {
+        let root = json!({
+            "preferences": [{
+                "$type": "app.bsky.actor.defs#savedFeedsPref",
+                "pinned": [
+                    "at://did:plc:alice/app.bsky.feed.generator/news",
+                    "at://did:plc:alice/app.bsky.graph.list/list"
+                ],
+                "saved": [
+                    "at://did:plc:bob/app.bsky.feed.generator/science"
+                ]
+            }]
+        });
+
+        let sources = feed_sources_from_preferences(&root);
+        let labels = sources
+            .iter()
+            .map(|source| source.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["Following", "news", "science"]);
+    }
+
+    #[test]
     fn filters_timeline_with_home_preferences() {
         let root = json!({
             "feed": [
@@ -898,6 +1362,131 @@ mod tests {
         let quote = item.quote.unwrap();
         assert_eq!(quote.author_name, "Alice");
         assert_eq!(quote.text, "quoted text");
+    }
+
+    #[test]
+    fn parses_video_embed() {
+        let post = json!({
+            "uri": "at://did:plc:bob/app.bsky.feed.post/2",
+            "author": {"handle": "bob.test"},
+            "record": {"text": "watch"},
+            "embed": {
+                "$type": "app.bsky.embed.video#view",
+                "playlist": "https://video.bsky.app/watch/playlist.m3u8",
+                "thumbnail": "https://video.bsky.app/watch/thumb.jpg",
+                "alt": "video alt",
+                "cid": "videocid",
+                "aspectRatio": {"width": 16, "height": 9}
+            }
+        });
+
+        let item = feed_item_from_post(&post, 0);
+
+        assert_eq!(item.videos.len(), 1);
+        assert_eq!(
+            item.videos[0],
+            VideoRef {
+                playlist_url: "https://video.bsky.app/watch/playlist.m3u8".into(),
+                thumb_url: Some("https://video.bsky.app/watch/thumb.jpg".into()),
+                alt: Some("video alt".into()),
+                cid: Some("videocid".into()),
+                aspect_ratio: Some((16, 9))
+            }
+        );
+    }
+
+    #[test]
+    fn collects_external_facet_plain_and_quote_links_in_order() {
+        let post = json!({
+            "uri": "at://did:plc:bob/app.bsky.feed.post/2",
+            "author": {"handle": "bob.test"},
+            "record": {
+                "text": "go docs and https://plain.test",
+                "facets": [{
+                    "index": {"byteStart": 3, "byteEnd": 7},
+                    "features": [{
+                        "$type": "app.bsky.richtext.facet#link",
+                        "uri": "https://docs.test"
+                    }]
+                }]
+            },
+            "embed": {
+                "$type": "app.bsky.embed.recordWithMedia#view",
+                "media": {
+                    "$type": "app.bsky.embed.external#view",
+                    "external": {
+                        "uri": "https://card.test",
+                        "title": "Card"
+                    }
+                },
+                "record": {
+                    "$type": "app.bsky.embed.record#viewRecord",
+                    "uri": "at://did:plc:alice/app.bsky.feed.post/1",
+                    "author": {"handle": "alice.test", "displayName": "Alice"},
+                    "value": {
+                        "text": "quote https://quote-text.test"
+                    },
+                    "embed": {
+                        "$type": "app.bsky.embed.external#view",
+                        "external": {
+                            "uri": "https://quote-card.test",
+                            "title": "Quote Card"
+                        }
+                    }
+                }
+            }
+        });
+
+        let item = feed_item_from_post(&post, 0);
+        let links = item_links(&item);
+        let uris = links
+            .iter()
+            .map(|link| link.uri.as_str())
+            .collect::<Vec<_>>();
+        let sources = links.iter().map(|link| link.source).collect::<Vec<_>>();
+
+        assert_eq!(
+            uris,
+            vec![
+                "https://card.test",
+                "https://docs.test",
+                "https://plain.test",
+                "https://quote-card.test",
+                "https://quote-text.test"
+            ]
+        );
+        assert_eq!(
+            sources,
+            vec![
+                LinkSource::External,
+                LinkSource::Text,
+                LinkSource::Text,
+                LinkSource::QuoteExternal,
+                LinkSource::QuoteText
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_invalid_facet_byte_ranges() {
+        let post = json!({
+            "uri": "at://did:plc:bob/app.bsky.feed.post/2",
+            "author": {"handle": "bob.test"},
+            "record": {
+                "text": "héllo",
+                "facets": [{
+                "index": {"byteStart": 2, "byteEnd": 3},
+                    "features": [{
+                        "$type": "app.bsky.richtext.facet#link",
+                        "uri": "https://invalid.test"
+                    }]
+                }]
+            }
+        });
+
+        let item = feed_item_from_post(&post, 0);
+
+        assert!(item_links(&item).is_empty());
     }
 
     #[test]

@@ -11,6 +11,8 @@ crossterm = "0.29.0"
 directories = "6.0.0"
 hex = "0.4.3"
 image = "0.25.6"
+linkify = "0.10.0"
+open = "5.3.2"
 ratatui = "0.30.0"
 ratatui-image = { version = "11.0.2", default-features = false, features = ["crossterm", "image-defaults"] }
 reqwest = { version = "0.12.18", default-features = false, features = ["json", "rustls-tls"] }
