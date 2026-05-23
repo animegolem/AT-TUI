@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if [[ ! -f "RAG/scripts/generate-index.sh" ]]; then
+  exit 0
+fi
+
+bash RAG/scripts/generate-index.sh
+git add RAG/INDEX.md RAG/AI-EPIC RAG/AI-IMP
