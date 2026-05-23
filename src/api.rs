@@ -100,6 +100,11 @@ impl BskyClient {
         self.get("app.bsky.feed.getAuthorFeed", &query).await
     }
 
+    pub async fn get_profile(&mut self, actor: &str) -> Result<Value> {
+        let query = actor_query(actor);
+        self.get("app.bsky.actor.getProfile", &query).await
+    }
+
     pub async fn get_preferences(&mut self) -> Result<Value> {
         let query: Vec<(String, String)> = Vec::new();
         self.get("app.bsky.actor.getPreferences", &query).await
@@ -116,6 +121,20 @@ impl BskyClient {
             .get("app.bsky.notification.getUnreadCount", &query)
             .await?;
         unread_notification_count(&root)
+    }
+
+    pub async fn list_notifications(&mut self, cursor: Option<&str>, limit: u16) -> Result<Value> {
+        let query = notification_query(cursor, limit);
+        self.get("app.bsky.notification.listNotifications", &query)
+            .await
+    }
+
+    pub async fn update_seen(&mut self, seen_at: &str) -> Result<()> {
+        self.post_empty(
+            "app.bsky.notification.updateSeen",
+            json!({ "seenAt": seen_at }),
+        )
+        .await
     }
 
     pub async fn refresh_session(&mut self) -> Result<()> {
@@ -266,6 +285,18 @@ fn author_feed_query(actor: &str, cursor: Option<&str>, limit: u16) -> Vec<(Stri
         ("filter".to_owned(), "posts_with_replies".to_owned()),
         ("limit".to_owned(), limit.to_string()),
     ];
+    if let Some(cursor) = cursor {
+        query.push(("cursor".to_owned(), cursor.to_owned()));
+    }
+    query
+}
+
+fn actor_query(actor: &str) -> Vec<(String, String)> {
+    vec![("actor".to_owned(), actor.to_owned())]
+}
+
+fn notification_query(cursor: Option<&str>, limit: u16) -> Vec<(String, String)> {
+    let mut query = vec![("limit".to_owned(), limit.to_string())];
     if let Some(cursor) = cursor {
         query.push(("cursor".to_owned(), cursor.to_owned()));
     }
@@ -457,6 +488,21 @@ mod tests {
             vec![
                 ("actor".into(), "did:plc:alice".into()),
                 ("filter".into(), "posts_with_replies".into()),
+                ("limit".into(), "25".into()),
+                ("cursor".into(), "cursor".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_profile_and_notification_queries() {
+        assert_eq!(
+            actor_query("alice.test"),
+            vec![("actor".into(), "alice.test".into())]
+        );
+        assert_eq!(
+            notification_query(Some("cursor"), 25),
+            vec![
                 ("limit".into(), "25".into()),
                 ("cursor".into(), "cursor".into())
             ]

@@ -7,20 +7,22 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ComposerKind, ComposerState, InputMode, MenuSection, Overlay},
+    app::{
+        App, ComposerKind, ComposerState, InputMode, MenuSection, Overlay, normal_key_help_lines,
+    },
     media::{PreviewImage, PreviewMedia},
     model::{
-        ExternalRef, FeedItem, FeedReason, ImageRef, QuotePost, ReplyContext, ReplyParentStatus,
-        compact_time,
+        ExternalRef, FeedItem, FeedReason, ImageRef, NotificationItem, NotificationTarget,
+        ProfileSummary, QuotePost, ReplyContext, ReplyParentStatus, ViewItem, compact_time,
     },
-    navigation::{CachedItemLines, ViewState},
+    navigation::{CachedItemLines, ViewKind, ViewState},
 };
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .constraints([Constraint::Min(5), Constraint::Length(status_height())])
         .split(area);
 
     render_body(frame, chunks[0], app);
@@ -42,7 +44,14 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let block = rounded_block().title(title);
     let inner_width = area.width.saturating_sub(4).max(12) as usize;
     let available_lines = area.height.saturating_sub(2) as usize;
-    let mut lines = visible_feed_lines(view, inner_width, available_lines);
+    let profile_lines = view
+        .profile
+        .as_ref()
+        .map(|profile| render_profile_header_lines(profile, inner_width))
+        .unwrap_or_default();
+    let list_available = available_lines.saturating_sub(profile_lines.len());
+    let mut lines = profile_lines;
+    lines.extend(visible_feed_lines(view, inner_width, list_available));
 
     if let Some(error) = &view.error {
         lines.push(Line::from(vec![Span::styled(
@@ -63,7 +72,7 @@ fn visible_feed_lines(
     ensure_selected_rendered(view, width, available_lines);
 
     if view.items.is_empty() {
-        return vec![Line::from("No posts in this view.")];
+        return vec![Line::from(empty_view_text(&view.kind))];
     }
 
     let mut lines = Vec::new();
@@ -101,8 +110,8 @@ fn ensure_layout_cache(view: &mut ViewState, width: usize) {
         .items
         .iter()
         .map(|item| CachedItemLines {
-            selected: render_item_lines(item, true, width),
-            unselected: render_item_lines(item, false, width),
+            selected: render_view_item_lines(item, true, width),
+            unselected: render_view_item_lines(item, false, width),
         })
         .collect();
     view.layout_cache.builds += 1;
@@ -150,7 +159,7 @@ fn rendered_height(view: &ViewState, start: usize, end: usize, width: usize) -> 
     if view.layout_cache.width != Some(width) {
         return view.items[start..=end]
             .iter()
-            .map(|item| render_item_lines(item, false, width).len())
+            .map(|item| render_view_item_lines(item, false, width).len())
             .sum();
     }
 
@@ -165,17 +174,24 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(Color::DarkGray)),
         area,
     );
+    render_status_content(frame, area, app);
+}
 
-    let left = status_left_line(app);
+fn render_status_content(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let right = status_right_line(app);
     let right_width = line_width(&right).min(area.width as usize) as u16;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_width)])
         .split(area);
+    let left = status_left_line(app, chunks[0].width as usize);
 
     frame.render_widget(Paragraph::new(left), chunks[0]);
     frame.render_widget(Paragraph::new(right), chunks[1]);
+}
+
+pub(crate) fn status_height() -> u16 {
+    1
 }
 
 fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -201,16 +217,7 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: M
 
     let mut lines = Vec::new();
     lines.push(section_line(MenuSection::Keys, selected));
-    lines.push(Line::from("  j/k or arrows: move"));
-    lines.push(Line::from("  l/Enter/Right: open thread"));
-    lines.push(Line::from("  h/Esc/Left: back"));
-    lines.push(Line::from("  Space: preview media"));
-    lines.push(Line::from(
-        "  u links, F like, R repost, p post, c reply, Q quote",
-    ));
-    lines.push(Line::from(
-        "  / search, n next, r reload, o open quote, U load pending, q quit",
-    ));
+    lines.extend(normal_key_help_lines().into_iter().map(Line::from));
     lines.push(Line::from(""));
 
     lines.push(section_line(MenuSection::Accounts, selected));
@@ -421,32 +428,36 @@ fn active_feed_label(app: &App) -> &str {
         .unwrap_or("Following")
 }
 
-fn status_left_line(app: &App) -> Line<'static> {
+pub(crate) fn status_left_line(app: &App, max_width: usize) -> Line<'static> {
+    if max_width == 0 {
+        return Line::from("");
+    }
+
+    let with_status = status_left_line_inner(app, true);
+    if line_width(&with_status) <= max_width {
+        return with_status;
+    }
+
+    status_left_line_inner(app, false)
+}
+
+fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'static> {
     let mut spans = vec![
         segment(
             format!(" @{} ", app.client.session().handle),
             Color::Black,
             Color::Cyan,
         ),
-        Span::raw(" "),
+        segment_separator(),
         segment(
-            format!(" {} ", active_feed_label(app)),
+            format!(" {} ", current_location_label(app)),
             Color::Black,
             Color::Yellow,
         ),
     ];
 
-    if let Some(context) = status_context_label(app) {
-        spans.push(Span::raw(" "));
-        spans.push(segment(
-            format!(" {context} "),
-            Color::White,
-            Color::DarkGray,
-        ));
-    }
-
     if app.pending_new_count() > 0 {
-        spans.push(Span::raw(" "));
+        spans.push(segment_separator());
         spans.push(segment(
             format!(" ↑ {} new ", app.pending_new_count()),
             Color::Black,
@@ -455,7 +466,7 @@ fn status_left_line(app: &App) -> Line<'static> {
     }
 
     if app.unread_notifications > 0 {
-        spans.push(Span::raw(" "));
+        spans.push(segment_separator());
         spans.push(segment(
             format!(" ! {} ", app.unread_notifications),
             Color::Black,
@@ -464,21 +475,17 @@ fn status_left_line(app: &App) -> Line<'static> {
     }
 
     if app.has_pending_tasks() {
-        spans.push(Span::raw(" "));
+        spans.push(segment_separator());
         spans.push(segment(" … ".to_owned(), Color::Black, Color::Magenta));
     }
 
-    let status = match (&app.input_mode, &app.overlay) {
-        (InputMode::Search { buffer }, _) => format!("/{buffer}"),
-        (InputMode::Normal, Some(Overlay::Composer(state))) => state.title().to_owned(),
-        (InputMode::Normal, _) => app
-            .visible_status()
-            .or_else(|| app.pending_task_label())
-            .unwrap_or_default()
-            .to_owned(),
+    let status = if include_transient_status {
+        status_text(app)
+    } else {
+        String::new()
     };
     if !status.is_empty() {
-        spans.push(Span::raw(" "));
+        spans.push(segment_separator());
         spans.push(Span::styled(
             format!(" {status} "),
             Style::default().fg(Color::Gray),
@@ -488,7 +495,19 @@ fn status_left_line(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn status_right_line(app: &App) -> Line<'static> {
+fn status_text(app: &App) -> String {
+    match (&app.input_mode, &app.overlay) {
+        (InputMode::Search { buffer }, _) => format!("/{buffer}"),
+        (InputMode::Normal, Some(Overlay::Composer(state))) => state.title().to_owned(),
+        (InputMode::Normal, _) => app
+            .visible_status()
+            .or_else(|| app.pending_task_label())
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+pub(crate) fn status_right_line(app: &App) -> Line<'static> {
     Line::from(vec![segment(
         format!(" {} ", app.current_position_label()),
         Color::Black,
@@ -496,11 +515,15 @@ fn status_right_line(app: &App) -> Line<'static> {
     )])
 }
 
-fn status_context_label(app: &App) -> Option<String> {
-    (app.nav.depth() > 1).then(|| app.nav.current().title.clone())
+pub(crate) fn current_location_label(app: &App) -> String {
+    if app.nav.depth() > 1 {
+        app.nav.current().title.clone()
+    } else {
+        active_feed_label(app).to_owned()
+    }
 }
 
-fn line_width(line: &Line<'_>) -> usize {
+pub(crate) fn line_width(line: &Line<'_>) -> usize {
     line.spans
         .iter()
         .map(|span| span.content.chars().count())
@@ -514,9 +537,13 @@ fn segment(text: String, fg: Color, bg: Color) -> Span<'static> {
     )
 }
 
+fn segment_separator() -> Span<'static> {
+    Span::styled(" / ", Style::default().fg(Color::Gray).bg(Color::DarkGray))
+}
+
 #[cfg(test)]
 fn normal_status_text(handle: &str, feed: &str, status: &str) -> String {
-    format!(" @{handle} | {feed} | {status} ")
+    format!(" @{handle} / {feed} / {status} ")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -568,6 +595,104 @@ fn media_title(
         .map(|alt| format!(" · {}", truncate(alt, 40)))
         .unwrap_or_default();
     format!("{kind} {}/{} · {source}{alt}", selected + 1, total)
+}
+
+fn empty_view_text(kind: &ViewKind) -> &'static str {
+    match kind {
+        ViewKind::Notifications => "No notifications.",
+        ViewKind::Profile { .. } => "No posts for this profile.",
+        _ => "No posts in this view.",
+    }
+}
+
+fn render_profile_header_lines(profile: &ProfileSummary, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        format!("{} @{}", profile.display_name, profile.handle),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    if let Some(description) = &profile.description {
+        for line in wrap_text(description, width).into_iter().take(3) {
+            lines.push(Line::from(line));
+        }
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "{} followers  {} following  {} posts",
+            profile.followers_count, profile.follows_count, profile.posts_count
+        ),
+        Style::default().fg(Color::DarkGray),
+    )]));
+    lines.push(Line::from(""));
+    lines
+}
+
+fn render_view_item_lines(item: &ViewItem, selected: bool, width: usize) -> Vec<Line<'static>> {
+    match item {
+        ViewItem::Post(item) => render_item_lines(item, selected, width),
+        ViewItem::Notification(item) => render_notification_lines(item, selected, width),
+    }
+}
+
+fn render_notification_lines(
+    item: &NotificationItem,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let marker = if selected { ">" } else { " " };
+    let unread = if item.is_read { " " } else { "●" };
+    let time = compact_time(Some(&item.indexed_at));
+    let header_style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if item.is_read {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "{marker} {unread} {} @{} {} {}",
+            item.author_name,
+            item.author_handle,
+            item.reason.label(),
+            time
+        ),
+        header_style,
+    )]));
+
+    let body_prefix = "  ";
+    if !item.text.trim().is_empty() {
+        for line in wrap_text(&item.text, width.saturating_sub(body_prefix.len()).max(10))
+            .into_iter()
+            .take(3)
+        {
+            lines.push(Line::from(format!("{body_prefix}{line}")));
+        }
+    }
+
+    if let Some(subject) = &item.reason_subject {
+        lines.push(Line::from(vec![Span::styled(
+            format!("{body_prefix}subject: {subject}"),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    } else if matches!(item.target, NotificationTarget::None) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("{body_prefix}[no openable target]"),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+
+    lines.push(Line::from(""));
+    lines
 }
 
 fn render_item_lines(item: &FeedItem, selected: bool, width: usize) -> Vec<Line<'static>> {
@@ -890,10 +1015,79 @@ mod tests {
     fn status_line_is_compact_and_has_no_footer_controls() {
         let text = normal_status_text("alice.test", "Following", "Loaded");
 
-        assert_eq!(text, " @alice.test | Following | Loaded ");
+        assert_eq!(text, " @alice.test / Following / Loaded ");
         assert!(!text.contains("j/k"));
         assert!(!text.contains("replies"));
         assert!(!text.contains("img:"));
+    }
+
+    #[test]
+    fn status_height_is_always_one_row() {
+        assert_eq!(status_height(), 1);
+    }
+
+    #[test]
+    fn renders_notification_row_with_unread_marker() {
+        let item = NotificationItem {
+            uri: "notification".into(),
+            cid: "cid".into(),
+            author_did: Some("did:plc:bob".into()),
+            author_name: "Bob".into(),
+            author_handle: "bob.test".into(),
+            reason: crate::model::NotificationReason::Reply,
+            reason_subject: Some("at://did:plc:alice/app.bsky.feed.post/1".into()),
+            text: "reply text".into(),
+            indexed_at: "2026-05-22T00:00:00Z".into(),
+            is_read: false,
+            target: NotificationTarget::Post {
+                uri: "at://did:plc:alice/app.bsky.feed.post/1".into(),
+            },
+        };
+
+        let lines = render_view_item_lines(&ViewItem::Notification(Box::new(item)), true, 80);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("● Bob @bob.test replied to you"));
+        assert!(text.contains("reply text"));
+    }
+
+    #[test]
+    fn renders_profile_header_summary() {
+        let profile = ProfileSummary {
+            did: "did:plc:alice".into(),
+            handle: "alice.test".into(),
+            display_name: "Alice".into(),
+            description: Some("profile text".into()),
+            avatar_url: None,
+            banner_url: None,
+            followers_count: 1,
+            follows_count: 2,
+            posts_count: 3,
+        };
+
+        let lines = render_profile_header_lines(&profile, 80);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Alice @alice.test"));
+        assert!(text.contains("1 followers  2 following  3 posts"));
     }
 
     #[test]

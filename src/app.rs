@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
+use chrono::{SecondsFormat, Utc};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -23,8 +24,10 @@ use crate::{
         MediaCache, PreviewImage, PreviewMedia, PreviewVideo, RequestedImageProtocol, preview_media,
     },
     model::{
-        FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, PostRef, QuotePost,
-        feed_item_from_quote, feed_sources_for_account, item_links, thread_items, timeline_items,
+        FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, NotificationItem,
+        NotificationTarget, PostRef, ProfileSummary, QuotePost, ViewItem, feed_item_from_quote,
+        feed_sources_for_account, item_links, notification_items, profile_summary, thread_items,
+        timeline_items,
     },
     navigation::{NavigationStack, ViewKind, ViewState},
     ui,
@@ -58,6 +61,12 @@ impl Default for MenuState {
 }
 
 impl MenuState {
+    pub fn settings() -> Self {
+        Self {
+            section: MenuSection::Settings,
+        }
+    }
+
     pub fn next(&mut self) {
         self.section = self.section.next();
     }
@@ -118,6 +127,77 @@ fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
         MenuSection::Feeds => MenuTabAction::SwitchFeed(delta),
         MenuSection::Keys | MenuSection::Settings => MenuTabAction::MoveSection(delta),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Quit,
+    MoveDown,
+    MoveUp,
+    OpenMenu,
+    PreviewMedia,
+    OpenLinks,
+    PreviousFeed,
+    NextFeed,
+    LoadPending,
+    ToggleLike,
+    ToggleRepost,
+    ComposePost,
+    ComposeReply,
+    ComposeQuote,
+    JumpTop,
+    JumpBottom,
+    StartSearch,
+    SearchNext,
+    Back,
+    Escape,
+    OpenSelected,
+    OpenQuote,
+    OpenProfile,
+    OpenNotifications,
+    Reload,
+}
+
+pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
+        KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
+        KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+        KeyCode::Char('?') => Some(Action::OpenMenu),
+        KeyCode::Char(' ') => Some(Action::PreviewMedia),
+        KeyCode::Char('u') => Some(Action::OpenLinks),
+        KeyCode::Char('[') => Some(Action::PreviousFeed),
+        KeyCode::Char(']') => Some(Action::NextFeed),
+        KeyCode::Char('U') => Some(Action::LoadPending),
+        KeyCode::Char('F') => Some(Action::ToggleLike),
+        KeyCode::Char('R') => Some(Action::ToggleRepost),
+        KeyCode::Char('p') => Some(Action::ComposePost),
+        KeyCode::Char('c') => Some(Action::ComposeReply),
+        KeyCode::Char('Q') => Some(Action::ComposeQuote),
+        KeyCode::Char('g') => Some(Action::JumpTop),
+        KeyCode::Char('G') => Some(Action::JumpBottom),
+        KeyCode::Char('/') => Some(Action::StartSearch),
+        KeyCode::Char('n') => Some(Action::SearchNext),
+        KeyCode::Char('h') | KeyCode::Left => Some(Action::Back),
+        KeyCode::Esc => Some(Action::Escape),
+        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => Some(Action::OpenSelected),
+        KeyCode::Char('o') => Some(Action::OpenQuote),
+        KeyCode::Char('P') => Some(Action::OpenProfile),
+        KeyCode::Char('N') => Some(Action::OpenNotifications),
+        KeyCode::Char('r') => Some(Action::Reload),
+        _ => None,
+    }
+}
+
+pub fn normal_key_help_lines() -> Vec<&'static str> {
+    vec![
+        "  j/k or arrows: move",
+        "  l/Enter/Right: open selected · h/Left: back · Esc back/settings",
+        "  P profile · N notifications · Space media · u links",
+        "  F like · R repost · p post · c reply · Q quote",
+        "  / search · n next · r reload · o quote · U load pending · q quit",
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +321,16 @@ enum AppEvent {
         action: ThreadAction,
         result: AppTaskResult<Vec<FeedItem>>,
     },
+    ProfileLoaded {
+        request_id: RequestId,
+        actor: String,
+        result: AppTaskResult<ProfileLoadData>,
+    },
+    NotificationsLoaded {
+        request_id: RequestId,
+        account_did: String,
+        result: AppTaskResult<NotificationsLoadData>,
+    },
     AccountLoaded {
         request_id: RequestId,
         result: Box<AppTaskResult<AccountSwitchData>>,
@@ -305,6 +395,21 @@ struct AccountSwitchData {
     cursor: Option<String>,
 }
 
+#[derive(Debug)]
+struct ProfileLoadData {
+    profile: ProfileSummary,
+    items: Vec<FeedItem>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug)]
+struct NotificationsLoadData {
+    items: Vec<NotificationItem>,
+    cursor: Option<String>,
+    seen_updated: bool,
+    seen_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WriteResult {
     Like {
@@ -344,7 +449,9 @@ pub struct App {
     pending_pagination: Option<RequestId>,
     pending_refresh: Option<RequestId>,
     pending_notification_count: Option<RequestId>,
+    pending_notifications: Option<RequestId>,
     pending_thread: Option<RequestId>,
+    pending_profile: Option<RequestId>,
     pending_account: Option<RequestId>,
     pending_writes: usize,
     last_refresh: Instant,
@@ -408,7 +515,9 @@ impl App {
             pending_pagination: None,
             pending_refresh: None,
             pending_notification_count: None,
+            pending_notifications: None,
             pending_thread: None,
+            pending_profile: None,
             pending_account: None,
             pending_writes: 0,
             last_refresh: now,
@@ -524,6 +633,28 @@ impl App {
                 if self.pending_thread == Some(request_id) {
                     self.pending_thread = None;
                     self.apply_thread_loaded(action, result);
+                }
+            }
+            AppEvent::ProfileLoaded {
+                request_id,
+                actor,
+                result,
+            } => {
+                if self.pending_profile == Some(request_id) {
+                    self.pending_profile = None;
+                    self.apply_profile_loaded(actor, result);
+                }
+            }
+            AppEvent::NotificationsLoaded {
+                request_id,
+                account_did,
+                result,
+            } => {
+                if self.pending_notifications == Some(request_id) {
+                    self.pending_notifications = None;
+                    if account_did == self.client.session().did {
+                        self.apply_notifications_loaded(result);
+                    }
                 }
             }
             AppEvent::AccountLoaded { request_id, result } => {
@@ -727,36 +858,37 @@ impl App {
     }
 
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.nav.current_mut().move_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.nav.current_mut().move_up(),
-            KeyCode::Char('?') => self.overlay = Some(Overlay::Menu(MenuState::default())),
-            KeyCode::Char(' ') => self.open_media_overlay_for_selected().await?,
-            KeyCode::Char('u') => self.open_links_for_selected(),
-            KeyCode::Char('[') => self.switch_feed_delta(-1).await?,
-            KeyCode::Char(']') => self.switch_feed_delta(1).await?,
-            KeyCode::Char('U') => {
+        let Some(action) = normal_action_for_key(key) else {
+            return Ok(());
+        };
+
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::MoveDown => self.nav.current_mut().move_down(),
+            Action::MoveUp => self.nav.current_mut().move_up(),
+            Action::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
+            Action::PreviewMedia => self.open_media_overlay_for_selected().await?,
+            Action::OpenLinks => self.open_links_for_selected(),
+            Action::PreviousFeed => self.switch_feed_delta(-1).await?,
+            Action::NextFeed => self.switch_feed_delta(1).await?,
+            Action::LoadPending => {
                 self.nav.current_mut().jump_top();
                 self.merge_pending_new_items(true);
             }
-            KeyCode::Char('F') => self.toggle_like_selected(),
-            KeyCode::Char('R') => self.toggle_repost_selected(),
-            KeyCode::Char('p') => self.open_post_composer(),
-            KeyCode::Char('c') => self.open_reply_composer(),
-            KeyCode::Char('Q') => self.open_quote_composer(),
-            KeyCode::Char('g') => self.nav.current_mut().jump_top(),
-            KeyCode::Char('G') => self.nav.current_mut().jump_bottom(),
-            KeyCode::Char('/') => {
+            Action::ToggleLike => self.toggle_like_selected(),
+            Action::ToggleRepost => self.toggle_repost_selected(),
+            Action::ComposePost => self.open_post_composer(),
+            Action::ComposeReply => self.open_reply_composer(),
+            Action::ComposeQuote => self.open_quote_composer(),
+            Action::JumpTop => self.nav.current_mut().jump_top(),
+            Action::JumpBottom => self.nav.current_mut().jump_bottom(),
+            Action::StartSearch => {
                 self.input_mode = InputMode::Search {
                     buffer: String::new(),
                 };
                 self.set_status("Search current view");
             }
-            KeyCode::Char('n') => {
+            Action::SearchNext => {
                 let query = self.nav.current().search_query.clone();
                 if let Some(query) = query {
                     if self.nav.current_mut().search_next(&query) {
@@ -766,23 +898,25 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+            Action::Back => {
                 if self.nav.pop() {
                     self.set_status("Back");
                 } else {
                     self.set_status("Already at timeline");
                 }
             }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                self.open_thread_for_selected().await?;
+            Action::Escape => {
+                if self.nav.pop() {
+                    self.set_status("Back");
+                } else {
+                    self.overlay = Some(Overlay::Menu(MenuState::settings()));
+                }
             }
-            KeyCode::Char('o') => {
-                self.open_quote_for_selected().await?;
-            }
-            KeyCode::Char('r') => {
-                self.reload_current().await?;
-            }
-            _ => {}
+            Action::OpenSelected => self.open_selected_detail().await?,
+            Action::OpenQuote => self.open_quote_for_selected().await?,
+            Action::OpenProfile => self.open_profile_for_selected(),
+            Action::OpenNotifications => self.queue_notifications_load("Loading notifications"),
+            Action::Reload => self.reload_current().await?,
         }
         Ok(())
     }
@@ -970,6 +1104,67 @@ impl App {
         });
     }
 
+    fn queue_profile_load(&mut self, actor: String, status: String) {
+        let id = self.next_request_id();
+        self.pending_profile = Some(id);
+        self.set_status(status);
+        let mut client = self.client.clone();
+        self.spawn_event(async move {
+            let result = async {
+                let root = client.get_profile(&actor).await?;
+                let profile = profile_summary(&root);
+                let feed_actor = if profile.did.is_empty() {
+                    actor.as_str()
+                } else {
+                    profile.did.as_str()
+                };
+                let feed = client.get_author_feed(feed_actor, None, 50).await?;
+                let (items, cursor) = timeline_items(&feed, &HomeFeedPrefs::default());
+                Ok::<_, anyhow::Error>(ProfileLoadData {
+                    profile,
+                    items,
+                    cursor,
+                })
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            AppEvent::ProfileLoaded {
+                request_id: id,
+                actor,
+                result,
+            }
+        });
+    }
+
+    fn queue_notifications_load(&mut self, status: impl Into<String>) {
+        let id = self.next_request_id();
+        self.pending_notifications = Some(id);
+        self.set_status(status);
+        let account_did = self.client.session().did.clone();
+        let mut client = self.client.clone();
+        self.spawn_event(async move {
+            let result = async {
+                let root = client.list_notifications(None, 50).await?;
+                let (items, cursor, _) = notification_items(&root);
+                let seen_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+                let seen_result = client.update_seen(&seen_at).await;
+                Ok::<_, anyhow::Error>(NotificationsLoadData {
+                    items,
+                    cursor,
+                    seen_updated: seen_result.is_ok(),
+                    seen_error: seen_result.err().map(|error| format!("{error:#}")),
+                })
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            AppEvent::NotificationsLoaded {
+                request_id: id,
+                account_did,
+                result,
+            }
+        });
+    }
+
     fn queue_account_switch(&mut self, account: AccountSession) {
         let id = self.next_request_id();
         self.pending_account = Some(id);
@@ -1043,8 +1238,7 @@ impl App {
 
         match result {
             Ok((mut items, cursor)) => {
-                current.items.append(&mut items);
-                current.layout_cache.clear();
+                current.append_posts(&mut items);
                 current.cursor = cursor;
                 self.set_status("Loaded more timeline posts");
             }
@@ -1216,6 +1410,65 @@ impl App {
         }
     }
 
+    fn apply_profile_loaded(&mut self, actor: String, result: AppTaskResult<ProfileLoadData>) {
+        match result {
+            Ok(data) => {
+                let title = format!("Profile @{}", data.profile.handle);
+                let mut view = ViewState::new(title, ViewKind::Profile { actor }, data.items);
+                view.cursor = data.cursor;
+                view.set_profile(data.profile);
+                let view_actor = match &view.kind {
+                    ViewKind::Profile { actor } => actor.clone(),
+                    _ => String::new(),
+                };
+                let replaces_current = matches!(
+                    &self.nav.current().kind,
+                    ViewKind::Profile { actor } if actor == &view_actor
+                );
+                if replaces_current {
+                    *self.nav.current_mut() = view;
+                } else {
+                    self.nav.push(view);
+                }
+                self.set_status("Profile loaded");
+            }
+            Err(error) => self.set_status(format!("Profile load failed: {error}")),
+        }
+    }
+
+    fn apply_notifications_loaded(&mut self, result: AppTaskResult<NotificationsLoadData>) {
+        match result {
+            Ok(data) => {
+                let rows = data
+                    .items
+                    .into_iter()
+                    .map(|item| ViewItem::Notification(Box::new(item)))
+                    .collect::<Vec<_>>();
+                let mut view = ViewState::from_rows("Notifications", ViewKind::Notifications, rows);
+                view.cursor = data.cursor;
+                if matches!(self.nav.current().kind, ViewKind::Notifications) {
+                    *self.nav.current_mut() = view;
+                } else {
+                    self.nav.push(view);
+                }
+                if data.seen_updated {
+                    self.unread_notifications = 0;
+                    self.last_notification_poll = Instant::now();
+                    self.set_status("Notifications loaded");
+                } else {
+                    self.set_status(format!(
+                        "Notifications loaded; seen update failed{}",
+                        data.seen_error
+                            .as_deref()
+                            .map(|error| format!(": {error}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+            Err(error) => self.set_status(format!("Notifications failed: {error}")),
+        }
+    }
+
     fn apply_account_loaded(&mut self, result: AppTaskResult<AccountSwitchData>) -> Result<()> {
         match result {
             Ok(data) => {
@@ -1245,20 +1498,68 @@ impl App {
         Ok(())
     }
 
-    async fn open_thread_for_selected(&mut self) -> Result<()> {
-        let Some(selected) = self.nav.current().selected_item().cloned() else {
-            self.set_status("No selected post");
+    async fn open_selected_detail(&mut self) -> Result<()> {
+        if let Some(selected) = self.nav.current().selected_item().cloned() {
+            self.queue_thread_load(ThreadAction::OpenThread {
+                selected_uri: selected.uri.clone(),
+                title: format!("Thread @{}", selected.author_handle),
+                kind: ViewKind::Thread {
+                    root_uri: selected.uri.clone(),
+                },
+            });
             return Ok(());
-        };
+        }
 
-        self.queue_thread_load(ThreadAction::OpenThread {
-            selected_uri: selected.uri.clone(),
-            title: format!("Thread @{}", selected.author_handle),
-            kind: ViewKind::Thread {
-                root_uri: selected.uri.clone(),
-            },
-        });
+        if let Some(notification) = self.nav.current().selected_notification().cloned() {
+            self.open_notification_target(notification);
+            return Ok(());
+        }
+
+        self.set_status("No selectable item");
         Ok(())
+    }
+
+    fn open_notification_target(&mut self, notification: NotificationItem) {
+        match notification.target {
+            NotificationTarget::Post { uri } => {
+                self.queue_thread_load(ThreadAction::OpenThread {
+                    selected_uri: uri.clone(),
+                    title: "Notification thread".into(),
+                    kind: ViewKind::Thread { root_uri: uri },
+                });
+            }
+            NotificationTarget::Profile { actor } => {
+                self.queue_profile_load(actor, "Loading profile".into());
+            }
+            NotificationTarget::None => self.set_status("Notification has no openable target"),
+        }
+    }
+
+    fn open_profile_for_selected(&mut self) {
+        let Some((actor, label)) = self.selected_author_actor() else {
+            self.set_status("No profile for selected item");
+            return;
+        };
+        self.queue_profile_load(actor, format!("Loading profile @{label}"));
+    }
+
+    fn selected_author_actor(&self) -> Option<(String, String)> {
+        if let Some(item) = self.nav.current().selected_item() {
+            let actor = item
+                .author_did
+                .clone()
+                .filter(|actor| !actor.is_empty())
+                .unwrap_or_else(|| item.author_handle.clone());
+            return Some((actor, item.author_handle.clone()));
+        }
+
+        let notification = self.nav.current().selected_notification()?;
+        let actor = notification
+            .author_did
+            .clone()
+            .filter(|actor| !actor.is_empty())
+            .unwrap_or_else(|| notification.author_handle.clone());
+        Some((actor, notification.author_handle.clone()))
     }
 
     async fn open_quote_for_selected(&mut self) -> Result<()> {
@@ -1308,6 +1609,12 @@ impl App {
                     root_uri,
                     selected_uri,
                 });
+            }
+            ViewKind::Profile { actor } => {
+                self.queue_profile_load(actor, "Refreshing profile".into());
+            }
+            ViewKind::Notifications => {
+                self.queue_notifications_load("Refreshing notifications");
             }
         }
         Ok(())
@@ -1583,13 +1890,11 @@ impl App {
         }
 
         let count = self.pending_new_items.len();
-        let mut pending = std::mem::take(&mut self.pending_new_items);
+        let pending = std::mem::take(&mut self.pending_new_items);
         let current = self.nav.current_mut();
-        pending.append(&mut current.items);
-        current.items = pending;
+        current.prepend_posts(pending);
         current.selected = 0;
         current.scroll = 0;
-        current.layout_cache.clear();
         self.set_status(format!("Loaded {count} new posts"));
     }
 
@@ -1602,7 +1907,9 @@ impl App {
             || self.pending_pagination.is_some()
             || self.pending_refresh.is_some()
             || self.pending_notification_count.is_some()
+            || self.pending_notifications.is_some()
             || self.pending_thread.is_some()
+            || self.pending_profile.is_some()
             || self.pending_account.is_some()
             || self.pending_writes > 0
     }
@@ -1614,6 +1921,10 @@ impl App {
             Some("Loading feed")
         } else if self.pending_thread.is_some() {
             Some("Loading thread")
+        } else if self.pending_profile.is_some() {
+            Some("Loading profile")
+        } else if self.pending_notifications.is_some() {
+            Some("Loading notifications")
         } else if self.pending_pagination.is_some() {
             Some("Loading more")
         } else if self.pending_writes > 0 {
@@ -1663,15 +1974,19 @@ fn post_ref_from_item(item: &FeedItem) -> Option<PostRef> {
 }
 
 fn new_items_before_current(
-    current_items: &[FeedItem],
+    current_items: &[ViewItem],
     pending_items: &[FeedItem],
     refreshed_items: Vec<FeedItem>,
 ) -> Vec<FeedItem> {
-    let first_current_uri = current_items.first().map(|item| item.uri.as_str());
+    let first_current_uri = current_items
+        .iter()
+        .find_map(ViewItem::as_post)
+        .map(|item| item.uri.as_str());
     let mut known = current_items
         .iter()
-        .chain(pending_items.iter())
+        .filter_map(ViewItem::as_post)
         .map(|item| item.uri.clone())
+        .chain(pending_items.iter().map(|item| item.uri.clone()))
         .collect::<std::collections::HashSet<_>>();
 
     let mut new_items = Vec::new();
@@ -1766,7 +2081,8 @@ mod tests {
     use crate::{
         config::SessionStore,
         media::PreviewImageSource,
-        model::{ImageRef, LinkSource},
+        model::{ImageRef, LinkSource, NotificationReason},
+        ui,
     };
 
     fn image(url: &str) -> PreviewImage {
@@ -1858,7 +2174,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.nav.current().items.len(), 1);
-        assert_eq!(app.nav.current().items[0].uri, "original");
+        assert_eq!(app.nav.current().items[0].uri(), "original");
     }
 
     #[test]
@@ -1894,7 +2210,7 @@ mod tests {
 
     #[test]
     fn pending_refresh_items_merge_only_when_requested() {
-        let current = vec![item("old", "old")];
+        let current = vec![ViewItem::from(item("old", "old"))];
         let refreshed = vec![item("new", "new"), item("old", "old")];
 
         let new_items = new_items_before_current(&current, &[], refreshed);
@@ -1980,6 +2296,223 @@ mod tests {
         assert_eq!(app.unread_notifications, 7);
     }
 
+    #[test]
+    fn normal_action_registry_maps_profile_notifications_and_existing_keys() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('P'))),
+            Some(Action::OpenProfile)
+        );
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('N'))),
+            Some(Action::OpenNotifications)
+        );
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('l'))),
+            Some(Action::OpenSelected)
+        );
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('h'))),
+            Some(Action::Back)
+        );
+        assert_eq!(
+            normal_action_for_key(key(KeyCode::Esc)),
+            Some(Action::Escape)
+        );
+        assert_eq!(
+            normal_action_for_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Quit)
+        );
+        assert!(
+            normal_key_help_lines()
+                .iter()
+                .any(|line| line.contains("P profile") && line.contains("N notifications"))
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_pops_when_nested_and_opens_settings_at_root() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.nav.push(ViewState::new(
+            "Thread @alice.test",
+            ViewKind::Thread {
+                root_uri: "post".into(),
+            },
+            vec![item("post", "hello")],
+        ));
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.nav.depth(), 1);
+        assert!(app.overlay.is_none());
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Menu(MenuState {
+                section: MenuSection::Settings
+            }))
+        ));
+    }
+
+    #[test]
+    fn status_location_replaces_feed_when_nested() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+
+        assert_eq!(ui::current_location_label(&app), "Following");
+
+        app.nav.push(ViewState::new(
+            "Thread @bob.test",
+            ViewKind::Thread {
+                root_uri: "post".into(),
+            },
+            vec![item("post", "hello")],
+        ));
+
+        assert_eq!(ui::current_location_label(&app), "Thread @bob.test");
+        let line = line_text(&ui::status_left_line(&app, 200));
+        assert!(line.contains("Thread @bob.test"));
+        assert!(!line.contains("Following"));
+    }
+
+    #[test]
+    fn status_counter_is_separate_right_segment_and_narrow_left_drops_status() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.set_status("Loaded a surprisingly long status message");
+
+        let full = line_text(&ui::status_left_line(&app, 200));
+        assert!(full.contains("Loaded a surprisingly long status message"));
+
+        let narrow = line_text(&ui::status_left_line(&app, 1));
+        assert!(!narrow.contains("Loaded a surprisingly long status message"));
+
+        let right = ui::status_right_line(&app);
+        assert_eq!(line_text(&right), " 1/1 ");
+        assert_eq!(ui::line_width(&right), 5);
+    }
+
+    fn line_text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn selected_author_actor_prefers_did_for_profile_navigation() {
+        let mut item = item("post", "hello");
+        item.author_did = Some("did:plc:alice".into());
+        item.author_handle = "alice.test".into();
+        let app = app_with_items(vec![item]);
+
+        assert_eq!(
+            app.selected_author_actor(),
+            Some(("did:plc:alice".into(), "alice.test".into()))
+        );
+    }
+
+    #[test]
+    fn profile_loaded_pushes_profile_view_with_header_and_posts() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+
+        app.apply_profile_loaded(
+            "did:plc:bob".into(),
+            Ok(ProfileLoadData {
+                profile: ProfileSummary {
+                    did: "did:plc:bob".into(),
+                    handle: "bob.test".into(),
+                    display_name: "Bob".into(),
+                    description: Some("profile text".into()),
+                    avatar_url: None,
+                    banner_url: None,
+                    followers_count: 1,
+                    follows_count: 2,
+                    posts_count: 3,
+                },
+                items: vec![item("bob-post", "bob text")],
+                cursor: Some("next".into()),
+            }),
+        );
+
+        assert!(matches!(
+            app.nav.current().kind,
+            ViewKind::Profile { ref actor } if actor == "did:plc:bob"
+        ));
+        assert_eq!(
+            app.nav
+                .current()
+                .profile
+                .as_ref()
+                .map(|profile| profile.handle.as_str()),
+            Some("bob.test")
+        );
+        assert_eq!(app.nav.current().items.len(), 1);
+        assert_eq!(app.nav.current().cursor.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn notifications_loaded_pushes_view_and_clears_unread_after_seen_update() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.unread_notifications = 4;
+
+        app.apply_notifications_loaded(Ok(NotificationsLoadData {
+            items: vec![notification(NotificationTarget::Post {
+                uri: "post".into(),
+            })],
+            cursor: Some("next".into()),
+            seen_updated: true,
+            seen_error: None,
+        }));
+
+        assert!(matches!(app.nav.current().kind, ViewKind::Notifications));
+        assert_eq!(app.unread_notifications, 0);
+        assert_eq!(app.nav.current().cursor.as_deref(), Some("next"));
+        assert!(matches!(
+            app.nav.current().items.first(),
+            Some(ViewItem::Notification(_))
+        ));
+    }
+
+    #[test]
+    fn notifications_seen_update_failure_leaves_unread_count() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.unread_notifications = 4;
+
+        app.apply_notifications_loaded(Ok(NotificationsLoadData {
+            items: vec![notification(NotificationTarget::Profile {
+                actor: "did:plc:bob".into(),
+            })],
+            cursor: None,
+            seen_updated: false,
+            seen_error: Some("network".into()),
+        }));
+
+        assert!(matches!(app.nav.current().kind, ViewKind::Notifications));
+        assert_eq!(app.unread_notifications, 4);
+        assert!(app.status.contains("seen update failed"));
+    }
+
+    #[tokio::test]
+    async fn notification_targets_route_to_profile_or_thread_tasks() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+
+        app.open_notification_target(notification(NotificationTarget::Profile {
+            actor: "did:plc:bob".into(),
+        }));
+        assert!(app.pending_profile.is_some());
+
+        app.open_notification_target(notification(NotificationTarget::Post {
+            uri: "at://did:plc:alice/app.bsky.feed.post/1".into(),
+        }));
+        assert!(app.pending_thread.is_some());
+    }
+
     fn app_with_items(items: Vec<FeedItem>) -> App {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::from_path(dir.path().join("accounts.json"));
@@ -2013,7 +2546,9 @@ mod tests {
             pending_pagination: None,
             pending_refresh: None,
             pending_notification_count: None,
+            pending_notifications: None,
             pending_thread: None,
+            pending_profile: None,
             pending_account: None,
             pending_writes: 0,
             last_refresh: Instant::now(),
@@ -2051,6 +2586,22 @@ mod tests {
             reply_root: None,
             embed_status: None,
             depth: 0,
+        }
+    }
+
+    fn notification(target: NotificationTarget) -> NotificationItem {
+        NotificationItem {
+            uri: "at://did:plc:bob/app.bsky.notification/1".into(),
+            cid: "cid".into(),
+            author_did: Some("did:plc:bob".into()),
+            author_name: "Bob".into(),
+            author_handle: "bob.test".into(),
+            reason: NotificationReason::Like,
+            reason_subject: None,
+            text: "notification text".into(),
+            indexed_at: "2026-05-22T00:00:00Z".into(),
+            is_read: false,
+            target,
         }
     }
 }

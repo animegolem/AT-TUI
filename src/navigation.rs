@@ -1,19 +1,22 @@
 use ratatui::text::Line;
 
-use crate::model::FeedItem;
+use crate::model::{FeedItem, NotificationItem, ProfileSummary, ViewItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewKind {
     Timeline,
     Thread { root_uri: String },
     Quote { uri: String },
+    Profile { actor: String },
+    Notifications,
 }
 
 #[derive(Debug, Clone)]
 pub struct ViewState {
     pub title: String,
     pub kind: ViewKind,
-    pub items: Vec<FeedItem>,
+    pub items: Vec<ViewItem>,
+    pub profile: Option<ProfileSummary>,
     pub selected: usize,
     pub scroll: usize,
     pub cursor: Option<String>,
@@ -45,10 +48,15 @@ pub struct CachedItemLines {
 
 impl ViewState {
     pub fn new(title: impl Into<String>, kind: ViewKind, items: Vec<FeedItem>) -> Self {
+        Self::from_rows(title, kind, items.into_iter().map(ViewItem::from).collect())
+    }
+
+    pub fn from_rows(title: impl Into<String>, kind: ViewKind, items: Vec<ViewItem>) -> Self {
         Self {
             title: title.into(),
             kind,
             items,
+            profile: None,
             selected: 0,
             scroll: 0,
             cursor: None,
@@ -60,11 +68,34 @@ impl ViewState {
     }
 
     pub fn selected_item(&self) -> Option<&FeedItem> {
-        self.items.get(self.selected)
+        self.items.get(self.selected).and_then(ViewItem::as_post)
+    }
+
+    pub fn selected_notification(&self) -> Option<&NotificationItem> {
+        match self.items.get(self.selected) {
+            Some(ViewItem::Notification(item)) => Some(item.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn set_profile(&mut self, profile: ProfileSummary) {
+        self.profile = Some(profile);
+    }
+
+    pub fn append_posts(&mut self, posts: &mut Vec<FeedItem>) {
+        self.items.extend(posts.drain(..).map(ViewItem::from));
+        self.layout_cache.clear();
+    }
+
+    pub fn prepend_posts(&mut self, posts: Vec<FeedItem>) {
+        let mut rows = posts.into_iter().map(ViewItem::from).collect::<Vec<_>>();
+        rows.append(&mut self.items);
+        self.items = rows;
+        self.layout_cache.clear();
     }
 
     pub fn select_uri(&mut self, uri: &str) -> bool {
-        let Some(index) = self.items.iter().position(|item| item.uri == uri) else {
+        let Some(index) = self.items.iter().position(|item| item.uri() == uri) else {
             return false;
         };
         self.selected = index;
@@ -80,13 +111,13 @@ impl ViewState {
         preferred_uri: Option<&str>,
         fallback_uri: Option<&str>,
     ) {
-        self.items = items;
+        self.items = items.into_iter().map(ViewItem::from).collect();
         self.layout_cache.clear();
 
         let selected = preferred_uri
-            .and_then(|uri| self.items.iter().position(|item| item.uri == uri))
+            .and_then(|uri| self.items.iter().position(|item| item.uri() == uri))
             .or_else(|| {
-                fallback_uri.and_then(|uri| self.items.iter().position(|item| item.uri == uri))
+                fallback_uri.and_then(|uri| self.items.iter().position(|item| item.uri() == uri))
             })
             .unwrap_or(0);
 
@@ -214,22 +245,18 @@ impl NavigationStack {
 
     pub fn for_each_item_mut(&mut self, mut f: impl FnMut(&mut FeedItem)) {
         for view in &mut self.views {
-            for item in &mut view.items {
-                f(item);
+            for row in &mut view.items {
+                if let Some(item) = row.as_post_mut() {
+                    f(item);
+                }
             }
             view.layout_cache.clear();
         }
     }
 }
 
-fn item_matches(item: &FeedItem, query: &str) -> bool {
-    item.text.to_lowercase().contains(query)
-        || item.author_handle.to_lowercase().contains(query)
-        || item.author_name.to_lowercase().contains(query)
-        || item
-            .quote
-            .as_ref()
-            .is_some_and(|quote| quote.text.to_lowercase().contains(query))
+fn item_matches(item: &ViewItem, query: &str) -> bool {
+    item.searchable_text().to_lowercase().contains(query)
 }
 
 #[cfg(test)]

@@ -32,6 +32,138 @@ pub struct FeedItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub did: String,
+    pub handle: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub avatar_url: Option<String>,
+    pub banner_url: Option<String>,
+    pub followers_count: u64,
+    pub follows_count: u64,
+    pub posts_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationItem {
+    pub uri: String,
+    pub cid: String,
+    pub author_did: Option<String>,
+    pub author_name: String,
+    pub author_handle: String,
+    pub reason: NotificationReason,
+    pub reason_subject: Option<String>,
+    pub text: String,
+    pub indexed_at: String,
+    pub is_read: bool,
+    pub target: NotificationTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationReason {
+    Like,
+    Repost,
+    Follow,
+    Mention,
+    Reply,
+    Quote,
+    StarterpackJoined,
+    Verified,
+    Unverified,
+    LikeViaRepost,
+    RepostViaRepost,
+    SubscribedPost,
+    ContactMatch,
+    Unknown(String),
+}
+
+impl NotificationReason {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Like => "liked your post",
+            Self::Repost => "reposted your post",
+            Self::Follow => "followed you",
+            Self::Mention => "mentioned you",
+            Self::Reply => "replied to you",
+            Self::Quote => "quoted your post",
+            Self::StarterpackJoined => "joined from starter pack",
+            Self::Verified => "verified you",
+            Self::Unverified => "removed verification",
+            Self::LikeViaRepost => "liked your repost",
+            Self::RepostViaRepost => "reposted your repost",
+            Self::SubscribedPost => "posted",
+            Self::ContactMatch => "joined from contacts",
+            Self::Unknown(reason) => reason.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationTarget {
+    Post { uri: String },
+    Profile { actor: String },
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewItem {
+    Post(Box<FeedItem>),
+    Notification(Box<NotificationItem>),
+}
+
+impl ViewItem {
+    pub fn as_post(&self) -> Option<&FeedItem> {
+        match self {
+            Self::Post(item) => Some(item.as_ref()),
+            Self::Notification(_) => None,
+        }
+    }
+
+    pub fn as_post_mut(&mut self) -> Option<&mut FeedItem> {
+        match self {
+            Self::Post(item) => Some(item.as_mut()),
+            Self::Notification(_) => None,
+        }
+    }
+
+    pub fn searchable_text(&self) -> String {
+        match self {
+            Self::Post(item) => {
+                let quote_text = item
+                    .quote
+                    .as_ref()
+                    .map(|quote| quote.text.as_str())
+                    .unwrap_or_default();
+                format!(
+                    "{} {} {} {}",
+                    item.text, item.author_handle, item.author_name, quote_text
+                )
+            }
+            Self::Notification(item) => format!(
+                "{} {} {} {}",
+                item.author_name,
+                item.author_handle,
+                item.reason.label(),
+                item.text
+            ),
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Post(item) => &item.uri,
+            Self::Notification(item) => &item.uri,
+        }
+    }
+}
+
+impl From<FeedItem> for ViewItem {
+    fn from(value: FeedItem) -> Self {
+        Self::Post(Box::new(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedReason {
     Repost {
         by_name: String,
@@ -291,6 +423,33 @@ pub fn timeline_items(root: &Value, prefs: &HomeFeedPrefs) -> (Vec<FeedItem>, Op
     (items, cursor)
 }
 
+pub fn profile_summary(root: &Value) -> ProfileSummary {
+    ProfileSummary {
+        did: string_field(root, "did").unwrap_or_default(),
+        handle: string_field(root, "handle").unwrap_or_else(|| "unknown".into()),
+        display_name: display_name(root),
+        description: string_field(root, "description").filter(|value| !value.trim().is_empty()),
+        avatar_url: string_field(root, "avatar"),
+        banner_url: string_field(root, "banner"),
+        followers_count: number_field(root, "followersCount"),
+        follows_count: number_field(root, "followsCount"),
+        posts_count: number_field(root, "postsCount"),
+    }
+}
+
+pub fn notification_items(root: &Value) -> (Vec<NotificationItem>, Option<String>, Option<String>) {
+    let items = root
+        .get("notifications")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(notification_item)
+        .collect();
+    let cursor = string_field(root, "cursor");
+    let seen_at = string_field(root, "seenAt");
+    (items, cursor, seen_at)
+}
+
 fn saved_feed_uris(root: &Value) -> Vec<String> {
     let mut uris = Vec::new();
     for pref in root
@@ -455,6 +614,94 @@ fn parse_reason(reason: Option<&Value>) -> Option<FeedReason> {
     }
 
     None
+}
+
+fn notification_item(value: &Value) -> NotificationItem {
+    let author = value.get("author").unwrap_or(&Value::Null);
+    let reason = notification_reason(
+        string_field(value, "reason")
+            .unwrap_or_else(|| "unknown".into())
+            .as_str(),
+    );
+    let reason_subject = string_field(value, "reasonSubject");
+    let text = notification_text(value);
+    let target = notification_target(&reason, author, value, reason_subject.as_deref());
+
+    NotificationItem {
+        uri: string_field(value, "uri").unwrap_or_default(),
+        cid: string_field(value, "cid").unwrap_or_default(),
+        author_did: string_field(author, "did"),
+        author_name: display_name(author),
+        author_handle: string_field(author, "handle").unwrap_or_else(|| "unknown".into()),
+        reason,
+        reason_subject,
+        text,
+        indexed_at: string_field(value, "indexedAt").unwrap_or_default(),
+        is_read: bool_field(value, "isRead").unwrap_or(false),
+        target,
+    }
+}
+
+fn notification_reason(reason: &str) -> NotificationReason {
+    match reason {
+        "like" => NotificationReason::Like,
+        "repost" => NotificationReason::Repost,
+        "follow" => NotificationReason::Follow,
+        "mention" => NotificationReason::Mention,
+        "reply" => NotificationReason::Reply,
+        "quote" => NotificationReason::Quote,
+        "starterpack-joined" => NotificationReason::StarterpackJoined,
+        "verified" => NotificationReason::Verified,
+        "unverified" => NotificationReason::Unverified,
+        "like-via-repost" => NotificationReason::LikeViaRepost,
+        "repost-via-repost" => NotificationReason::RepostViaRepost,
+        "subscribed-post" => NotificationReason::SubscribedPost,
+        "contact-match" => NotificationReason::ContactMatch,
+        other => NotificationReason::Unknown(other.to_owned()),
+    }
+}
+
+fn notification_text(value: &Value) -> String {
+    value
+        .get("record")
+        .map(record_value_text)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn notification_target(
+    reason: &NotificationReason,
+    author: &Value,
+    value: &Value,
+    reason_subject: Option<&str>,
+) -> NotificationTarget {
+    match reason {
+        NotificationReason::Follow
+        | NotificationReason::StarterpackJoined
+        | NotificationReason::Verified
+        | NotificationReason::Unverified
+        | NotificationReason::ContactMatch => {
+            let actor = string_field(author, "did")
+                .or_else(|| string_field(author, "handle"))
+                .unwrap_or_default();
+            if actor.is_empty() {
+                NotificationTarget::None
+            } else {
+                NotificationTarget::Profile { actor }
+            }
+        }
+        _ => {
+            let uri = reason_subject
+                .map(ToOwned::to_owned)
+                .or_else(|| string_field(value, "uri"))
+                .unwrap_or_default();
+            if uri.is_empty() {
+                NotificationTarget::None
+            } else {
+                NotificationTarget::Post { uri }
+            }
+        }
+    }
 }
 
 fn parse_reply_context(reply: Option<&Value>) -> Option<ReplyContext> {
@@ -887,14 +1134,16 @@ fn record_value_text(record: &Value) -> String {
 }
 
 fn record_value_field(record: &Value, field: &str) -> Option<String> {
-    record
-        .get("value")
-        .and_then(|value| string_field(value, field))
-        .or_else(|| {
-            record
-                .get("record")
-                .and_then(|value| string_field(value, field))
-        })
+    string_field(record, field).or_else(|| {
+        record
+            .get("value")
+            .and_then(|value| string_field(value, field))
+            .or_else(|| {
+                record
+                    .get("record")
+                    .and_then(|value| string_field(value, field))
+            })
+    })
 }
 
 fn display_name(author: &Value) -> String {
@@ -1019,6 +1268,115 @@ mod tests {
                 uri: "at://did:plc:root/app.bsky.feed.post/1".into(),
                 cid: "rootcid".into()
             })
+        );
+    }
+
+    #[test]
+    fn parses_profile_summary() {
+        let root = json!({
+            "did": "did:plc:alice",
+            "handle": "alice.test",
+            "displayName": "Alice",
+            "description": "hello profile",
+            "avatar": "https://example.com/avatar.jpg",
+            "banner": "https://example.com/banner.jpg",
+            "followersCount": 10,
+            "followsCount": 20,
+            "postsCount": 30
+        });
+
+        let profile = profile_summary(&root);
+
+        assert_eq!(profile.did, "did:plc:alice");
+        assert_eq!(profile.handle, "alice.test");
+        assert_eq!(profile.display_name, "Alice");
+        assert_eq!(profile.description.as_deref(), Some("hello profile"));
+        assert_eq!(profile.followers_count, 10);
+        assert_eq!(profile.follows_count, 20);
+        assert_eq!(profile.posts_count, 30);
+    }
+
+    #[test]
+    fn parses_notification_reasons_and_targets() {
+        let root = json!({
+            "cursor": "next",
+            "seenAt": "2026-05-22T00:00:00Z",
+            "notifications": [
+                {
+                    "uri": "at://did:plc:alice/app.bsky.feed.like/1",
+                    "cid": "likecid",
+                    "author": {
+                        "did": "did:plc:bob",
+                        "handle": "bob.test",
+                        "displayName": "Bob"
+                    },
+                    "reason": "like",
+                    "reasonSubject": "at://did:plc:alice/app.bsky.feed.post/root",
+                    "record": {"$type": "app.bsky.feed.like"},
+                    "isRead": false,
+                    "indexedAt": "2026-05-22T00:01:00Z"
+                },
+                {
+                    "uri": "at://did:plc:carol/app.bsky.graph.follow/1",
+                    "cid": "followcid",
+                    "author": {
+                        "did": "did:plc:carol",
+                        "handle": "carol.test"
+                    },
+                    "reason": "follow",
+                    "record": {"$type": "app.bsky.graph.follow"},
+                    "isRead": true,
+                    "indexedAt": "2026-05-22T00:02:00Z"
+                },
+                {
+                    "uri": "at://did:plc:dana/app.bsky.feed.post/1",
+                    "cid": "postcid",
+                    "author": {"handle": "dana.test"},
+                    "reason": "reply",
+                    "record": {"text": "reply text"},
+                    "isRead": false,
+                    "indexedAt": "2026-05-22T00:03:00Z"
+                },
+                {
+                    "uri": "at://did:plc:eric/app.bsky.feed.post/1",
+                    "cid": "postcid2",
+                    "author": {"handle": "eric.test"},
+                    "reason": "custom-reason",
+                    "record": {"text": "unknown reason text"},
+                    "isRead": false,
+                    "indexedAt": "2026-05-22T00:04:00Z"
+                }
+            ]
+        });
+
+        let (items, cursor, seen_at) = notification_items(&root);
+
+        assert_eq!(cursor.as_deref(), Some("next"));
+        assert_eq!(seen_at.as_deref(), Some("2026-05-22T00:00:00Z"));
+        assert_eq!(items[0].reason, NotificationReason::Like);
+        assert_eq!(
+            items[0].target,
+            NotificationTarget::Post {
+                uri: "at://did:plc:alice/app.bsky.feed.post/root".into()
+            }
+        );
+        assert_eq!(items[1].reason, NotificationReason::Follow);
+        assert_eq!(
+            items[1].target,
+            NotificationTarget::Profile {
+                actor: "did:plc:carol".into()
+            }
+        );
+        assert_eq!(items[2].text, "reply text");
+        assert_eq!(
+            items[2].target,
+            NotificationTarget::Post {
+                uri: "at://did:plc:dana/app.bsky.feed.post/1".into()
+            }
+        );
+        assert_eq!(
+            items[3].reason,
+            NotificationReason::Unknown("custom-reason".into())
         );
     }
 
