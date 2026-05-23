@@ -448,7 +448,6 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
             Color::Black,
             Color::Cyan,
         ),
-        segment_separator(),
         segment(
             format!(" {} ", current_location_label(app)),
             Color::Black,
@@ -457,7 +456,6 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
     ];
 
     if app.pending_new_count() > 0 {
-        spans.push(segment_separator());
         spans.push(segment(
             format!(" ↑ {} new ", app.pending_new_count()),
             Color::Black,
@@ -466,7 +464,6 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
     }
 
     if app.unread_notifications > 0 {
-        spans.push(segment_separator());
         spans.push(segment(
             format!(" ! {} ", app.unread_notifications),
             Color::Black,
@@ -475,7 +472,6 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
     }
 
     if app.has_pending_tasks() {
-        spans.push(segment_separator());
         spans.push(segment(" … ".to_owned(), Color::Black, Color::Magenta));
     }
 
@@ -485,7 +481,6 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
         String::new()
     };
     if !status.is_empty() {
-        spans.push(segment_separator());
         spans.push(Span::styled(
             format!(" {status} "),
             Style::default().fg(Color::Gray),
@@ -537,13 +532,9 @@ fn segment(text: String, fg: Color, bg: Color) -> Span<'static> {
     )
 }
 
-fn segment_separator() -> Span<'static> {
-    Span::styled(" / ", Style::default().fg(Color::Gray).bg(Color::DarkGray))
-}
-
 #[cfg(test)]
 fn normal_status_text(handle: &str, feed: &str, status: &str) -> String {
-    format!(" @{handle} / {feed} / {status} ")
+    format!(" @{handle}  {feed}  {status} ")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -738,6 +729,7 @@ fn render_item_lines(item: &FeedItem, selected: bool, width: usize) -> Vec<Line<
     render_media_summary(
         &mut lines,
         &body_prefix,
+        width,
         &item.images,
         &item.videos,
         item.external.as_ref(),
@@ -837,15 +829,19 @@ pub(crate) fn engagement_line(item: &FeedItem, prefix: &str) -> Line<'static> {
     } else {
         "♡"
     };
+    let like_style = if item.viewer_like.is_some() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
 
     Line::from(vec![
         Span::raw(prefix.to_owned()),
         Span::raw(format!("↩ {}  ", item.reply_count)),
         Span::styled(format!("⟳ {}", item.repost_count), repost_style),
-        Span::raw(format!(
-            "  {} {}  ❞ {}",
-            like_symbol, item.like_count, item.quote_count
-        )),
+        Span::raw("  "),
+        Span::styled(format!("{} {}", like_symbol, item.like_count), like_style),
+        Span::raw(format!("  ❞ {}", item.quote_count)),
     ])
 }
 
@@ -874,6 +870,7 @@ fn render_quote_lines(
     render_media_summary(
         lines,
         &quote_prefix,
+        width,
         &quote.images,
         &quote.videos,
         quote.external.as_ref(),
@@ -886,10 +883,15 @@ fn render_quote_lines(
 fn render_media_summary(
     lines: &mut Vec<Line<'static>>,
     prefix: &str,
+    width: usize,
     images: &[ImageRef],
     videos: &[crate::model::VideoRef],
     external: Option<&ExternalRef>,
 ) {
+    let content_width = width.saturating_sub(prefix.len()).max(10);
+    let media_style = Style::default().fg(Color::LightMagenta);
+    let link_style = Style::default().fg(Color::LightCyan);
+
     if !images.is_empty() {
         let label = if images.len() == 1 { "image" } else { "images" };
         let alt = images
@@ -897,10 +899,13 @@ fn render_media_summary(
             .and_then(|image| image.alt.as_ref())
             .map(|alt| format!(": {alt}"))
             .unwrap_or_default();
-        lines.push(Line::from(format!(
-            "{prefix}[{} {label}{alt}]",
-            images.len()
-        )));
+        push_wrapped_summary(
+            lines,
+            prefix,
+            &format!("[{} {label}{alt}]", images.len()),
+            content_width,
+            media_style,
+        );
     }
     if !videos.is_empty() {
         let label = if videos.len() == 1 { "video" } else { "videos" };
@@ -909,10 +914,13 @@ fn render_media_summary(
             .and_then(|video| video.alt.as_ref())
             .map(|alt| format!(": {alt}"))
             .unwrap_or_default();
-        lines.push(Line::from(format!(
-            "{prefix}[{} {label}{alt}]",
-            videos.len()
-        )));
+        push_wrapped_summary(
+            lines,
+            prefix,
+            &format!("[{} {label}{alt}]", videos.len()),
+            content_width,
+            media_style,
+        );
     }
     if let Some(external) = external {
         let description = external
@@ -920,10 +928,28 @@ fn render_media_summary(
             .as_ref()
             .map(|description| format!(" - {description}"))
             .unwrap_or_default();
-        lines.push(Line::from(format!(
-            "{prefix}[link] {}{}",
-            external.title, description
-        )));
+        push_wrapped_summary(
+            lines,
+            prefix,
+            &format!("[link] {}{}", external.title, description),
+            content_width,
+            link_style,
+        );
+    }
+}
+
+fn push_wrapped_summary(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    width: usize,
+    style: Style,
+) {
+    for line in wrap_text(text, width) {
+        lines.push(Line::from(vec![
+            Span::raw(prefix.to_owned()),
+            Span::styled(line, style),
+        ]));
     }
 }
 
@@ -1002,6 +1028,18 @@ mod tests {
     }
 
     #[test]
+    fn styles_liked_counter() {
+        let mut item = item();
+        item.viewer_like = Some("at://did:plc:viewer/app.bsky.feed.like/1".into());
+
+        let line = engagement_line(&item, "");
+
+        assert_eq!(line.spans[4].content.as_ref(), "♥ 5");
+        assert_eq!(line.spans[4].style.fg, Some(Color::Red));
+        assert!(line.spans[4].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn renders_repost_reason_text() {
         let reason = FeedReason::Repost {
             by_name: "Alice".into(),
@@ -1015,7 +1053,8 @@ mod tests {
     fn status_line_is_compact_and_has_no_footer_controls() {
         let text = normal_status_text("alice.test", "Following", "Loaded");
 
-        assert_eq!(text, " @alice.test / Following / Loaded ");
+        assert_eq!(text, " @alice.test  Following  Loaded ");
+        assert!(!text.contains('/'));
         assert!(!text.contains("j/k"));
         assert!(!text.contains("replies"));
         assert!(!text.contains("img:"));
@@ -1088,6 +1127,44 @@ mod tests {
 
         assert!(text.contains("Alice @alice.test"));
         assert!(text.contains("1 followers  2 following  3 posts"));
+    }
+
+    #[test]
+    fn wraps_and_styles_media_and_link_summaries() {
+        let images = vec![ImageRef {
+            thumb_url: "https://example.com/thumb.jpg".into(),
+            fullsize_url: Some("https://example.com/full.jpg".into()),
+            alt: Some("a long image alt text that wraps cleanly".into()),
+        }];
+        let videos = vec![crate::model::VideoRef {
+            playlist_url: "https://example.com/video.m3u8".into(),
+            thumb_url: None,
+            alt: Some("a long video alt text that wraps cleanly".into()),
+            cid: None,
+            aspect_ratio: None,
+        }];
+        let external = ExternalRef {
+            uri: "https://example.com/article".into(),
+            title: "Article title".into(),
+            description: Some("a long external description that wraps cleanly".into()),
+            thumb_url: None,
+        };
+        let mut lines = Vec::new();
+
+        render_media_summary(&mut lines, "  ", 28, &images, &videos, Some(&external));
+
+        assert!(lines.len() > 3);
+        assert!(lines.iter().all(|line| line_width(line) <= 28));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::LightMagenta))
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::LightCyan))
+        }));
     }
 
     #[test]

@@ -34,7 +34,7 @@ Generated from tracked files; binary assets excluded.
 - Cargo.lock (4145 LOC)
 - src/app.rs (2607 LOC)
 - src/model.rs (1941 LOC)
-- src/ui.rs (1186 LOC)
+- src/ui.rs (1263 LOC)
 - src/media.rs (745 LOC)
 
 ### > 300 LOC
