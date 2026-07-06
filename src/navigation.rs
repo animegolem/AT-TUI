@@ -87,6 +87,11 @@ impl ViewState {
         self.layout_cache.clear();
     }
 
+    pub fn append_rows(&mut self, rows: Vec<ViewItem>) {
+        self.items.extend(rows);
+        self.layout_cache.clear();
+    }
+
     pub fn prepend_posts(&mut self, posts: Vec<FeedItem>) {
         let mut rows = posts.into_iter().map(ViewItem::from).collect::<Vec<_>>();
         rows.append(&mut self.items);
@@ -223,6 +228,18 @@ impl NavigationStack {
         self.views.push(view);
     }
 
+    /// Swap out the root view (the timeline) without touching anything the
+    /// user has pushed on top of it.
+    pub fn replace_root(&mut self, view: ViewState) {
+        self.views[0] = view;
+    }
+
+    pub fn root_mut(&mut self) -> &mut ViewState {
+        self.views
+            .first_mut()
+            .expect("navigation stack always has a root view")
+    }
+
     pub fn pop(&mut self) -> bool {
         if self.views.len() <= 1 {
             return false;
@@ -325,6 +342,31 @@ mod tests {
         assert_eq!(view.selected, 1);
         view.move_up();
         assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn replace_root_preserves_pushed_views() {
+        let root = ViewState::new("Timeline", ViewKind::Timeline, vec![item("1", "one")]);
+        let mut stack = NavigationStack::new(root);
+        stack.push(ViewState::new(
+            "Thread",
+            ViewKind::Thread {
+                root_uri: "1".into(),
+            },
+            vec![item("1", "one")],
+        ));
+
+        stack.replace_root(ViewState::new(
+            "News",
+            ViewKind::Timeline,
+            vec![item("2", "two")],
+        ));
+
+        assert_eq!(stack.depth(), 2);
+        assert_eq!(stack.current().title, "Thread");
+        assert!(stack.pop());
+        assert_eq!(stack.current().title, "News");
+        assert_eq!(stack.current().items[0].uri(), "2");
     }
 
     #[test]

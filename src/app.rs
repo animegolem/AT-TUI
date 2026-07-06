@@ -319,6 +319,16 @@ enum AppEvent {
         source: FeedSource,
         result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
     },
+    ProfilePageLoaded {
+        request_id: RequestId,
+        actor: String,
+        result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
+    },
+    NotificationsPageLoaded {
+        request_id: RequestId,
+        account_did: String,
+        result: AppTaskResult<(Vec<NotificationItem>, Option<String>)>,
+    },
     ThreadLoaded {
         request_id: RequestId,
         action: ThreadAction,
@@ -643,6 +653,28 @@ impl App {
                 if self.pending_pagination == Some(request_id) {
                     self.pending_pagination = None;
                     self.apply_page_loaded(source, result);
+                }
+            }
+            AppEvent::ProfilePageLoaded {
+                request_id,
+                actor,
+                result,
+            } => {
+                if self.pending_pagination == Some(request_id) {
+                    self.pending_pagination = None;
+                    self.apply_profile_page_loaded(actor, result);
+                }
+            }
+            AppEvent::NotificationsPageLoaded {
+                request_id,
+                account_did,
+                result,
+            } => {
+                if self.pending_pagination == Some(request_id) {
+                    self.pending_pagination = None;
+                    if account_did == self.client.session().did {
+                        self.apply_notifications_page_loaded(result);
+                    }
                 }
             }
             AppEvent::ThreadLoaded {
@@ -1126,7 +1158,8 @@ impl App {
     fn queue_feed_load(&mut self, source: FeedSource, status: String) {
         let id = self.next_request_id();
         self.pending_feed = Some(id);
-        self.nav.current_mut().loading = true;
+        // Feed loads always target the root timeline, wherever the user is.
+        self.nav.root_mut().loading = true;
         self.set_status(status);
         let mut client = self.client.clone();
         let prefs = self.home_feed_prefs;
@@ -1265,19 +1298,71 @@ impl App {
         source: FeedSource,
         result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
     ) {
-        self.nav.current_mut().loading = false;
+        self.nav.root_mut().loading = false;
         match result {
             Ok((items, cursor)) => {
                 let mut view = ViewState::new(source.label.clone(), ViewKind::Timeline, items);
                 view.cursor = cursor;
-                self.nav = NavigationStack::new(view);
+                self.nav.replace_root(view);
                 self.pending_new_items.clear();
                 self.last_refresh = Instant::now();
                 self.set_status(format!("Loaded {}", source.label));
             }
             Err(error) => {
-                self.nav.current_mut().error = Some(error);
+                self.nav.root_mut().error = Some(error);
                 self.set_status("Feed load failed");
+            }
+        }
+    }
+
+    fn apply_profile_page_loaded(
+        &mut self,
+        actor: String,
+        result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
+    ) {
+        let current = self.nav.current_mut();
+        current.loading = false;
+        if !matches!(&current.kind, ViewKind::Profile { actor: current_actor } if current_actor == &actor)
+        {
+            return;
+        }
+
+        match result {
+            Ok((mut items, cursor)) => {
+                current.append_posts(&mut items);
+                current.cursor = cursor;
+                self.set_status("Loaded more posts");
+            }
+            Err(error) => {
+                current.error = Some(error);
+                self.set_status("Pagination failed");
+            }
+        }
+    }
+
+    fn apply_notifications_page_loaded(
+        &mut self,
+        result: AppTaskResult<(Vec<NotificationItem>, Option<String>)>,
+    ) {
+        let current = self.nav.current_mut();
+        current.loading = false;
+        if !matches!(current.kind, ViewKind::Notifications) {
+            return;
+        }
+
+        match result {
+            Ok((items, cursor)) => {
+                let rows = items
+                    .into_iter()
+                    .map(|item| ViewItem::Notification(Box::new(item)))
+                    .collect::<Vec<_>>();
+                current.append_rows(rows);
+                current.cursor = cursor;
+                self.set_status("Loaded more notifications");
+            }
+            Err(error) => {
+                current.error = Some(error);
+                self.set_status("Pagination failed");
             }
         }
     }
@@ -1992,39 +2077,84 @@ impl App {
     }
 
     async fn maybe_load_more(&mut self) -> Result<()> {
-        let should_load = {
+        let near_bottom = {
             let current = self.nav.current();
-            matches!(current.kind, ViewKind::Timeline)
-                && current.cursor.is_some()
+            current.cursor.is_some()
                 && !current.loading
                 && current.selected.saturating_add(5) >= current.items.len()
         };
 
-        if !should_load {
+        if !near_bottom {
             return Ok(());
         }
 
-        let cursor = self.nav.current().cursor.clone();
-        let Some(cursor) = cursor else {
+        let Some(cursor) = self.nav.current().cursor.clone() else {
             return Ok(());
         };
 
-        self.nav.current_mut().loading = true;
-        let source = self.feeds[self.active_feed].clone();
-        let id = self.next_request_id();
-        self.pending_pagination = Some(id);
-        let mut client = self.client.clone();
-        let prefs = self.home_feed_prefs;
-        self.spawn_event(async move {
-            let result = load_feed_page(&mut client, &source, &prefs, Some(&cursor))
-                .await
-                .map_err(|error| format!("{error:#}"));
-            AppEvent::PageLoaded {
-                request_id: id,
-                source,
-                result,
+        match self.nav.current().kind.clone() {
+            ViewKind::Timeline => {
+                self.nav.current_mut().loading = true;
+                let source = self.feeds[self.active_feed].clone();
+                let id = self.next_request_id();
+                self.pending_pagination = Some(id);
+                let mut client = self.client.clone();
+                let prefs = self.home_feed_prefs;
+                self.spawn_event(async move {
+                    let result = load_feed_page(&mut client, &source, &prefs, Some(&cursor))
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    AppEvent::PageLoaded {
+                        request_id: id,
+                        source,
+                        result,
+                    }
+                });
             }
-        });
+            ViewKind::Profile { actor } => {
+                self.nav.current_mut().loading = true;
+                let id = self.next_request_id();
+                self.pending_pagination = Some(id);
+                let mut client = self.client.clone();
+                self.spawn_event(async move {
+                    let result = client
+                        .get_author_feed(&actor, Some(&cursor), 50)
+                        .await
+                        .map(|root| timeline_items(&root, &HomeFeedPrefs::default()))
+                        .map_err(|error| format!("{error:#}"));
+                    AppEvent::ProfilePageLoaded {
+                        request_id: id,
+                        actor,
+                        result,
+                    }
+                });
+            }
+            ViewKind::Notifications => {
+                self.nav.current_mut().loading = true;
+                let id = self.next_request_id();
+                self.pending_pagination = Some(id);
+                let account_did = self.client.session().did.clone();
+                let mut client = self.client.clone();
+                self.spawn_event(async move {
+                    // Deliberately no updateSeen here: reading history is
+                    // not the same as acknowledging new notifications.
+                    let result = client
+                        .list_notifications(Some(&cursor), 50)
+                        .await
+                        .map(|root| {
+                            let (items, cursor, _) = notification_items(&root);
+                            (items, cursor)
+                        })
+                        .map_err(|error| format!("{error:#}"));
+                    AppEvent::NotificationsPageLoaded {
+                        request_id: id,
+                        account_did,
+                        result,
+                    }
+                });
+            }
+            ViewKind::Thread { .. } | ViewKind::Quote { .. } => {}
+        }
         Ok(())
     }
 
@@ -2490,6 +2620,84 @@ mod tests {
 
         assert_eq!(app.nav.current().items.len(), 1);
         assert_eq!(app.nav.current().items[0].uri(), "original");
+    }
+
+    #[test]
+    fn profile_view_paginates_with_stored_cursor() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        let mut profile_view = ViewState::new(
+            "Profile @bob.test",
+            ViewKind::Profile {
+                actor: "did:plc:bob".into(),
+            },
+            vec![item("bob-1", "one")],
+        );
+        profile_view.cursor = Some("page-2".into());
+        app.nav.push(profile_view);
+        app.pending_pagination = Some(9);
+
+        app.apply_event(AppEvent::ProfilePageLoaded {
+            request_id: 9,
+            actor: "did:plc:bob".into(),
+            result: Ok((vec![item("bob-2", "two")], Some("page-3".into()))),
+        })
+        .unwrap();
+
+        assert_eq!(app.nav.current().items.len(), 2);
+        assert_eq!(app.nav.current().cursor.as_deref(), Some("page-3"));
+    }
+
+    #[test]
+    fn notification_view_paginates_and_appends_rows() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        let mut view = ViewState::from_rows(
+            "Notifications",
+            ViewKind::Notifications,
+            vec![ViewItem::Notification(Box::new(notification(
+                NotificationTarget::None,
+            )))],
+        );
+        view.cursor = Some("page-2".into());
+        app.nav.push(view);
+        app.pending_pagination = Some(9);
+
+        app.apply_event(AppEvent::NotificationsPageLoaded {
+            request_id: 9,
+            account_did: "did:plc:alice".into(),
+            result: Ok((
+                vec![notification(NotificationTarget::None)],
+                Some("page-3".into()),
+            )),
+        })
+        .unwrap();
+
+        assert_eq!(app.nav.current().items.len(), 2);
+        assert_eq!(app.nav.current().cursor.as_deref(), Some("page-3"));
+    }
+
+    #[test]
+    fn feed_load_keeps_pushed_views() {
+        let mut app = app_with_items(vec![item("old", "old")]);
+        app.nav.push(ViewState::new(
+            "Thread @alice.test",
+            ViewKind::Thread {
+                root_uri: "old".into(),
+            },
+            vec![item("old", "old")],
+        ));
+        app.pending_feed = Some(5);
+
+        app.apply_event(AppEvent::FeedLoaded {
+            request_id: 5,
+            source: FeedSource::home(),
+            result: Ok((vec![item("new", "new")], None)),
+        })
+        .unwrap();
+
+        assert_eq!(app.nav.depth(), 2);
+        assert_eq!(app.nav.current().title, "Thread @alice.test");
+        assert!(app.nav.pop());
+        assert_eq!(app.nav.current().items[0].uri(), "new");
     }
 
     #[test]

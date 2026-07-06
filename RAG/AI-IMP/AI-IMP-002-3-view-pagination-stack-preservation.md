@@ -6,12 +6,12 @@ tags:
   - at-tui
   - pagination
   - navigation
-kanban_status: planned
+kanban_status: completed
 depends_on:
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.85
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-3-view-pagination-stack-preservation
@@ -34,13 +34,13 @@ Generalize pagination: near-bottom check stays in `maybe_load_more`; dispatch on
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] `navigation.rs`: `replace_root` preserving pushed views; unit test.
-- [ ] `app.rs`: `maybe_load_more` dispatches for Profile and Notifications using stored cursors.
-- [ ] `app.rs`: new page-loaded events guarded by request id and view identity (actor/kind still current).
-- [ ] `app.rs`: notification pages append without re-triggering `updateSeen`.
-- [ ] `app.rs`: `apply_feed_loaded` replaces root in place; loading flag targets the root view.
-- [ ] Tests: profile pagination appends and updates cursor; stale page dropped; feed load keeps pushed thread view.
-- [ ] Gate: fmt, test, clippy -D warnings, build.
+- [x] `navigation.rs`: `replace_root` preserving pushed views; unit test.
+- [x] `app.rs`: `maybe_load_more` dispatches for Profile and Notifications using stored cursors.
+- [x] `app.rs`: new page-loaded events guarded by request id and view identity (actor/kind still current).
+- [x] `app.rs`: notification pages append without re-triggering `updateSeen`.
+- [x] `app.rs`: `apply_feed_loaded` replaces root in place; loading flag targets the root view.
+- [x] Tests: profile pagination appends and updates cursor; stale page dropped; feed load keeps pushed thread view.
+- [x] Gate: fmt, test, clippy -D warnings, build.
 
 ### Acceptance Criteria
 **Scenario:** Reading a prolific profile.
@@ -60,3 +60,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+Went with separate ProfilePageLoaded/NotificationsPageLoaded events sharing the single pending_pagination id (globally unique ids make sharing safe) rather than a discriminator on PageLoaded. Notification pagination deliberately skips updateSeen. queue_feed_load/apply_feed_loaded now target the root view explicitly, which also fixed the loading flag landing on whatever view happened to be current.
