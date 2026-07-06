@@ -6,12 +6,28 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 0 | 0 |
-| Planned | 2 | 1 |
+| In Progress | 1 | 0 |
+| Planned | 1 | 8 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
 | Completed | 0 | 2 |
-| **Total** | **2** | **3** |
+| **Total** | **2** | **10** |
+
+## In Progress
+
+### [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002: At tui stabilization daily driver]]
+> AT-TUI cannot currently be left running: after roughly two hours idle the access token expires, the refreshing clone strands the main client with a...
+
+**IMPs:**
+- [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — planned
+- [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — planned
+- [[AI-IMP-002-3-view-pagination-stack-preservation|IMP-002-3]] 3 view pagination stack preservation — planned
+- [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — planned
+- [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — planned
+- [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — planned
+- [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — planned
+
+---
 
 ## Planned
 
@@ -22,11 +38,6 @@
 - [[AI-IMP-001-1-cosmetic-polish|IMP-001-1]] Compact Statusline And Timeline Readability — completed
 - [[AI-IMP-001-2-follow-unfollow-accounts|IMP-001-2]] Keyboard Follow And Unfollow — completed
 - [[AI-IMP-001-3-video-audio-spike|IMP-001-3]] Video Audio Implementation Brief — planned
-
----
-
-### [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002: At tui stabilization daily driver]]
-> AT-TUI cannot currently be left running: after roughly two hours idle the access token expires, the refreshing clone strands the main client with a...
 
 ---
 

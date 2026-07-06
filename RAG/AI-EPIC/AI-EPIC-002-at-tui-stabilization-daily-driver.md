@@ -9,8 +9,15 @@ tags:
   - media
 date_created: 2026-07-06
 date_completed:
-kanban_status: planned
+kanban_status: in-progress
 AI_IMP_spawned:
+  - AI-IMP-002-1
+  - AI-IMP-002-2
+  - AI-IMP-002-3
+  - AI-IMP-002-4
+  - AI-IMP-002-5
+  - AI-IMP-002-6
+  - AI-IMP-002-7
 ---
 
 # AI-EPIC-002-at-tui-stabilization-daily-driver
@@ -84,6 +91,8 @@ Global search, follower/following list views, mute/block, image upload, list fee
 - [ ] FR-15: Outgoing posts shall include link and mention facets.
 - [ ] FR-16: Post length shall be validated by grapheme count.
 - [ ] FR-17: Users shall be able to delete their own posts after confirmation.
+- [ ] FR-18: The statusline pending indicator shall animate (braille spinner) while tasks run.
+- [ ] FR-19: Quote posts shall render inside box-drawing frames consistent with the app chrome.
 
 ### Non-Functional Requirements
 - No new heavyweight dependencies; `unicode-segmentation` for FR-16 is acceptable.
@@ -92,12 +101,13 @@ Global search, follower/following list views, mute/block, image upload, list fee
 - Every behavioral change lands with unit tests in the existing test style.
 
 ## Implementation Breakdown
-Proposed cut (tickets not yet written — pending owner go):
-- AI-IMP-002-1 session sharing and failure visibility (FR-1..3) — api.rs, app.rs; ~250 LOC.
-- AI-IMP-002-2 event-loop hygiene (FR-4..6) — app.rs; ~120 LOC.
-- AI-IMP-002-3 view pagination and stack preservation (FR-7..8) — app.rs; ~200 LOC.
-- AI-IMP-002-4 keymap rework and page scrolling (FR-9..10) — app.rs, ui.rs, README; ~180 LOC.
-- AI-IMP-002-5 image cache and prefetch (FR-11..14) — media.rs, app.rs; ~250 LOC.
-- AI-IMP-002-6 posting correctness (FR-15..17) — api.rs, app.rs; ~250 LOC.
+Cut 2026-07-06 with owner go (visual quick wins added to scope at cut time):
+- [ ] [[AI-IMP-002-1-session-sharing-failure-visibility]]: shared session, single-flight refresh, offline indicator (FR-1..3).
+- [ ] [[AI-IMP-002-2-event-loop-hygiene]]: Press filter, wheel scroll, dirty-flag redraw (FR-4..6).
+- [ ] [[AI-IMP-002-3-view-pagination-stack-preservation]]: profile/notification pagination, root-in-place feed loads (FR-7..8).
+- [ ] [[AI-IMP-002-4-keymap-rework-page-scroll]]: agreed keymap plus page motion (FR-9..10).
+- [ ] [[AI-IMP-002-5-image-cache-prefetch]]: disk read-through, prefetch, thumb-first, LRU (FR-11..14).
+- [ ] [[AI-IMP-002-6-posting-correctness]]: facets, graphemes, delete own post (FR-15..17).
+- [ ] [[AI-IMP-002-7-visual-quick-wins]]: braille spinner, box-drawing quote frames (FR-18..19).
 
-Dependency order: 002-1 first (everything relies on a live session). 002-2 and 002-3 follow, serialized with 002-4 (all touch app.rs). 002-5 and 002-6 are independent and can run in parallel or be delegated.
+Dependency order: 002-1 first; 002-2 → 002-3 → 002-4 serialized (all touch app.rs); 002-5/002-6/002-7 follow, independent of each other.
