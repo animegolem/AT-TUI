@@ -253,6 +253,24 @@ impl NavigationStack {
             view.layout_cache.clear();
         }
     }
+
+    pub fn for_each_notification_mut(&mut self, mut f: impl FnMut(&mut NotificationItem)) {
+        for view in &mut self.views {
+            for row in &mut view.items {
+                if let Some(item) = row.as_notification_mut() {
+                    f(item);
+                }
+            }
+        }
+    }
+
+    pub fn for_each_profile_mut(&mut self, mut f: impl FnMut(&mut ProfileSummary)) {
+        for view in &mut self.views {
+            if let Some(profile) = &mut view.profile {
+                f(profile);
+            }
+        }
+    }
 }
 
 fn item_matches(item: &ViewItem, query: &str) -> bool {
@@ -274,6 +292,7 @@ mod tests {
             author_name: "Alice".into(),
             author_handle: "alice.test".into(),
             author_following: None,
+            author_following_uri: None,
             avatar_url: None,
             text: text.into(),
             indexed_at: None,

@@ -12,6 +12,7 @@ pub struct FeedItem {
     pub author_name: String,
     pub author_handle: String,
     pub author_following: Option<bool>,
+    pub author_following_uri: Option<String>,
     pub avatar_url: Option<String>,
     pub text: String,
     pub indexed_at: Option<String>,
@@ -39,6 +40,7 @@ pub struct ProfileSummary {
     pub description: Option<String>,
     pub avatar_url: Option<String>,
     pub banner_url: Option<String>,
+    pub viewer_following: Option<String>,
     pub followers_count: u64,
     pub follows_count: u64,
     pub posts_count: u64,
@@ -51,6 +53,7 @@ pub struct NotificationItem {
     pub author_did: Option<String>,
     pub author_name: String,
     pub author_handle: String,
+    pub author_following_uri: Option<String>,
     pub reason: NotificationReason,
     pub reason_subject: Option<String>,
     pub text: String,
@@ -123,6 +126,13 @@ impl ViewItem {
         match self {
             Self::Post(item) => Some(item.as_mut()),
             Self::Notification(_) => None,
+        }
+    }
+
+    pub fn as_notification_mut(&mut self) -> Option<&mut NotificationItem> {
+        match self {
+            Self::Post(_) => None,
+            Self::Notification(item) => Some(item.as_mut()),
         }
     }
 
@@ -431,6 +441,7 @@ pub fn profile_summary(root: &Value) -> ProfileSummary {
         description: string_field(root, "description").filter(|value| !value.trim().is_empty()),
         avatar_url: string_field(root, "avatar"),
         banner_url: string_field(root, "banner"),
+        viewer_following: viewer_following_uri(root),
         followers_count: number_field(root, "followersCount"),
         follows_count: number_field(root, "followsCount"),
         posts_count: number_field(root, "postsCount"),
@@ -546,6 +557,7 @@ pub fn feed_item_from_post(post: &Value, depth: usize) -> FeedItem {
         author_name: display_name(author),
         author_handle: string_field(author, "handle").unwrap_or_else(|| "unknown".into()),
         author_following: author_following(author),
+        author_following_uri: viewer_following_uri(author),
         avatar_url: string_field(author, "avatar"),
         text: post_text(post),
         indexed_at: string_field(post, "indexedAt")
@@ -577,6 +589,7 @@ pub fn feed_item_from_quote(quote: QuotePost, depth: usize) -> FeedItem {
         author_name: quote.author_name,
         author_handle: quote.author_handle,
         author_following: None,
+        author_following_uri: None,
         avatar_url: None,
         text: quote.text,
         indexed_at: quote.indexed_at,
@@ -633,6 +646,7 @@ fn notification_item(value: &Value) -> NotificationItem {
         author_did: string_field(author, "did"),
         author_name: display_name(author),
         author_handle: string_field(author, "handle").unwrap_or_else(|| "unknown".into()),
+        author_following_uri: viewer_following_uri(author),
         reason,
         reason_subject,
         text,
@@ -1157,11 +1171,14 @@ fn author_following(author: &Value) -> Option<bool> {
     author
         .get("viewer")
         .and_then(|viewer| viewer.get("following"))
-        .map(|value| {
-            value
-                .as_str()
-                .is_some_and(|following| !following.is_empty())
-        })
+        .map(|_| viewer_following_uri(author).is_some())
+}
+
+fn viewer_following_uri(value: &Value) -> Option<String> {
+    value
+        .get("viewer")
+        .and_then(|viewer| string_field(viewer, "following"))
+        .filter(|following| !following.is_empty())
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -1280,6 +1297,9 @@ mod tests {
             "description": "hello profile",
             "avatar": "https://example.com/avatar.jpg",
             "banner": "https://example.com/banner.jpg",
+            "viewer": {
+                "following": "at://did:plc:viewer/app.bsky.graph.follow/1"
+            },
             "followersCount": 10,
             "followsCount": 20,
             "postsCount": 30
@@ -1291,6 +1311,10 @@ mod tests {
         assert_eq!(profile.handle, "alice.test");
         assert_eq!(profile.display_name, "Alice");
         assert_eq!(profile.description.as_deref(), Some("hello profile"));
+        assert_eq!(
+            profile.viewer_following.as_deref(),
+            Some("at://did:plc:viewer/app.bsky.graph.follow/1")
+        );
         assert_eq!(profile.followers_count, 10);
         assert_eq!(profile.follows_count, 20);
         assert_eq!(profile.posts_count, 30);
@@ -1308,7 +1332,10 @@ mod tests {
                     "author": {
                         "did": "did:plc:bob",
                         "handle": "bob.test",
-                        "displayName": "Bob"
+                        "displayName": "Bob",
+                        "viewer": {
+                            "following": "at://did:plc:viewer/app.bsky.graph.follow/1"
+                        }
                     },
                     "reason": "like",
                     "reasonSubject": "at://did:plc:alice/app.bsky.feed.post/root",
@@ -1354,6 +1381,10 @@ mod tests {
         assert_eq!(cursor.as_deref(), Some("next"));
         assert_eq!(seen_at.as_deref(), Some("2026-05-22T00:00:00Z"));
         assert_eq!(items[0].reason, NotificationReason::Like);
+        assert_eq!(
+            items[0].author_following_uri.as_deref(),
+            Some("at://did:plc:viewer/app.bsky.graph.follow/1")
+        );
         assert_eq!(
             items[0].target,
             NotificationTarget::Post {
@@ -1460,6 +1491,10 @@ mod tests {
             Some("alice.test")
         );
         assert_eq!(items[0].author_following, Some(true));
+        assert_eq!(
+            items[0].author_following_uri.as_deref(),
+            Some("at://did:viewer/follow/1")
+        );
     }
 
     #[test]

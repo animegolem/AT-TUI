@@ -71,6 +71,7 @@ cargo run -- --no-images
 - `U`: merge pending new posts and jump to top
 - `F`: like/unlike selected post
 - `R`: repost/unrepost selected post
+- `w`: follow/unfollow selected post author, notification author, or active profile
 - `p`: compose a new text post
 - `c`: reply to selected post
 - `Q`: quote selected post

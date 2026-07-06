@@ -723,6 +723,7 @@ mod tests {
             author_name: "Alice".into(),
             author_handle: "alice.test".into(),
             author_following: None,
+            author_following_uri: None,
             avatar_url: None,
             text: "hello".into(),
             indexed_at: None,

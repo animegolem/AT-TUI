@@ -142,6 +142,7 @@ pub enum Action {
     LoadPending,
     ToggleLike,
     ToggleRepost,
+    ToggleFollow,
     ComposePost,
     ComposeReply,
     ComposeQuote,
@@ -172,6 +173,7 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('U') => Some(Action::LoadPending),
         KeyCode::Char('F') => Some(Action::ToggleLike),
         KeyCode::Char('R') => Some(Action::ToggleRepost),
+        KeyCode::Char('w') => Some(Action::ToggleFollow),
         KeyCode::Char('p') => Some(Action::ComposePost),
         KeyCode::Char('c') => Some(Action::ComposeReply),
         KeyCode::Char('Q') => Some(Action::ComposeQuote),
@@ -195,7 +197,7 @@ pub fn normal_key_help_lines() -> Vec<&'static str> {
         "  j/k or arrows: move",
         "  l/Enter/Right: open selected · h/Left: back · Esc back/settings",
         "  P profile · N notifications · Space media · u links",
-        "  F like · R repost · p post · c reply · Q quote",
+        "  F like · R repost · w follow · p post · c reply · Q quote",
         "  / search · n next · r reload · o quote · U load pending · q quit",
     ]
 }
@@ -422,9 +424,22 @@ enum WriteResult {
         reposted: bool,
         record_uri: Option<String>,
     },
+    Follow {
+        target_did: String,
+        target_handle: String,
+        followed: bool,
+        record_uri: Option<String>,
+    },
     Posted {
         uri: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FollowTarget {
+    did: String,
+    handle: String,
+    following_uri: Option<String>,
 }
 
 pub struct App {
@@ -877,6 +892,7 @@ impl App {
             }
             Action::ToggleLike => self.toggle_like_selected(),
             Action::ToggleRepost => self.toggle_repost_selected(),
+            Action::ToggleFollow => self.toggle_follow_selected(),
             Action::ComposePost => self.open_post_composer(),
             Action::ComposeReply => self.open_reply_composer(),
             Action::ComposeQuote => self.open_quote_composer(),
@@ -1341,12 +1357,60 @@ impl App {
                     "Removed repost"
                 });
             }
+            Ok(WriteResult::Follow {
+                target_did,
+                target_handle,
+                followed,
+                record_uri,
+            }) => {
+                self.apply_follow_state(&target_did, &target_handle, followed, record_uri);
+                self.set_status(if followed {
+                    format!("Following @{target_handle}")
+                } else {
+                    format!("Unfollowed @{target_handle}")
+                });
+            }
             Ok(WriteResult::Posted { uri }) => {
                 self.set_status(format!("Posted {uri}"));
                 self.last_refresh = Instant::now() - self.refresh_interval;
             }
             Err(error) => self.set_status(format!("Write failed: {error}")),
         }
+    }
+
+    fn apply_follow_state(
+        &mut self,
+        target_did: &str,
+        target_handle: &str,
+        followed: bool,
+        record_uri: Option<String>,
+    ) {
+        let record_uri_for_posts = record_uri.clone();
+        self.nav.for_each_item_mut(|item| {
+            if item.author_did.as_deref() == Some(target_did)
+                || (!target_handle.is_empty() && item.author_handle == target_handle)
+            {
+                item.author_following = Some(followed);
+                item.author_following_uri = record_uri_for_posts.clone();
+            }
+        });
+
+        let record_uri_for_notifications = record_uri.clone();
+        self.nav.for_each_notification_mut(|item| {
+            if item.author_did.as_deref() == Some(target_did)
+                || (!target_handle.is_empty() && item.author_handle == target_handle)
+            {
+                item.author_following_uri = record_uri_for_notifications.clone();
+            }
+        });
+
+        self.nav.for_each_profile_mut(|profile| {
+            if profile.did == target_did
+                || (!target_handle.is_empty() && profile.handle == target_handle)
+            {
+                profile.viewer_following = record_uri.clone();
+            }
+        });
     }
 
     fn apply_thread_loaded(&mut self, action: ThreadAction, result: AppTaskResult<Vec<FeedItem>>) {
@@ -1562,6 +1626,51 @@ impl App {
         Some((actor, notification.author_handle.clone()))
     }
 
+    fn follow_target_for_selected(&self) -> Result<FollowTarget, &'static str> {
+        let view = self.nav.current();
+        if matches!(view.kind, ViewKind::Profile { .. })
+            && let Some(profile) = &view.profile
+        {
+            let did = profile.did.trim();
+            if did.is_empty() {
+                return Err("Selected profile is missing a DID; cannot follow");
+            }
+            return Ok(FollowTarget {
+                did: did.to_owned(),
+                handle: profile.handle.clone(),
+                following_uri: profile.viewer_following.clone(),
+            });
+        }
+
+        if let Some(item) = view.selected_item() {
+            let did = item
+                .author_did
+                .as_deref()
+                .filter(|did| !did.trim().is_empty())
+                .ok_or("Selected author is missing a DID; cannot follow")?;
+            return Ok(FollowTarget {
+                did: did.to_owned(),
+                handle: item.author_handle.clone(),
+                following_uri: item.author_following_uri.clone(),
+            });
+        }
+
+        if let Some(notification) = view.selected_notification() {
+            let did = notification
+                .author_did
+                .as_deref()
+                .filter(|did| !did.trim().is_empty())
+                .ok_or("Selected notification author is missing a DID; cannot follow")?;
+            return Ok(FollowTarget {
+                did: did.to_owned(),
+                handle: notification.author_handle.clone(),
+                following_uri: notification.author_following_uri.clone(),
+            });
+        }
+
+        Err("No follow target for selected item")
+    }
+
     async fn open_quote_for_selected(&mut self) -> Result<()> {
         let Some(quote) = self
             .nav
@@ -1775,6 +1884,57 @@ impl App {
                     Ok(WriteResult::Repost {
                         target_uri,
                         reposted: true,
+                        record_uri: Some(record.uri),
+                    })
+                }
+            }
+            .await
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+            AppEvent::WriteCompleted { result }
+        });
+    }
+
+    fn toggle_follow_selected(&mut self) {
+        let target = match self.follow_target_for_selected() {
+            Ok(target) => target,
+            Err(status) => {
+                self.set_status(status);
+                return;
+            }
+        };
+
+        if target.did == self.client.session().did {
+            self.set_status("Cannot follow your own account");
+            return;
+        }
+
+        self.pending_writes = self.pending_writes.saturating_add(1);
+        self.set_status(if target.following_uri.is_some() {
+            format!("Unfollowing @{}", target.handle)
+        } else {
+            format!("Following @{}", target.handle)
+        });
+
+        let existing = target.following_uri.clone();
+        let target_did = target.did.clone();
+        let target_handle = target.handle.clone();
+        let mut client = self.client.clone();
+        self.spawn_event(async move {
+            let result = async {
+                if let Some(record_uri) = existing {
+                    client.delete_record_uri(&record_uri).await?;
+                    Ok(WriteResult::Follow {
+                        target_did,
+                        target_handle,
+                        followed: false,
+                        record_uri: None,
+                    })
+                } else {
+                    let record = client.create_follow(&target_did).await?;
+                    Ok(WriteResult::Follow {
+                        target_did,
+                        target_handle,
+                        followed: true,
                         record_uri: Some(record.uri),
                     })
                 }
@@ -2309,6 +2469,10 @@ mod tests {
             Some(Action::OpenNotifications)
         );
         assert_eq!(
+            normal_action_for_key(key(KeyCode::Char('w'))),
+            Some(Action::ToggleFollow)
+        );
+        assert_eq!(
             normal_action_for_key(key(KeyCode::Char('l'))),
             Some(Action::OpenSelected)
         );
@@ -2328,6 +2492,11 @@ mod tests {
             normal_key_help_lines()
                 .iter()
                 .any(|line| line.contains("P profile") && line.contains("N notifications"))
+        );
+        assert!(
+            normal_key_help_lines()
+                .iter()
+                .any(|line| line.contains("w follow"))
         );
     }
 
@@ -2418,6 +2587,169 @@ mod tests {
     }
 
     #[test]
+    fn follow_target_uses_profile_before_selected_post() {
+        let mut post = item("post", "hello");
+        post.author_did = Some("did:plc:bob".into());
+        post.author_handle = "bob.test".into();
+        let mut app = app_with_items(vec![post]);
+        let mut profile_view = ViewState::new(
+            "Profile @carol.test",
+            ViewKind::Profile {
+                actor: "did:plc:carol".into(),
+            },
+            vec![item("carol-post", "hello")],
+        );
+        profile_view.set_profile(ProfileSummary {
+            did: "did:plc:carol".into(),
+            handle: "carol.test".into(),
+            display_name: "Carol".into(),
+            description: None,
+            avatar_url: None,
+            banner_url: None,
+            viewer_following: Some("at://did:plc:viewer/app.bsky.graph.follow/1".into()),
+            followers_count: 0,
+            follows_count: 0,
+            posts_count: 0,
+        });
+        app.nav.push(profile_view);
+
+        assert_eq!(
+            app.follow_target_for_selected().unwrap(),
+            FollowTarget {
+                did: "did:plc:carol".into(),
+                handle: "carol.test".into(),
+                following_uri: Some("at://did:plc:viewer/app.bsky.graph.follow/1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn follow_target_uses_post_or_notification_author() {
+        let mut post = item("post", "hello");
+        post.author_did = Some("did:plc:bob".into());
+        post.author_handle = "bob.test".into();
+        post.author_following_uri = Some("at://did:plc:viewer/app.bsky.graph.follow/1".into());
+        let mut app = app_with_items(vec![post]);
+
+        assert_eq!(
+            app.follow_target_for_selected().unwrap(),
+            FollowTarget {
+                did: "did:plc:bob".into(),
+                handle: "bob.test".into(),
+                following_uri: Some("at://did:plc:viewer/app.bsky.graph.follow/1".into()),
+            }
+        );
+
+        let mut notification = notification(NotificationTarget::Profile {
+            actor: "did:plc:carol".into(),
+        });
+        notification.author_did = Some("did:plc:carol".into());
+        notification.author_handle = "carol.test".into();
+        let rows = vec![ViewItem::Notification(Box::new(notification))];
+        app.nav.push(ViewState::from_rows(
+            "Notifications",
+            ViewKind::Notifications,
+            rows,
+        ));
+
+        assert_eq!(
+            app.follow_target_for_selected().unwrap(),
+            FollowTarget {
+                did: "did:plc:carol".into(),
+                handle: "carol.test".into(),
+                following_uri: None,
+            }
+        );
+    }
+
+    #[test]
+    fn self_follow_guard_does_not_queue_write() {
+        let mut post = item("post", "hello");
+        post.author_did = Some("did:plc:alice".into());
+        post.author_handle = "alice.test".into();
+        let mut app = app_with_items(vec![post]);
+
+        app.toggle_follow_selected();
+
+        assert_eq!(app.pending_writes, 0);
+        assert!(app.status.contains("Cannot follow your own account"));
+    }
+
+    #[test]
+    fn follow_write_result_updates_matching_visible_state() {
+        let mut post = item("post", "hello");
+        post.author_did = Some("did:plc:bob".into());
+        post.author_handle = "bob.test".into();
+        let mut app = app_with_items(vec![post]);
+        let mut profile_view = ViewState::new(
+            "Profile @bob.test",
+            ViewKind::Profile {
+                actor: "did:plc:bob".into(),
+            },
+            Vec::new(),
+        );
+        profile_view.set_profile(ProfileSummary {
+            did: "did:plc:bob".into(),
+            handle: "bob.test".into(),
+            display_name: "Bob".into(),
+            description: None,
+            avatar_url: None,
+            banner_url: None,
+            viewer_following: None,
+            followers_count: 0,
+            follows_count: 0,
+            posts_count: 0,
+        });
+        app.nav.push(profile_view);
+
+        app.apply_write_result(Ok(WriteResult::Follow {
+            target_did: "did:plc:bob".into(),
+            target_handle: "bob.test".into(),
+            followed: true,
+            record_uri: Some("at://did:plc:viewer/app.bsky.graph.follow/1".into()),
+        }));
+
+        let root_item = app.nav.current().profile.as_ref().unwrap();
+        assert_eq!(
+            root_item.viewer_following.as_deref(),
+            Some("at://did:plc:viewer/app.bsky.graph.follow/1")
+        );
+        app.nav.pop();
+        let post = app.nav.current().selected_item().unwrap();
+        assert_eq!(post.author_following, Some(true));
+        assert_eq!(
+            post.author_following_uri.as_deref(),
+            Some("at://did:plc:viewer/app.bsky.graph.follow/1")
+        );
+
+        app.apply_write_result(Ok(WriteResult::Follow {
+            target_did: "did:plc:bob".into(),
+            target_handle: "bob.test".into(),
+            followed: false,
+            record_uri: None,
+        }));
+
+        let post = app.nav.current().selected_item().unwrap();
+        assert_eq!(post.author_following, Some(false));
+        assert_eq!(post.author_following_uri, None);
+    }
+
+    #[test]
+    fn failed_follow_write_leaves_local_state_unchanged() {
+        let mut post = item("post", "hello");
+        post.author_did = Some("did:plc:bob".into());
+        post.author_handle = "bob.test".into();
+        let mut app = app_with_items(vec![post]);
+
+        app.apply_write_result(Err("network".into()));
+
+        let post = app.nav.current().selected_item().unwrap();
+        assert_eq!(post.author_following, None);
+        assert_eq!(post.author_following_uri, None);
+        assert!(app.status.contains("Write failed"));
+    }
+
+    #[test]
     fn profile_loaded_pushes_profile_view_with_header_and_posts() {
         let mut app = app_with_items(vec![item("post", "hello")]);
 
@@ -2431,6 +2763,7 @@ mod tests {
                     description: Some("profile text".into()),
                     avatar_url: None,
                     banner_url: None,
+                    viewer_following: None,
                     followers_count: 1,
                     follows_count: 2,
                     posts_count: 3,
@@ -2569,6 +2902,7 @@ mod tests {
             author_name: "Alice".into(),
             author_handle: "alice.test".into(),
             author_following: None,
+            author_following_uri: None,
             avatar_url: None,
             text: text.into(),
             indexed_at: None,
@@ -2596,6 +2930,7 @@ mod tests {
             author_did: Some("did:plc:bob".into()),
             author_name: "Bob".into(),
             author_handle: "bob.test".into(),
+            author_following_uri: None,
             reason: NotificationReason::Like,
             reason_subject: None,
             text: "notification text".into(),

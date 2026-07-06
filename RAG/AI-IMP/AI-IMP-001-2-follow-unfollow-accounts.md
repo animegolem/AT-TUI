@@ -6,12 +6,12 @@ tags:
   - at-tui
   - bluesky
   - follow
-kanban_status: planned
+kanban_status: completed
 depends_on: [[AI-EPIC-001-at-tui-public-readiness-polish]]
 parent_epic: [[AI-EPIC-001-at-tui-public-readiness-polish]]
 confidence_score: 0.82
 date_created: 2026-05-22
-date_completed:
+date_completed: 2026-05-23
 ---
 
 # AI-IMP-001-2-follow-unfollow-accounts
@@ -36,16 +36,16 @@ Use provisional `w` as the normal-mode follow toggle until keymap-file support e
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Parse author/profile `viewer.following` into a follow record URI.
-- [ ] Add `BskyClient::create_follow(subject_did)` using `com.atproto.repo.createRecord` with collection `app.bsky.graph.follow`.
-- [ ] Reuse existing record deletion for unfollow.
-- [ ] Add provisional normal-mode `w` action and menu help text.
-- [ ] Resolve the follow target from selected post author, selected notification author, or active profile.
-- [ ] Prevent following/unfollowing the active account and show a transient status.
-- [ ] Queue follow/unfollow writes in the background.
-- [ ] Update matching visible author/profile follow state only after success.
-- [ ] Show profile follow status in the profile header.
-- [ ] Add tests for record construction, self-follow guard, target resolution, successful toggle updates, and failed write behavior.
+- [x] Parse author/profile `viewer.following` into a follow record URI.
+- [x] Add `BskyClient::create_follow(subject_did)` using `com.atproto.repo.createRecord` with collection `app.bsky.graph.follow`.
+- [x] Reuse existing record deletion for unfollow.
+- [x] Add provisional normal-mode `w` action and menu help text.
+- [x] Resolve the follow target from selected post author, selected notification author, or active profile.
+- [x] Prevent following/unfollowing the active account and show a transient status.
+- [x] Queue follow/unfollow writes in the background.
+- [x] Update matching visible author/profile follow state only after success.
+- [x] Show profile follow status in the profile header.
+- [x] Add tests for record construction, self-follow guard, target resolution, successful toggle updates, and failed write behavior.
 
 ### Acceptance Criteria
 **Scenario:** User follows a profile from the profile view.  
@@ -67,4 +67,4 @@ Before marking an item complete on the checklist MUST **stop** and **think**. Ha
 **AND** the statusline shows that self-follow is not allowed.
 
 ### Issues Encountered
-None yet.
+Implementation is complete in the current working tree and validated with `cargo fmt -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, and `git diff --check`; it has not been committed yet.

@@ -35,6 +35,7 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let active_did = app.client.session().did.clone();
     let view = app.nav.current_mut();
     let title = if view.loading {
         format!("{} [loading]", view.title)
@@ -47,7 +48,7 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let profile_lines = view
         .profile
         .as_ref()
-        .map(|profile| render_profile_header_lines(profile, inner_width))
+        .map(|profile| render_profile_header_lines(profile, inner_width, &active_did))
         .unwrap_or_default();
     let list_available = available_lines.saturating_sub(profile_lines.len());
     let mut lines = profile_lines;
@@ -596,7 +597,11 @@ fn empty_view_text(kind: &ViewKind) -> &'static str {
     }
 }
 
-fn render_profile_header_lines(profile: &ProfileSummary, width: usize) -> Vec<Line<'static>> {
+fn render_profile_header_lines(
+    profile: &ProfileSummary,
+    width: usize,
+    active_did: &str,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         format!("{} @{}", profile.display_name, profile.handle),
@@ -609,10 +614,19 @@ fn render_profile_header_lines(profile: &ProfileSummary, width: usize) -> Vec<Li
             lines.push(Line::from(line));
         }
     }
+    let follow_state = if !profile.did.is_empty() && profile.did != active_did {
+        if profile.viewer_following.is_some() {
+            "  · following"
+        } else {
+            "  · not following"
+        }
+    } else {
+        ""
+    };
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "{} followers  {} following  {} posts",
-            profile.followers_count, profile.follows_count, profile.posts_count
+            "{} followers  {} following  {} posts{}",
+            profile.followers_count, profile.follows_count, profile.posts_count, follow_state
         ),
         Style::default().fg(Color::DarkGray),
     )]));
@@ -987,6 +1001,7 @@ mod tests {
             author_name: "Alice".into(),
             author_handle: "alice.test".into(),
             author_following: None,
+            author_following_uri: None,
             avatar_url: None,
             text: text.into(),
             indexed_at: None,
@@ -1073,6 +1088,7 @@ mod tests {
             author_did: Some("did:plc:bob".into()),
             author_name: "Bob".into(),
             author_handle: "bob.test".into(),
+            author_following_uri: None,
             reason: crate::model::NotificationReason::Reply,
             reason_subject: Some("at://did:plc:alice/app.bsky.feed.post/1".into()),
             text: "reply text".into(),
@@ -1108,12 +1124,13 @@ mod tests {
             description: Some("profile text".into()),
             avatar_url: None,
             banner_url: None,
+            viewer_following: Some("at://did:plc:viewer/app.bsky.graph.follow/1".into()),
             followers_count: 1,
             follows_count: 2,
             posts_count: 3,
         };
 
-        let lines = render_profile_header_lines(&profile, 80);
+        let lines = render_profile_header_lines(&profile, 80, "did:plc:viewer");
         let text = lines
             .iter()
             .map(|line| {
@@ -1126,7 +1143,38 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("Alice @alice.test"));
+        assert!(text.contains("1 followers  2 following  3 posts  · following"));
+    }
+
+    #[test]
+    fn omits_profile_follow_state_for_active_account() {
+        let profile = ProfileSummary {
+            did: "did:plc:alice".into(),
+            handle: "alice.test".into(),
+            display_name: "Alice".into(),
+            description: None,
+            avatar_url: None,
+            banner_url: None,
+            viewer_following: None,
+            followers_count: 1,
+            follows_count: 2,
+            posts_count: 3,
+        };
+
+        let lines = render_profile_header_lines(&profile, 80, "did:plc:alice");
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
         assert!(text.contains("1 followers  2 following  3 posts"));
+        assert!(!text.contains("not following"));
     }
 
     #[test]

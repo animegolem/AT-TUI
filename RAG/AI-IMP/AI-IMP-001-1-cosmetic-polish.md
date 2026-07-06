@@ -6,12 +6,12 @@ tags:
   - at-tui
   - ui
   - polish
-kanban_status: planned
+kanban_status: completed
 depends_on: [[AI-EPIC-001-at-tui-public-readiness-polish]]
 parent_epic: [[AI-EPIC-001-at-tui-public-readiness-polish]]
 confidence_score: 0.88
 date_created: 2026-05-22
-date_completed:
+date_completed: 2026-05-23
 ---
 
 # AI-IMP-001-1-cosmetic-polish
@@ -33,16 +33,16 @@ Keep the statusline one row. Remove separator spans and let colored segments sit
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Remove literal slash separator spans from statusline construction.
-- [ ] Ensure colored statusline segments connect edge-to-edge while retaining readable padding.
-- [ ] Keep `status_right_line` separately right-aligned and unchanged in width behavior.
-- [ ] Wrap image alt text within available row width.
-- [ ] Wrap video alt text within available row width.
-- [ ] Wrap external link title/description summaries within available row width.
-- [ ] Apply distinct media/link colors so summaries stand out from normal post text.
-- [ ] Style active likes with red + bold `♥`.
-- [ ] Preserve active repost styling as green + bold `⟳`.
-- [ ] Update or add unit tests for status segments, media/link wrapping, and active engagement colors.
+- [x] Remove literal slash separator spans from statusline construction.
+- [x] Ensure colored statusline segments connect edge-to-edge while retaining readable padding.
+- [x] Keep `status_right_line` separately right-aligned and unchanged in width behavior.
+- [x] Wrap image alt text within available row width.
+- [x] Wrap video alt text within available row width.
+- [x] Wrap external link title/description summaries within available row width.
+- [x] Apply distinct media/link colors so summaries stand out from normal post text.
+- [x] Style active likes with red + bold `♥`.
+- [x] Preserve active repost styling as green + bold `⟳`.
+- [x] Update or add unit tests for status segments, media/link wrapping, and active engagement colors.
 
 ### Acceptance Criteria
 **Scenario:** A timeline row includes a long image alt text.  
@@ -64,4 +64,4 @@ Before marking an item complete on the checklist MUST **stop** and **think**. Ha
 **AND** the selected/total counter remains pinned at the right.
 
 ### Issues Encountered
-None yet.
+Completed in `8a3c8e3` with passing `cargo fmt -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, and `git diff --check`.

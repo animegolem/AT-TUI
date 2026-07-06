@@ -176,6 +176,11 @@ impl BskyClient {
         self.create_record("app.bsky.feed.repost", record).await
     }
 
+    pub async fn create_follow(&mut self, subject_did: &str) -> Result<CreatedRecord> {
+        let record = follow_record_json(subject_did);
+        self.create_record("app.bsky.graph.follow", record).await
+    }
+
     pub async fn create_post(
         &mut self,
         text: &str,
@@ -368,6 +373,14 @@ fn repost_record_json(subject: &PostRef) -> Value {
     })
 }
 
+fn follow_record_json(subject_did: &str) -> Value {
+    json!({
+        "$type": "app.bsky.graph.follow",
+        "subject": subject_did,
+        "createdAt": now_timestamp(),
+    })
+}
+
 fn post_record_json(
     text: &str,
     reply: Option<(PostRef, PostRef)>,
@@ -532,6 +545,11 @@ mod tests {
         let like = like_record_json(&subject);
         assert_eq!(like["$type"], "app.bsky.feed.like");
         assert_eq!(like["subject"]["uri"].as_str(), Some(subject.uri.as_str()));
+
+        let follow = follow_record_json("did:plc:alice");
+        assert_eq!(follow["$type"], "app.bsky.graph.follow");
+        assert_eq!(follow["subject"].as_str(), Some("did:plc:alice"));
+        assert!(follow["createdAt"].as_str().is_some());
 
         let reply = post_record_json(
             "reply text",
