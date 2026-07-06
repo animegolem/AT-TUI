@@ -133,8 +133,13 @@ fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Quit,
+    BackOrQuit,
     MoveDown,
     MoveUp,
+    HalfPageDown,
+    HalfPageUp,
+    PageDown,
+    PageUp,
     OpenMenu,
     PreviewMedia,
     OpenLinks,
@@ -160,23 +165,35 @@ pub enum Action {
     Reload,
 }
 
+// Keymap principles (AI-EPIC-002): navigation keys are sacred, lowercase
+// acts on the selected post, shift acts on the view or the person, and `q`
+// layers back-then-quit so quote and quit are no longer one shift apart.
 pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
     match key.code {
-        KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::HalfPageDown)
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::HalfPageUp)
+        }
+        KeyCode::Char('q') => Some(Action::BackOrQuit),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::Char('?') => Some(Action::OpenMenu),
         KeyCode::Char(' ') => Some(Action::PreviewMedia),
-        KeyCode::Char('u') => Some(Action::OpenLinks),
+        KeyCode::Char('o') => Some(Action::OpenLinks),
         KeyCode::Char('[') => Some(Action::PreviousFeed),
         KeyCode::Char(']') => Some(Action::NextFeed),
-        KeyCode::Char('U') => Some(Action::LoadPending),
-        KeyCode::Char('F') => Some(Action::ToggleLike),
-        KeyCode::Char('R') => Some(Action::ToggleRepost),
-        KeyCode::Char('w') => Some(Action::ToggleFollow),
+        KeyCode::Char('u') => Some(Action::LoadPending),
+        KeyCode::Char('f') => Some(Action::ToggleLike),
+        KeyCode::Char('F') => Some(Action::ToggleFollow),
+        KeyCode::Char('b') => Some(Action::ToggleRepost),
         KeyCode::Char('p') => Some(Action::ComposePost),
-        KeyCode::Char('c') => Some(Action::ComposeReply),
+        KeyCode::Char('r') => Some(Action::ComposeReply),
+        KeyCode::Char('R') => Some(Action::Reload),
         KeyCode::Char('Q') => Some(Action::ComposeQuote),
         KeyCode::Char('g') => Some(Action::JumpTop),
         KeyCode::Char('G') => Some(Action::JumpBottom),
@@ -185,21 +202,20 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('h') | KeyCode::Left => Some(Action::Back),
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => Some(Action::OpenSelected),
-        KeyCode::Char('o') => Some(Action::OpenQuote),
+        KeyCode::Char('e') => Some(Action::OpenQuote),
         KeyCode::Char('P') => Some(Action::OpenProfile),
         KeyCode::Char('N') => Some(Action::OpenNotifications),
-        KeyCode::Char('r') => Some(Action::Reload),
         _ => None,
     }
 }
 
 pub fn normal_key_help_lines() -> Vec<&'static str> {
     vec![
-        "  j/k or arrows: move",
-        "  l/Enter/Right: open selected · h/Left: back · Esc back/settings",
-        "  P profile · N notifications · Space media · u links",
-        "  F like · R repost · w follow · p post · c reply · Q quote",
-        "  / search · n next · r reload · o quote · U load pending · q quit",
+        "  j/k or arrows: move · Ctrl-d/Ctrl-u half page · PgUp/PgDn page",
+        "  l/Enter/Right: open selected · h/Left back · q back, quit at root",
+        "  P profile · N notifications · Space media · o links · e quoted post",
+        "  f like · b repost · F follow · p post · r reply · Q quote",
+        "  / search · n next · R reload · u load pending · Ctrl-C quit",
     ]
 }
 
@@ -953,8 +969,19 @@ impl App {
 
         match action {
             Action::Quit => self.should_quit = true,
+            Action::BackOrQuit => {
+                if self.nav.pop() {
+                    self.set_status("Back");
+                } else {
+                    self.should_quit = true;
+                }
+            }
             Action::MoveDown => self.nav.current_mut().move_down(),
             Action::MoveUp => self.nav.current_mut().move_up(),
+            Action::HalfPageDown => self.nav.current_mut().move_by(5),
+            Action::HalfPageUp => self.nav.current_mut().move_by(-5),
+            Action::PageDown => self.nav.current_mut().move_by(10),
+            Action::PageUp => self.nav.current_mut().move_by(-10),
             Action::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
             Action::PreviewMedia => self.open_media_overlay_for_selected().await?,
             Action::OpenLinks => self.open_links_for_selected(),
@@ -2868,37 +2895,42 @@ mod tests {
     }
 
     #[test]
-    fn normal_action_registry_maps_profile_notifications_and_existing_keys() {
+    fn normal_action_registry_matches_agreed_keymap() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
 
-        assert_eq!(
-            normal_action_for_key(key(KeyCode::Char('P'))),
-            Some(Action::OpenProfile)
-        );
-        assert_eq!(
-            normal_action_for_key(key(KeyCode::Char('N'))),
-            Some(Action::OpenNotifications)
-        );
-        assert_eq!(
-            normal_action_for_key(key(KeyCode::Char('w'))),
-            Some(Action::ToggleFollow)
-        );
-        assert_eq!(
-            normal_action_for_key(key(KeyCode::Char('l'))),
-            Some(Action::OpenSelected)
-        );
-        assert_eq!(
-            normal_action_for_key(key(KeyCode::Char('h'))),
-            Some(Action::Back)
-        );
-        assert_eq!(
-            normal_action_for_key(key(KeyCode::Esc)),
-            Some(Action::Escape)
-        );
-        assert_eq!(
-            normal_action_for_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(Action::Quit)
-        );
+        let expectations = [
+            (KeyCode::Char('q'), Action::BackOrQuit),
+            (KeyCode::Char('f'), Action::ToggleLike),
+            (KeyCode::Char('F'), Action::ToggleFollow),
+            (KeyCode::Char('b'), Action::ToggleRepost),
+            (KeyCode::Char('r'), Action::ComposeReply),
+            (KeyCode::Char('R'), Action::Reload),
+            (KeyCode::Char('Q'), Action::ComposeQuote),
+            (KeyCode::Char('o'), Action::OpenLinks),
+            (KeyCode::Char('e'), Action::OpenQuote),
+            (KeyCode::Char('u'), Action::LoadPending),
+            (KeyCode::Char('p'), Action::ComposePost),
+            (KeyCode::Char('P'), Action::OpenProfile),
+            (KeyCode::Char('N'), Action::OpenNotifications),
+            (KeyCode::Char('l'), Action::OpenSelected),
+            (KeyCode::Char('h'), Action::Back),
+            (KeyCode::PageDown, Action::PageDown),
+            (KeyCode::PageUp, Action::PageUp),
+        ];
+        for (code, action) in expectations {
+            assert_eq!(normal_action_for_key(key(code)), Some(action));
+        }
+
+        assert_eq!(normal_action_for_key(ctrl('c')), Some(Action::Quit));
+        assert_eq!(normal_action_for_key(ctrl('d')), Some(Action::HalfPageDown));
+        assert_eq!(normal_action_for_key(ctrl('u')), Some(Action::HalfPageUp));
+
+        // Retired bindings must be unmapped.
+        assert_eq!(normal_action_for_key(key(KeyCode::Char('w'))), None);
+        assert_eq!(normal_action_for_key(key(KeyCode::Char('U'))), None);
+        assert_eq!(normal_action_for_key(key(KeyCode::Char('c'))), None);
+
         assert!(
             normal_key_help_lines()
                 .iter()
@@ -2907,8 +2939,54 @@ mod tests {
         assert!(
             normal_key_help_lines()
                 .iter()
-                .any(|line| line.contains("w follow"))
+                .any(|line| line.contains("F follow") && line.contains("f like"))
         );
+    }
+
+    #[tokio::test]
+    async fn q_pops_views_and_quits_only_at_root() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.nav.push(ViewState::new(
+            "Thread @alice.test",
+            ViewKind::Thread {
+                root_uri: "post".into(),
+            },
+            vec![item("post", "hello")],
+        ));
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.nav.depth(), 1);
+        assert!(!app.should_quit);
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn half_page_and_page_keys_move_selection() {
+        let items = (0..30)
+            .map(|index| item(&format!("post-{index}"), "text"))
+            .collect::<Vec<_>>();
+        let mut app = app_with_items(items);
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.nav.current().selected, 5);
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.nav.current().selected, 15);
+
+        app.handle_normal_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.nav.current().selected, 10);
     }
 
     #[tokio::test]

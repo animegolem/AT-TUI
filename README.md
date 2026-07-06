@@ -62,26 +62,30 @@ cargo run -- --no-images
 
 - `j` / Down: move down
 - `k` / Up: move up
+- `Ctrl-d` / `Ctrl-u`: half page down/up
+- PgDn / PgUp: page down/up
 - `g`: top
 - `G`: bottom
 - `l` / Right / Enter: open replies/thread for the selected post
 - `h` / Left / Esc: go back
+- `q`: go back; quits when already at the timeline root
 - `[` / `]`: previous/next saved feed
 - Space: open media overlay for selected post
-- `U`: merge pending new posts and jump to top
-- `F`: like/unlike selected post
-- `R`: repost/unrepost selected post
-- `w`: follow/unfollow selected post author, notification author, or active profile
+- Mouse wheel: move selection
+- `u`: merge pending new posts and jump to top
+- `f`: like/unlike selected post
+- `b`: repost/unrepost selected post
+- `F`: follow/unfollow selected post author, notification author, or active profile
 - `p`: compose a new text post
-- `c`: reply to selected post
+- `r`: reply to selected post
 - `Q`: quote selected post
-- `u`: open selected post's link, or show a picker when multiple links exist
-- `o`: open selected post's quoted post
+- `o`: open selected post's link, or show a picker when multiple links exist
+- `e`: open selected post's quoted post
 - `/`: search within loaded posts in the current view
 - `n`: next search match
-- `r`: reload current view
+- `R`: reload current view
 - `?`: menu with keys, account, feed, and image settings
-- `q`: quit
+- `Ctrl-C`: quit from anywhere
 
 Menu:
 

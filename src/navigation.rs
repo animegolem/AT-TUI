@@ -143,6 +143,15 @@ impl ViewState {
         self.ensure_cursor_visible();
     }
 
+    pub fn move_by(&mut self, delta: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let last = (self.items.len() - 1) as isize;
+        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+        self.ensure_cursor_visible();
+    }
+
     pub fn jump_top(&mut self) {
         self.selected = 0;
         self.scroll = 0;
@@ -328,6 +337,22 @@ mod tests {
             embed_status: None,
             depth: 0,
         }
+    }
+
+    #[test]
+    fn move_by_clamps_at_both_ends() {
+        let mut view = ViewState::new(
+            "Timeline",
+            ViewKind::Timeline,
+            vec![item("1", "one"), item("2", "two"), item("3", "three")],
+        );
+
+        view.move_by(10);
+        assert_eq!(view.selected, 2);
+        view.move_by(-1);
+        assert_eq!(view.selected, 1);
+        view.move_by(-10);
+        assert_eq!(view.selected, 0);
     }
 
     #[test]

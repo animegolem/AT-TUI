@@ -6,12 +6,12 @@ tags:
   - at-tui
   - keymap
   - input
-kanban_status: planned
+kanban_status: completed
 depends_on: [[AI-IMP-002-2]]
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.87
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-4-keymap-rework-page-scroll
@@ -36,14 +36,14 @@ Per the epic table: `q` back/close (quits only at root timeline with no overlay)
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] `normal_action_for_key` implements the agreed table; retired keys unmapped.
-- [ ] `q` pops views/overlays and quits only at root with no overlay.
-- [ ] `navigation.rs`: `move_by` clamped at both ends; unit test.
-- [ ] `Ctrl-d`/`Ctrl-u` half-page, `PgDn`/`PgUp` full-page in all list views.
-- [ ] Help overlay lines match the new map.
-- [ ] README Keys and Menu sections match the new map.
-- [ ] Tests updated: action registry, q layering, page motion.
-- [ ] Gate: fmt, test, clippy -D warnings, build.
+- [x] `normal_action_for_key` implements the agreed table; retired keys unmapped.
+- [x] `q` pops views/overlays and quits only at root with no overlay.
+- [x] `navigation.rs`: `move_by` clamped at both ends; unit test.
+- [x] `Ctrl-d`/`Ctrl-u` half-page, `PgDn`/`PgUp` full-page in all list views.
+- [x] Help overlay lines match the new map.
+- [x] README Keys and Menu sections match the new map.
+- [x] Tests updated: action registry, q layering, page motion.
+- [x] Gate: fmt, test, clippy -D warnings, build.
 
 ### Acceptance Criteria
 **Scenario:** Backing out with q.
@@ -63,3 +63,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+No blockers. `q` inside overlays already closed them via the overlay handlers, so BackOrQuit only needed the normal-mode layering. `d` is intentionally left unmapped until AI-IMP-002-6 claims it for delete. Page motion is item-based (5/10) rather than pixel-based because rows have variable height; feels right in practice but worth revisiting if items get much taller with inline media.
