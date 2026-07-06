@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
+use linkify::{LinkFinder, LinkKind};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -219,13 +220,28 @@ impl BskyClient {
         self.create_record("app.bsky.graph.follow", record).await
     }
 
+    pub async fn resolve_handle(&mut self, handle: &str) -> Result<String> {
+        let query = vec![("handle".to_owned(), handle.to_owned())];
+        let root = self
+            .get("com.atproto.identity.resolveHandle", &query)
+            .await?;
+        required_string(&root, "did")
+    }
+
     pub async fn create_post(
         &mut self,
         text: &str,
         reply: Option<(PostRef, PostRef)>,
         quote: Option<PostRef>,
     ) -> Result<CreatedRecord> {
-        let record = post_record_json(text, reply, quote);
+        let mut facets = link_facets(text);
+        for mention in mention_candidates(text) {
+            // Unresolvable mentions post as plain text rather than failing.
+            if let Ok(did) = self.resolve_handle(&mention.handle).await {
+                facets.push(mention_facet(&mention, &did));
+            }
+        }
+        let record = post_record_json(text, reply, quote, facets);
         self.create_record("app.bsky.feed.post", record).await
     }
 
@@ -431,12 +447,17 @@ fn post_record_json(
     text: &str,
     reply: Option<(PostRef, PostRef)>,
     quote: Option<PostRef>,
+    facets: Vec<Value>,
 ) -> Value {
     let mut record = json!({
         "$type": "app.bsky.feed.post",
         "text": text,
         "createdAt": now_timestamp(),
     });
+
+    if !facets.is_empty() {
+        record["facets"] = Value::Array(facets);
+    }
 
     if let Some((root, parent)) = reply {
         record["reply"] = json!({
@@ -453,6 +474,95 @@ fn post_record_json(
     }
 
     record
+}
+
+// Facet index fields are UTF-8 byte offsets, which is exactly what linkify
+// and our byte scanner produce; no char-index conversion is needed.
+fn link_facets(text: &str) -> Vec<Value> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    finder
+        .links(text)
+        .map(|link| {
+            json!({
+                "index": {"byteStart": link.start(), "byteEnd": link.end()},
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": link.as_str(),
+                }],
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionCandidate {
+    byte_start: usize,
+    byte_end: usize,
+    handle: String,
+}
+
+fn mention_facet(mention: &MentionCandidate, did: &str) -> Value {
+    json!({
+        "index": {"byteStart": mention.byte_start, "byteEnd": mention.byte_end},
+        "features": [{
+            "$type": "app.bsky.richtext.facet#mention",
+            "did": did,
+        }],
+    })
+}
+
+fn mention_candidates(text: &str) -> Vec<MentionCandidate> {
+    let bytes = text.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'@' && (index == 0 || !is_handle_byte(bytes[index - 1])) {
+            let mut end = index + 1;
+            while end < bytes.len() && is_handle_byte(bytes[end]) {
+                end += 1;
+            }
+            // A sentence-ending dot is punctuation, not part of the handle.
+            while end > index + 1 && bytes[end - 1] == b'.' {
+                end -= 1;
+            }
+            let handle = &text[index + 1..end];
+            if is_plausible_handle(handle) {
+                candidates.push(MentionCandidate {
+                    byte_start: index,
+                    byte_end: end,
+                    handle: handle.to_owned(),
+                });
+            }
+            index = end.max(index + 1);
+        } else {
+            index += 1;
+        }
+    }
+    candidates
+}
+
+fn is_handle_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-'
+}
+
+fn is_plausible_handle(handle: &str) -> bool {
+    let segments: Vec<&str> = handle.split('.').collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let tld = segments.last().expect("at least two segments");
+    if tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    segments.iter().all(|segment| {
+        !segment.is_empty()
+            && !segment.starts_with('-')
+            && !segment.ends_with('-')
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 async fn response_json(response: Response) -> Result<Value> {
@@ -607,13 +717,61 @@ mod tests {
                 subject.clone(),
             )),
             None,
+            Vec::new(),
         );
         assert_eq!(reply["reply"]["root"]["cid"], "rootcid");
         assert_eq!(reply["reply"]["parent"]["cid"], "postcid");
+        assert!(reply.get("facets").is_none());
 
-        let quote = post_record_json("quote text", None, Some(subject));
+        let quote = post_record_json("quote text", None, Some(subject), Vec::new());
         assert_eq!(quote["embed"]["$type"], "app.bsky.embed.record");
         assert_eq!(quote["embed"]["record"]["cid"], "postcid");
+    }
+
+    #[test]
+    fn link_facets_use_byte_offsets_after_multibyte_text() {
+        let text = "🦋🦋 https://example.com done";
+        let facets = link_facets(text);
+
+        assert_eq!(facets.len(), 1);
+        let start = facets[0]["index"]["byteStart"].as_u64().unwrap() as usize;
+        let end = facets[0]["index"]["byteEnd"].as_u64().unwrap() as usize;
+        assert_eq!(&text[start..end], "https://example.com");
+        assert_eq!(
+            facets[0]["features"][0]["uri"].as_str(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn mention_candidates_find_handles_and_skip_noise() {
+        let text = "hi @alice.test and @bob.example.com. not@this.one @x @-bad.com";
+        let candidates = mention_candidates(text);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.handle.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice.test", "bob.example.com"]
+        );
+        for candidate in &candidates {
+            assert_eq!(
+                &text[candidate.byte_start..candidate.byte_end],
+                format!("@{}", candidate.handle)
+            );
+        }
+    }
+
+    #[test]
+    fn post_record_includes_facets_when_present() {
+        let text = "see https://example.com";
+        let record = post_record_json(text, None, None, link_facets(text));
+
+        assert_eq!(
+            record["facets"][0]["features"][0]["$type"],
+            "app.bsky.richtext.facet#link"
+        );
     }
 
     #[test]

@@ -79,6 +79,7 @@ cargo run -- --no-images
 - `p`: compose a new text post
 - `r`: reply to selected post
 - `Q`: quote selected post
+- `d`: delete your own selected post (with confirmation)
 - `o`: open selected post's link, or show a picker when multiple links exist
 - `e`: open selected post's quoted post
 - `/`: search within loaded posts in the current view

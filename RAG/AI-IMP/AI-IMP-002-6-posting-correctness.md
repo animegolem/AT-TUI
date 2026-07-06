@@ -6,12 +6,12 @@ tags:
   - at-tui
   - posting
   - facets
-kanban_status: planned
+kanban_status: completed
 depends_on: [[AI-IMP-002-4]]
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.8
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-6-posting-correctness
@@ -37,14 +37,14 @@ Facets: a `facets_for_text` builder in api.rs — linkify finds URLs (byte offse
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] `facets_for_text` emits link facets with correct byte ranges (multibyte-text test).
-- [ ] Mention facets resolve handles; unresolvable mentions skipped without failing the post.
-- [ ] `create_post` includes facets when present.
-- [ ] Grapheme-based length check in composer submit and counter display.
-- [ ] `d` opens confirm overlay only for own posts; `y` deletes, others cancel.
-- [ ] Successful delete removes the post from all stacked views and shows status.
-- [ ] Tests: facet byte offsets, grapheme edge case (emoji ZWJ), delete guard for foreign posts.
-- [ ] Gate: fmt, test, clippy -D warnings, build.
+- [x] `facets_for_text` emits link facets with correct byte ranges (multibyte-text test).
+- [x] Mention facets resolve handles; unresolvable mentions skipped without failing the post.
+- [x] `create_post` includes facets when present.
+- [x] Grapheme-based length check in composer submit and counter display.
+- [x] `d` opens confirm overlay only for own posts; `y` deletes, others cancel.
+- [x] Successful delete removes the post from all stacked views and shows status.
+- [x] Tests: facet byte offsets, grapheme edge case (emoji ZWJ), delete guard for foreign posts.
+- [x] Gate: fmt, test, clippy -D warnings, build.
 
 ### Acceptance Criteria
 **Scenario:** Posting a link.
@@ -65,3 +65,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+Mention detection is a conservative ASCII byte scanner (segments, TLD >= 2 alpha, trailing-dot trim); punycode/unicode handles post as plain text, acceptable for v1. Mention resolution happens sequentially inside create_post -- worst case a few hundred ms per mention before posting, felt acceptable versus preflight complexity. Facet coverage of hashtags deliberately skipped per Out of Scope. Delete confirms via a dedicated overlay; any key except y cancels.

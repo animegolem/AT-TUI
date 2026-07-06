@@ -7,10 +7,10 @@
 | Status | EPICs | IMPs |
 |--------|-------|------|
 | In Progress | 1 | 0 |
-| Planned | 1 | 3 |
+| Planned | 1 | 2 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 0 | 7 |
+| Completed | 0 | 8 |
 | **Total** | **2** | **10** |
 
 ## In Progress
@@ -24,7 +24,7 @@
 - [[AI-IMP-002-3-view-pagination-stack-preservation|IMP-002-3]] 3 view pagination stack preservation — completed
 - [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — completed
 - [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — completed
-- [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — planned
+- [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — completed
 - [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — planned
 
 ---
@@ -47,17 +47,17 @@ Generated from tracked files; binary assets excluded.
 
 ### > 600 LOC
 
-- Cargo.lock (4145 LOC)
-- src/app.rs (3465 LOC)
+- Cargo.lock (4146 LOC)
+- src/app.rs (3615 LOC)
 - src/model.rs (1976 LOC)
-- src/ui.rs (1316 LOC)
+- src/ui.rs (1339 LOC)
 - src/media.rs (941 LOC)
-- src/api.rs (675 LOC)
+- src/api.rs (833 LOC)
 
 ### > 300 LOC
 
 - RAG/scripts/generate-index.sh (575 LOC)
-- src/navigation.rs (491 LOC)
+- src/navigation.rs (503 LOC)
 - src/config.rs (360 LOC)
 
 ---

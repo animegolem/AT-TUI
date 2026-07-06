@@ -46,6 +46,12 @@ pub enum Overlay {
     Media(MediaOverlayState),
     Links(LinkPickerState),
     Composer(ComposerState),
+    ConfirmDelete(ConfirmDeleteState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmDeleteState {
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +155,7 @@ pub enum Action {
     ToggleLike,
     ToggleRepost,
     ToggleFollow,
+    DeleteOwnPost,
     ComposePost,
     ComposeReply,
     ComposeQuote,
@@ -191,6 +198,7 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('f') => Some(Action::ToggleLike),
         KeyCode::Char('F') => Some(Action::ToggleFollow),
         KeyCode::Char('b') => Some(Action::ToggleRepost),
+        KeyCode::Char('d') => Some(Action::DeleteOwnPost),
         KeyCode::Char('p') => Some(Action::ComposePost),
         KeyCode::Char('r') => Some(Action::ComposeReply),
         KeyCode::Char('R') => Some(Action::Reload),
@@ -214,7 +222,7 @@ pub fn normal_key_help_lines() -> Vec<&'static str> {
         "  j/k or arrows: move · Ctrl-d/Ctrl-u half page · PgUp/PgDn page",
         "  l/Enter/Right: open selected · h/Left back · q back, quit at root",
         "  P profile · N notifications · Space media · o links · e quoted post",
-        "  f like · b repost · F follow · p post · r reply · Q quote",
+        "  f like · b repost · F follow · p post · r reply · Q quote · d delete",
         "  / search · n next · R reload · u load pending · Ctrl-C quit",
     ]
 }
@@ -458,6 +466,9 @@ enum WriteResult {
         record_uri: Option<String>,
     },
     Posted {
+        uri: String,
+    },
+    Deleted {
         uri: String,
     },
 }
@@ -850,6 +861,7 @@ impl App {
             OpenUri(Option<String>),
             PlayVideo(Option<PreviewVideo>),
             SubmitComposer(Option<ComposerState>),
+            DeletePost(String),
         }
 
         let mut action = Action::None;
@@ -911,6 +923,13 @@ impl App {
                 }
                 _ => {}
             },
+            Some(Overlay::ConfirmDelete(state)) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    action = Action::DeletePost(state.uri.clone());
+                }
+                // Anything but an explicit yes cancels a destructive action.
+                _ => action = Action::Close,
+            },
             Some(Overlay::Composer(state)) => match key.code {
                 KeyCode::Esc => action = Action::Close,
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -959,6 +978,10 @@ impl App {
                     self.submit_composer(state);
                 }
             }
+            Action::DeletePost(uri) => {
+                self.overlay = None;
+                self.delete_post(uri);
+            }
         }
         Ok(())
     }
@@ -995,6 +1018,7 @@ impl App {
             Action::ToggleLike => self.toggle_like_selected(),
             Action::ToggleRepost => self.toggle_repost_selected(),
             Action::ToggleFollow => self.toggle_follow_selected(),
+            Action::DeleteOwnPost => self.confirm_delete_selected(),
             Action::ComposePost => self.open_post_composer(),
             Action::ComposeReply => self.open_reply_composer(),
             Action::ComposeQuote => self.open_quote_composer(),
@@ -1564,6 +1588,10 @@ impl App {
                 self.set_status(format!("Posted {uri}"));
                 self.last_refresh = Instant::now() - self.refresh_interval;
             }
+            Ok(WriteResult::Deleted { uri }) => {
+                self.nav.retain_items(|item| item.uri() != uri);
+                self.set_status("Post deleted");
+            }
             Err(error) => self.set_status(format!("Write failed: {error}")),
         }
     }
@@ -1973,7 +2001,8 @@ impl App {
             self.set_status("Post text is empty");
             return;
         }
-        if text.chars().count() > 300 {
+        // Bluesky's limit counts grapheme clusters, not chars.
+        if post_grapheme_count(&text) > 300 {
             self.set_status("Post is over 300 characters");
             return;
         }
@@ -1993,6 +2022,34 @@ impl App {
                 .create_post(&text, reply, quote)
                 .await
                 .map(|record| WriteResult::Posted { uri: record.uri })
+                .map_err(|error| format!("{error:#}"));
+            AppEvent::WriteCompleted { result }
+        });
+    }
+
+    fn confirm_delete_selected(&mut self) {
+        let Some(item) = self.nav.current().selected_item() else {
+            self.set_status("No selected post");
+            return;
+        };
+        if item.author_did.as_deref() != Some(self.client.session().did.as_str()) {
+            self.set_status("Can only delete your own posts");
+            return;
+        }
+        self.overlay = Some(Overlay::ConfirmDelete(ConfirmDeleteState {
+            uri: item.uri.clone(),
+        }));
+    }
+
+    fn delete_post(&mut self, uri: String) {
+        self.pending_writes = self.pending_writes.saturating_add(1);
+        self.set_status("Deleting post");
+        let mut client = self.client.clone();
+        self.spawn_event(async move {
+            let result = client
+                .delete_record_uri(&uri)
+                .await
+                .map(|()| WriteResult::Deleted { uri })
                 .map_err(|error| format!("{error:#}"));
             AppEvent::WriteCompleted { result }
         });
@@ -2370,6 +2427,11 @@ impl App {
     pub fn video_playing(&self) -> bool {
         matches!(self.overlay.as_ref(), Some(Overlay::Media(state)) if state.playing)
     }
+}
+
+pub fn post_grapheme_count(text: &str) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    text.graphemes(true).count()
 }
 
 fn post_ref_from_item(item: &FeedItem) -> Option<PostRef> {
@@ -2808,6 +2870,93 @@ mod tests {
     }
 
     #[test]
+    fn delete_guard_rejects_foreign_posts_and_confirms_own() {
+        let mut foreign = item("foreign", "not mine");
+        foreign.author_did = Some("did:plc:bob".into());
+        let mut own = item("mine", "my post");
+        own.author_did = Some("did:plc:alice".into());
+        let mut app = app_with_items(vec![foreign, own]);
+
+        app.confirm_delete_selected();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.status, "Can only delete your own posts");
+
+        app.nav.current_mut().move_down();
+        app.confirm_delete_selected();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ConfirmDelete(ConfirmDeleteState { ref uri })) if uri == "mine"
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_delete_requires_explicit_yes() {
+        let mut own = item("mine", "my post");
+        own.author_did = Some("did:plc:alice".into());
+        let mut app = app_with_items(vec![own]);
+        app.overlay = Some(Overlay::ConfirmDelete(ConfirmDeleteState {
+            uri: "mine".into(),
+        }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.pending_writes, 0);
+
+        app.overlay = Some(Overlay::ConfirmDelete(ConfirmDeleteState {
+            uri: "mine".into(),
+        }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.pending_writes, 1);
+    }
+
+    #[test]
+    fn deleted_post_is_removed_from_all_views() {
+        let mut app = app_with_items(vec![item("mine", "my post"), item("other", "other")]);
+        app.nav.push(ViewState::new(
+            "Thread @alice.test",
+            ViewKind::Thread {
+                root_uri: "mine".into(),
+            },
+            vec![item("mine", "my post"), item("reply", "reply")],
+        ));
+
+        app.apply_write_result(Ok(WriteResult::Deleted { uri: "mine".into() }));
+
+        assert_eq!(app.nav.current().items.len(), 1);
+        assert_eq!(app.nav.current().items[0].uri(), "reply");
+        app.nav.pop();
+        assert_eq!(app.nav.current().items.len(), 1);
+        assert_eq!(app.nav.current().items[0].uri(), "other");
+    }
+
+    #[tokio::test]
+    async fn composer_counts_graphemes_not_chars() {
+        // 151 thumbs-up-with-skin-tone emoji: 302 chars but 151 graphemes.
+        let emoji_text = "\u{1F44D}\u{1F3FD}".repeat(151);
+        assert!(emoji_text.chars().count() > 300);
+        assert_eq!(post_grapheme_count(&emoji_text), 151);
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.submit_composer(ComposerState {
+            kind: ComposerKind::Post,
+            buffer: emoji_text,
+        });
+        assert_eq!(app.pending_writes, 1);
+
+        app.submit_composer(ComposerState {
+            kind: ComposerKind::Post,
+            buffer: "x".repeat(301),
+        });
+        assert_eq!(app.pending_writes, 1);
+        assert_eq!(app.status, "Post is over 300 characters");
+    }
+
+    #[test]
     fn composer_rejects_empty_post_without_closing() {
         let mut app = app_with_items(vec![item("post", "hello")]);
         let state = ComposerState {
@@ -2937,6 +3086,7 @@ mod tests {
             (KeyCode::Char('f'), Action::ToggleLike),
             (KeyCode::Char('F'), Action::ToggleFollow),
             (KeyCode::Char('b'), Action::ToggleRepost),
+            (KeyCode::Char('d'), Action::DeleteOwnPost),
             (KeyCode::Char('r'), Action::ComposeReply),
             (KeyCode::Char('R'), Action::Reload),
             (KeyCode::Char('Q'), Action::ComposeQuote),

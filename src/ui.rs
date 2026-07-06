@@ -209,7 +209,30 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
         Overlay::Links(state) => render_link_overlay(frame, area, state.links, state.selected),
         Overlay::Composer(state) => render_composer_overlay(frame, area, state),
+        Overlay::ConfirmDelete(_) => render_confirm_delete_overlay(frame, area),
     }
+}
+
+fn render_confirm_delete_overlay(frame: &mut Frame<'_>, area: Rect) {
+    let area = centered_rect(60, 20, area);
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from("This permanently deletes the post from Bluesky."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "y",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" delete · any other key cancels"),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(rounded_block().title("Delete post?"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: MenuSection) {
@@ -390,7 +413,7 @@ fn render_composer_overlay(frame: &mut Frame<'_>, area: Rect, state: ComposerSta
         lines.extend(state.buffer.lines().map(|line| Line::from(line.to_owned())));
     }
     lines.push(Line::from(""));
-    let count = state.buffer.chars().count();
+    let count = crate::app::post_grapheme_count(&state.buffer);
     let count_style = if count > 300 {
         Style::default().fg(Color::Red)
     } else {

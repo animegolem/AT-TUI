@@ -269,6 +269,18 @@ impl NavigationStack {
             .join(" / ")
     }
 
+    pub fn retain_items(&mut self, mut keep: impl FnMut(&ViewItem) -> bool) {
+        for view in &mut self.views {
+            let before = view.items.len();
+            view.items.retain(&mut keep);
+            if view.items.len() != before {
+                view.layout_cache.clear();
+                view.selected = view.selected.min(view.items.len().saturating_sub(1));
+                view.scroll = view.scroll.min(view.selected);
+            }
+        }
+    }
+
     pub fn for_each_item_mut(&mut self, mut f: impl FnMut(&mut FeedItem)) {
         for view in &mut self.views {
             for row in &mut view.items {
