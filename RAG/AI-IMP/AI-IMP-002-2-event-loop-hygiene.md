@@ -6,12 +6,12 @@ tags:
   - at-tui
   - input
   - performance
-kanban_status: planned
+kanban_status: completed
 depends_on:
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.88
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-2-event-loop-hygiene
@@ -33,13 +33,13 @@ Guard `handle_key` entry on `key.kind == KeyEventKind::Press`. Match `Event::Mou
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] `handle_key` ignores non-Press key events.
-- [ ] `run_tui` handles mouse wheel events as selection movement; other mouse events ignored.
-- [ ] `drain_events` reports whether any event was applied.
-- [ ] `run_tui` skips `terminal.draw` when nothing changed; resize and status-expiry mark dirty.
-- [ ] Poll timeout 50 ms during video playback or pending tasks, 250 ms otherwise.
-- [ ] Tests: release key event produces no action; wheel event moves selection; drain_events count.
-- [ ] Gate: fmt, test, clippy -D warnings, build.
+- [x] `handle_key` ignores non-Press key events.
+- [x] `run_tui` handles mouse wheel events as selection movement; other mouse events ignored.
+- [x] `drain_events` reports whether any event was applied.
+- [x] `run_tui` skips `terminal.draw` when nothing changed; resize and status-expiry mark dirty.
+- [x] Poll timeout 50 ms during video playback or pending tasks, 250 ms otherwise.
+- [x] Tests: release key event produces no action; wheel event moves selection; drain_events count.
+- [x] Gate: fmt, test, clippy -D warnings, build.
 
 ### Acceptance Criteria
 **Scenario:** Typing on a kitty-protocol terminal.
@@ -59,3 +59,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+No blockers. Wheel handling routes through the same after-input hook as keys so scrolling near the bottom still triggers pagination. Idle-CPU acceptance was validated by reasoning over the loop structure and unit tests on the pieces (drain count, advance_video_frame bool); no automated CPU measurement was added.

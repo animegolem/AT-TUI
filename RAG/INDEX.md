@@ -7,10 +7,10 @@
 | Status | EPICs | IMPs |
 |--------|-------|------|
 | In Progress | 1 | 0 |
-| Planned | 1 | 7 |
+| Planned | 1 | 6 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 0 | 3 |
+| Completed | 0 | 4 |
 | **Total** | **2** | **10** |
 
 ## In Progress
@@ -20,7 +20,7 @@
 
 **IMPs:**
 - [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
-- [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — planned
+- [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — completed
 - [[AI-IMP-002-3-view-pagination-stack-preservation|IMP-002-3]] 3 view pagination stack preservation — planned
 - [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — planned
 - [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — planned
@@ -48,7 +48,7 @@ Generated from tracked files; binary assets excluded.
 ### > 600 LOC
 
 - Cargo.lock (4145 LOC)
-- src/app.rs (3011 LOC)
+- src/app.rs (3146 LOC)
 - src/model.rs (1976 LOC)
 - src/ui.rs (1315 LOC)
 - src/media.rs (746 LOC)

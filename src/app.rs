@@ -8,7 +8,8 @@ use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -545,11 +546,13 @@ impl App {
         })
     }
 
-    pub fn drain_events(&mut self) -> Result<()> {
+    pub fn drain_events(&mut self) -> Result<usize> {
+        let mut applied = 0;
         while let Ok(event) = self.events_rx.try_recv() {
             self.apply_event(event)?;
+            applied += 1;
         }
-        Ok(())
+        Ok(applied)
     }
 
     fn next_request_id(&mut self) -> RequestId {
@@ -716,6 +719,10 @@ impl App {
     }
 
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Kitty-protocol terminals and Windows also deliver Release/Repeat.
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
         if self.overlay.is_some() {
             self.handle_overlay_key(key).await?;
         } else {
@@ -749,6 +756,31 @@ impl App {
             }
         }
 
+        self.after_input().await
+    }
+
+    pub async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        if self.overlay.is_some() {
+            return Ok(false);
+        }
+        let handled = match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                self.nav.current_mut().move_down();
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.nav.current_mut().move_up();
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            self.after_input().await?;
+        }
+        Ok(handled)
+    }
+
+    async fn after_input(&mut self) -> Result<()> {
         if !self.should_quit && self.overlay.is_none() {
             self.maybe_load_more().await?;
             if self.is_current_timeline_at_top() {
@@ -2127,22 +2159,27 @@ impl App {
         }
     }
 
-    pub fn advance_video_frame(&mut self) {
+    pub fn advance_video_frame(&mut self) -> bool {
         if self.last_video_frame.elapsed() < Duration::from_millis(125) {
-            return;
+            return false;
         }
         let Some(Overlay::Media(state)) = self.overlay.as_ref() else {
-            return;
+            return false;
         };
         if !state.playing {
-            return;
+            return false;
         }
         let Some(PreviewMedia::Video(video)) = state.selected_media() else {
-            return;
+            return false;
         };
         let playlist_url = video.playlist_url.clone();
         self.media.advance_video(&playlist_url);
         self.last_video_frame = Instant::now();
+        true
+    }
+
+    pub fn video_playing(&self) -> bool {
+        matches!(self.overlay.as_ref(), Some(Overlay::Media(state)) if state.playing)
     }
 }
 
@@ -2223,21 +2260,54 @@ pub async fn run_tui(
     };
 
     let mut app = App::bootstrap(client, media).await?;
+    let mut dirty = true;
+    let mut status_was_visible = app.visible_status().is_some();
 
     loop {
-        app.drain_events()?;
+        if app.drain_events()? > 0 {
+            dirty = true;
+        }
         app.maybe_refresh_active_feed();
         app.maybe_poll_notifications();
-        app.advance_video_frame();
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        if app.advance_video_frame() {
+            dirty = true;
+        }
+        let status_visible = app.visible_status().is_some();
+        if status_visible != status_was_visible {
+            status_was_visible = status_visible;
+            dirty = true;
+        }
+        if app.has_pending_tasks() {
+            // Keep progress indicators animating while work is in flight.
+            dirty = true;
+        }
+        if dirty {
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            dirty = false;
+        }
         if app.should_quit {
             break;
         }
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            app.handle_key(key).await?;
-            app.drain_events()?;
+        let poll_timeout = if app.video_playing() || app.has_pending_tasks() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+        if event::poll(poll_timeout)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    app.handle_key(key).await?;
+                    app.drain_events()?;
+                    dirty = true;
+                }
+                Event::Mouse(mouse) => {
+                    if app.handle_mouse(mouse).await? {
+                        dirty = true;
+                    }
+                }
+                Event::Resize(_, _) => dirty = true,
+                _ => {}
+            }
         }
     }
 
@@ -2339,6 +2409,71 @@ mod tests {
         app.open_media_overlay_for_selected().await.unwrap();
 
         assert!(matches!(app.overlay, Some(Overlay::Media(_))));
+    }
+
+    #[tokio::test]
+    async fn release_key_events_are_ignored() {
+        let mut app = app_with_items(vec![item("one", "one"), item("two", "two")]);
+        let release = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+
+        app.handle_key(release).await.unwrap();
+        assert_eq!(app.nav.current().selected, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.nav.current().selected, 1);
+    }
+
+    #[tokio::test]
+    async fn mouse_wheel_moves_selection() {
+        let mut app = app_with_items(vec![item("one", "one"), item("two", "two")]);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(
+            app.handle_mouse(wheel(MouseEventKind::ScrollDown))
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.nav.current().selected, 1);
+
+        assert!(
+            app.handle_mouse(wheel(MouseEventKind::ScrollUp))
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.nav.current().selected, 0);
+
+        assert!(
+            !app.handle_mouse(wheel(MouseEventKind::Moved))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn drain_events_reports_applied_count() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        assert_eq!(app.drain_events().unwrap(), 0);
+
+        app.events_tx
+            .send(AppEvent::LinkOpened {
+                uri: "https://example.com".into(),
+                result: Ok(()),
+            })
+            .unwrap();
+
+        assert_eq!(app.drain_events().unwrap(), 1);
     }
 
     #[test]
