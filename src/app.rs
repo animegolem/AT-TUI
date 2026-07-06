@@ -834,6 +834,7 @@ impl App {
             if self.is_current_timeline_at_top() {
                 self.merge_pending_new_items(false);
             }
+            self.prefetch_nearby_media();
         }
 
         Ok(())
@@ -1062,6 +1063,7 @@ impl App {
                 PreviewMedia::Image(image) => Some(image.clone()),
                 PreviewMedia::Video(video) => video.thumb_url.as_ref().map(|url| PreviewImage {
                     url: url.clone(),
+                    thumb_url: None,
                     alt: video.alt.clone(),
                     source: video.source,
                 }),
@@ -1071,12 +1073,25 @@ impl App {
     }
 
     fn queue_image_loads(&mut self, images: &[PreviewImage]) {
+        let mut urls = Vec::new();
         for image in images {
-            if !self.media.should_load(image) {
+            // Thumb first so the overlay has something immediately; the
+            // fullsize load replaces it when it lands.
+            if let Some(thumb) = &image.thumb_url {
+                urls.push(thumb.clone());
+            }
+            urls.push(image.url.clone());
+        }
+        self.queue_image_url_loads(urls);
+    }
+
+    fn queue_image_url_loads(&mut self, urls: Vec<String>) {
+        for url in urls {
+            if !self.media.should_load_url(&url) {
                 continue;
             }
-            self.media.mark_loading(image);
-            let Some(job) = self.media.load_job(image) else {
+            self.media.mark_loading_url(&url);
+            let Some(job) = self.media.load_job_url(&url) else {
                 continue;
             };
             self.spawn_event(async move {
@@ -1084,6 +1099,23 @@ impl App {
                 AppEvent::ImageLoaded { url, result }
             });
         }
+    }
+
+    fn prefetch_nearby_media(&mut self) {
+        let urls = {
+            let view = self.nav.current();
+            if view.items.is_empty() {
+                return;
+            }
+            let start = view.selected.saturating_sub(2);
+            let end = view.selected.saturating_add(2).min(view.items.len() - 1);
+            view.items[start..=end]
+                .iter()
+                .filter_map(ViewItem::as_post)
+                .flat_map(crate::media::prefetch_thumb_urls)
+                .collect::<Vec<_>>()
+        };
+        self.queue_image_url_loads(urls);
     }
 
     fn queue_video_load(&mut self, video: &PreviewVideo) {
@@ -2495,6 +2527,7 @@ mod tests {
     fn image(url: &str) -> PreviewImage {
         PreviewImage {
             url: url.into(),
+            thumb_url: None,
             alt: None,
             source: PreviewImageSource::Post,
         }

@@ -6,12 +6,12 @@ tags:
   - at-tui
   - media
   - performance
-kanban_status: planned
+kanban_status: completed
 depends_on:
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.85
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-5-image-cache-prefetch
@@ -34,13 +34,13 @@ Inline timeline thumbnails, video frame caching changes beyond a count cap, cach
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] `ImageLoadJob::run` reads the disk cache before HTTP and decodes via `spawn_blocking`.
-- [ ] Downloads still write the cache file on miss.
-- [ ] `PreviewImage` carries thumb + fullsize; overlay renders thumb while fullsize loads.
-- [ ] Prefetch of ±2 posts' thumbnails on selection movement, deduped by existing states.
-- [ ] LRU eviction beyond 48 decoded images; video cache capped at 4.
-- [ ] Tests: cache read-through (tempdir), thumb-first selection logic, LRU eviction order.
-- [ ] Gate: fmt, test, clippy -D warnings, build.
+- [x] `ImageLoadJob::run` reads the disk cache before HTTP and decodes via `spawn_blocking`.
+- [x] Downloads still write the cache file on miss.
+- [x] `PreviewImage` carries thumb + fullsize; overlay renders thumb while fullsize loads.
+- [x] Prefetch of ±2 posts' thumbnails on selection movement, deduped by existing states.
+- [x] LRU eviction beyond 48 decoded images; video cache capped at 4.
+- [x] Tests: cache read-through (tempdir), thumb-first selection logic, LRU eviction order.
+- [x] Gate: fmt, test, clippy -D warnings, build.
 
 ### Acceptance Criteria
 **Scenario:** Second launch.
@@ -60,3 +60,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+Removed the dead ensure_item/ensure_images/ensure_url synchronous download path (no callers) rather than teaching it LRU. Corrupt disk-cache entries are deleted and fall through to the network. Known edge: if 48+ loads complete while the overlay shows an image that never gets re-rendered (touch happens on draw), the displayed entry could in principle be evicted and show 'Image queued' until the overlay reopens; render-time touch makes this effectively unreachable, documented here rather than complicating eviction. LRU/thumb tests use a Picker::halfblocks cache with a tempdir.

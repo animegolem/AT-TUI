@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::PathBuf, process::Command};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -30,6 +35,8 @@ pub enum RequestedImageProtocol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewImage {
     pub url: String,
+    /// Smaller variant rendered while the fullsize `url` is still loading.
+    pub thumb_url: Option<String>,
     pub alt: Option<String>,
     pub source: PreviewImageSource,
 }
@@ -74,6 +81,9 @@ impl PreviewImageSource {
     }
 }
 
+const IMAGE_CACHE_CAP: usize = 48;
+const VIDEO_CACHE_CAP: usize = 4;
+
 pub struct MediaCache {
     enabled: bool,
     cache_dir: PathBuf,
@@ -81,6 +91,9 @@ pub struct MediaCache {
     picker: Option<Picker>,
     images: HashMap<String, ImageState>,
     videos: HashMap<String, VideoState>,
+    // Access-ordered keys backing the LRU bound; disk cache makes re-loads cheap.
+    image_order: VecDeque<String>,
+    video_order: VecDeque<String>,
 }
 
 enum ImageState {
@@ -145,6 +158,8 @@ impl MediaCache {
             picker,
             images: HashMap::new(),
             videos: HashMap::new(),
+            image_order: VecDeque::new(),
+            video_order: VecDeque::new(),
         })
     }
 
@@ -156,6 +171,22 @@ impl MediaCache {
             picker: None,
             images: HashMap::new(),
             videos: HashMap::new(),
+            image_order: VecDeque::new(),
+            video_order: VecDeque::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_enabled(cache_dir: PathBuf) -> Self {
+        Self {
+            enabled: true,
+            cache_dir,
+            http: Client::new(),
+            picker: Some(Picker::halfblocks()),
+            images: HashMap::new(),
+            videos: HashMap::new(),
+            image_order: VecDeque::new(),
+            video_order: VecDeque::new(),
         }
     }
 
@@ -170,23 +201,55 @@ impl MediaCache {
     }
 
     pub fn should_load(&self, image: &PreviewImage) -> bool {
-        self.enabled && !self.images.contains_key(&image.url)
+        self.should_load_url(&image.url)
     }
 
     pub fn mark_loading(&mut self, image: &PreviewImage) {
-        if self.enabled {
-            self.images
-                .entry(image.url.clone())
-                .or_insert(ImageState::Loading);
-        }
+        self.mark_loading_url(&image.url);
     }
 
     pub fn load_job(&self, image: &PreviewImage) -> Option<ImageLoadJob> {
+        self.load_job_url(&image.url)
+    }
+
+    pub fn should_load_url(&self, url: &str) -> bool {
+        self.enabled && !self.images.contains_key(url)
+    }
+
+    pub fn mark_loading_url(&mut self, url: &str) {
+        if self.enabled && !self.images.contains_key(url) {
+            self.record_image(url.to_owned(), ImageState::Loading);
+        }
+    }
+
+    pub fn load_job_url(&self, url: &str) -> Option<ImageLoadJob> {
         self.enabled.then(|| ImageLoadJob {
-            url: image.url.clone(),
+            url: url.to_owned(),
             cache_dir: self.cache_dir.clone(),
             http: self.http.clone(),
         })
+    }
+
+    fn record_image(&mut self, url: String, state: ImageState) {
+        if self.images.insert(url.clone(), state).is_none() {
+            self.image_order.push_back(url);
+        }
+        while self.image_order.len() > IMAGE_CACHE_CAP {
+            if let Some(evicted) = self.image_order.pop_front() {
+                self.images.remove(&evicted);
+            }
+        }
+    }
+
+    /// Move a key to the back of the eviction queue on render access.
+    fn touch_image(&mut self, url: &str) {
+        if let Some(position) = self.image_order.iter().position(|key| key == url) {
+            let key = self
+                .image_order
+                .remove(position)
+                .expect("position is in bounds");
+            self.image_order.push_back(key);
+        }
     }
 
     pub fn should_load_video(&self, video: &PreviewVideo) -> bool {
@@ -220,7 +283,7 @@ impl MediaCache {
             },
             Err(error) => ImageState::Failed(error),
         };
-        self.images.insert(url, state);
+        self.record_image(url, state);
     }
 
     pub fn finish_video_load(
@@ -248,7 +311,14 @@ impl MediaCache {
             },
             Err(error) => VideoState::Failed(error),
         };
-        self.videos.insert(playlist_url, state);
+        if self.videos.insert(playlist_url.clone(), state).is_none() {
+            self.video_order.push_back(playlist_url);
+        }
+        while self.video_order.len() > VIDEO_CACHE_CAP {
+            if let Some(evicted) = self.video_order.pop_front() {
+                self.videos.remove(&evicted);
+            }
+        }
     }
 
     pub fn state_name(&self, url: &str) -> &'static str {
@@ -277,32 +347,26 @@ impl MediaCache {
         }
     }
 
-    pub async fn ensure_item(&mut self, item: &FeedItem) {
-        if !self.enabled {
-            return;
+    /// Which cached entry should draw for this image: the fullsize URL when
+    /// ready, the thumbnail while fullsize is still in flight, or a message.
+    fn image_render_key<'a>(
+        &self,
+        image: &'a PreviewImage,
+    ) -> std::result::Result<&'a str, String> {
+        if matches!(self.images.get(&image.url), Some(ImageState::Ready(_))) {
+            return Ok(&image.url);
         }
-
-        for image in preview_images(item).into_iter().take(3) {
-            let _ = self.ensure_url(&image.url).await;
-        }
-
-        if let Some(thumb_url) = item
-            .external
-            .as_ref()
-            .and_then(|external| external.thumb_url.as_ref())
+        if let Some(thumb) = image.thumb_url.as_deref()
+            && matches!(self.images.get(thumb), Some(ImageState::Ready(_)))
         {
-            let _ = self.ensure_url(thumb_url).await;
+            return Ok(thumb);
         }
-    }
-
-    pub async fn ensure_images(&mut self, images: &[PreviewImage]) {
-        if !self.enabled {
-            return;
-        }
-
-        for image in images {
-            let _ = self.ensure_url(&image.url).await;
-        }
+        Err(match self.images.get(&image.url) {
+            Some(ImageState::Loading) => "Image loading".into(),
+            Some(ImageState::Failed(error)) => error.clone(),
+            Some(ImageState::Ready(_)) => unreachable!("handled above"),
+            None => "Image queued".into(),
+        })
     }
 
     pub fn render_preview_image(
@@ -321,30 +385,17 @@ impl MediaCache {
             return;
         }
 
-        let Some(cached) = self.images.get_mut(&image.url) else {
-            frame.render_widget(
-                Paragraph::new("Image queued").block(media_block(title)),
-                area,
-            );
-            return;
+        let key = match self.image_render_key(image) {
+            Ok(key) => key.to_owned(),
+            Err(message) => {
+                frame.render_widget(Paragraph::new(message).block(media_block(title)), area);
+                return;
+            }
         };
 
-        let protocol = match cached {
-            ImageState::Loading => {
-                frame.render_widget(
-                    Paragraph::new("Image loading").block(media_block(title)),
-                    area,
-                );
-                return;
-            }
-            ImageState::Failed(error) => {
-                frame.render_widget(
-                    Paragraph::new(error.clone()).block(media_block(title)),
-                    area,
-                );
-                return;
-            }
-            ImageState::Ready(protocol) => protocol.as_mut(),
+        self.touch_image(&key);
+        let Some(ImageState::Ready(protocol)) = self.images.get_mut(&key) else {
+            return;
         };
 
         let block = media_block(title);
@@ -353,7 +404,7 @@ impl MediaCache {
         frame.render_stateful_widget(
             StatefulImage::default().resize(Resize::Fit(None)),
             inner,
-            protocol,
+            protocol.as_mut(),
         );
     }
 
@@ -410,51 +461,6 @@ impl MediaCache {
             }
         }
     }
-
-    async fn ensure_url(&mut self, url: &str) -> Result<()> {
-        if self.images.contains_key(url) {
-            return Ok(());
-        }
-
-        let result = self.download_and_decode(url).await;
-        match result {
-            Ok(protocol) => {
-                self.images
-                    .insert(url.to_owned(), ImageState::Ready(Box::new(protocol)));
-            }
-            Err(error) => {
-                self.images.insert(
-                    url.to_owned(),
-                    ImageState::Failed(format!("Image failed: {error:#}")),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn download_and_decode(&mut self, url: &str) -> Result<StatefulProtocol> {
-        let bytes = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("could not download {url}"))?
-            .error_for_status()
-            .with_context(|| format!("image request failed for {url}"))?
-            .bytes()
-            .await
-            .with_context(|| format!("could not read image bytes for {url}"))?;
-
-        let path = self.cache_dir.join(cache_key(url));
-        fs::write(&path, &bytes).with_context(|| format!("could not write {}", path.display()))?;
-        let image = image::load_from_memory(&bytes)
-            .with_context(|| format!("could not decode image from {url}"))?;
-        let picker = self
-            .picker
-            .as_ref()
-            .context("image rendering is disabled")?;
-        Ok(picker.new_resize_protocol(image))
-    }
 }
 
 impl ImageLoadJob {
@@ -464,14 +470,16 @@ impl ImageLoadJob {
 
     pub async fn run(self) -> (String, std::result::Result<DynamicImage, String>) {
         let url = self.url.clone();
-        let result = self
-            .download_and_decode()
-            .await
-            .map_err(|error| error.to_string());
+        let result = self.load().await.map_err(|error| error.to_string());
         (url, result)
     }
 
-    async fn download_and_decode(self) -> Result<DynamicImage> {
+    async fn load(self) -> Result<DynamicImage> {
+        let path = self.cache_dir.join(cache_key(&self.url));
+        if let Some(image) = read_cached_image(&path).await {
+            return Ok(image);
+        }
+
         let bytes = self
             .http
             .get(&self.url)
@@ -484,11 +492,36 @@ impl ImageLoadJob {
             .await
             .with_context(|| format!("could not read image bytes for {}", self.url))?;
 
-        let path = self.cache_dir.join(cache_key(&self.url));
-        fs::write(&path, &bytes).with_context(|| format!("could not write {}", path.display()))?;
-        image::load_from_memory(&bytes)
-            .with_context(|| format!("could not decode image from {}", self.url))
+        // Best effort: a failed cache write should not fail the render.
+        let _ = fs::write(&path, &bytes);
+        decode_image_bytes(bytes.to_vec(), self.url).await
     }
+}
+
+async fn read_cached_image(path: &Path) -> Option<DynamicImage> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let bytes = fs::read(&path).ok()?;
+        match image::load_from_memory(&bytes) {
+            Ok(image) => Some(image),
+            Err(_) => {
+                // Corrupt cache entry: drop it and fall back to the network.
+                let _ = fs::remove_file(&path);
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn decode_image_bytes(bytes: Vec<u8>, url: String) -> Result<DynamicImage> {
+    tokio::task::spawn_blocking(move || {
+        image::load_from_memory(&bytes)
+            .with_context(|| format!("could not decode image from {url}"))
+    })
+    .await?
 }
 
 impl VideoLoadJob {
@@ -547,31 +580,74 @@ impl VideoLoadJob {
     }
 }
 
+fn preview_image_from_ref(
+    image: &crate::model::ImageRef,
+    source: PreviewImageSource,
+) -> PreviewImage {
+    let url = image
+        .fullsize_url
+        .clone()
+        .unwrap_or_else(|| image.thumb_url.clone());
+    let thumb_url = (url != image.thumb_url).then(|| image.thumb_url.clone());
+    PreviewImage {
+        url,
+        thumb_url,
+        alt: image.alt.clone(),
+        source,
+    }
+}
+
 pub fn preview_images(item: &FeedItem) -> Vec<PreviewImage> {
-    let mut images = Vec::new();
-    images.extend(item.images.iter().map(|image| {
-        PreviewImage {
-            url: image
-                .fullsize_url
-                .clone()
-                .unwrap_or_else(|| image.thumb_url.clone()),
-            alt: image.alt.clone(),
-            source: PreviewImageSource::Post,
-        }
-    }));
+    let mut images = item
+        .images
+        .iter()
+        .map(|image| preview_image_from_ref(image, PreviewImageSource::Post))
+        .collect::<Vec<_>>();
     if let Some(quote) = &item.quote {
-        images.extend(quote.images.iter().map(|image| {
-            PreviewImage {
-                url: image
-                    .fullsize_url
-                    .clone()
-                    .unwrap_or_else(|| image.thumb_url.clone()),
-                alt: image.alt.clone(),
-                source: PreviewImageSource::Quote,
-            }
-        }));
+        images.extend(
+            quote
+                .images
+                .iter()
+                .map(|image| preview_image_from_ref(image, PreviewImageSource::Quote)),
+        );
     }
     images
+}
+
+/// Thumbnail URLs worth warming while the cursor is near this post, so the
+/// media overlay opens with something already decoded.
+pub fn prefetch_thumb_urls(item: &FeedItem) -> Vec<String> {
+    let mut urls: Vec<String> = item
+        .images
+        .iter()
+        .map(|image| image.thumb_url.clone())
+        .collect();
+    urls.extend(
+        item.videos
+            .iter()
+            .filter_map(|video| video.thumb_url.clone()),
+    );
+    urls.extend(
+        item.external
+            .as_ref()
+            .and_then(|external| external.thumb_url.clone()),
+    );
+    if let Some(quote) = &item.quote {
+        urls.extend(quote.images.iter().map(|image| image.thumb_url.clone()));
+        urls.extend(
+            quote
+                .videos
+                .iter()
+                .filter_map(|video| video.thumb_url.clone()),
+        );
+        urls.extend(
+            quote
+                .external
+                .as_ref()
+                .and_then(|external| external.thumb_url.clone()),
+        );
+    }
+    urls
 }
 
 pub fn preview_media(item: &FeedItem) -> Vec<PreviewMedia> {
@@ -669,9 +745,127 @@ mod tests {
 
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].url, "https://example.com/post-full.jpg");
+        assert_eq!(
+            images[0].thumb_url.as_deref(),
+            Some("https://example.com/post-thumb.jpg")
+        );
         assert_eq!(images[0].source, PreviewImageSource::Post);
         assert_eq!(images[1].url, "https://example.com/quote-thumb.jpg");
+        assert_eq!(images[1].thumb_url, None);
         assert_eq!(images[1].source, PreviewImageSource::Quote);
+    }
+
+    fn tiny_image() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+    }
+
+    #[tokio::test]
+    async fn load_job_reads_disk_cache_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unroutable URL proves a hit never touches the network.
+        let url = "https://cache-hit.invalid/image.png";
+        let path = dir.path().join(cache_key(url));
+        tiny_image()
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+
+        let job = ImageLoadJob {
+            url: url.into(),
+            cache_dir: dir.path().to_owned(),
+            http: Client::new(),
+        };
+
+        let (returned_url, result) = job.run().await;
+        assert_eq!(returned_url, url);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_entry_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://cache-corrupt.invalid/image.png";
+        let path = dir.path().join(cache_key(url));
+        fs::write(&path, b"not an image").unwrap();
+
+        assert!(read_cached_image(&path).await.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn decoded_image_cache_is_lru_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = MediaCache::test_enabled(dir.path().to_owned());
+
+        for index in 0..(IMAGE_CACHE_CAP + 2) {
+            cache.finish_load(format!("https://example.com/{index}.png"), Ok(tiny_image()));
+        }
+
+        assert_eq!(cache.images.len(), IMAGE_CACHE_CAP);
+        assert_eq!(cache.state_name("https://example.com/0.png"), "missing");
+        assert_eq!(cache.state_name("https://example.com/1.png"), "missing");
+        assert_eq!(cache.state_name("https://example.com/2.png"), "ready");
+
+        // Touching the oldest survivor protects it from the next eviction.
+        cache.touch_image("https://example.com/2.png");
+        cache.finish_load("https://example.com/extra.png".into(), Ok(tiny_image()));
+        assert_eq!(cache.state_name("https://example.com/2.png"), "ready");
+        assert_eq!(cache.state_name("https://example.com/3.png"), "missing");
+    }
+
+    #[test]
+    fn render_key_prefers_fullsize_then_thumb() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = MediaCache::test_enabled(dir.path().to_owned());
+        let image = PreviewImage {
+            url: "https://example.com/full.png".into(),
+            thumb_url: Some("https://example.com/thumb.png".into()),
+            alt: None,
+            source: PreviewImageSource::Post,
+        };
+
+        assert_eq!(
+            cache.image_render_key(&image),
+            Err("Image queued".to_owned())
+        );
+
+        cache.mark_loading_url(&image.url);
+        cache.finish_load("https://example.com/thumb.png".into(), Ok(tiny_image()));
+        assert_eq!(
+            cache.image_render_key(&image),
+            Ok("https://example.com/thumb.png")
+        );
+
+        cache.finish_load(image.url.clone(), Ok(tiny_image()));
+        assert_eq!(
+            cache.image_render_key(&image),
+            Ok("https://example.com/full.png")
+        );
+    }
+
+    #[test]
+    fn prefetch_urls_cover_post_quote_and_external_thumbs() {
+        let mut item = item();
+        item.images = vec![ImageRef {
+            thumb_url: "https://example.com/post-thumb.jpg".into(),
+            fullsize_url: Some("https://example.com/post-full.jpg".into()),
+            alt: None,
+        }];
+        item.external = Some(crate::model::ExternalRef {
+            uri: "https://example.com/article".into(),
+            title: "article".into(),
+            description: None,
+            thumb_url: Some("https://example.com/card-thumb.jpg".into()),
+        });
+
+        let urls = prefetch_thumb_urls(&item);
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/post-thumb.jpg".to_owned(),
+                "https://example.com/card-thumb.jpg".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -679,6 +873,7 @@ mod tests {
         let mut cache = MediaCache::disabled();
         let image = PreviewImage {
             url: "https://example.com/image.jpg".into(),
+            thumb_url: None,
             alt: None,
             source: PreviewImageSource::Post,
         };

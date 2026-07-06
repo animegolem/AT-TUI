@@ -346,6 +346,7 @@ fn render_media_overlay(
             {
                 let image = PreviewImage {
                     url: thumb_url.clone(),
+                    thumb_url: None,
                     alt: video.alt.clone(),
                     source: video.source,
                 };
