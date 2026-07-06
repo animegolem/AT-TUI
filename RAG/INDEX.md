@@ -6,28 +6,12 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 1 | 0 |
+| In Progress | 0 | 0 |
 | Planned | 1 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 0 | 9 |
+| Completed | 1 | 9 |
 | **Total** | **2** | **10** |
-
-## In Progress
-
-### [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002: At tui stabilization daily driver]]
-> AT-TUI cannot currently be left running: after roughly two hours idle the access token expires, the refreshing clone strands the main client with a...
-
-**IMPs:**
-- [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
-- [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — completed
-- [[AI-IMP-002-3-view-pagination-stack-preservation|IMP-002-3]] 3 view pagination stack preservation — completed
-- [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — completed
-- [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — completed
-- [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — completed
-- [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — completed
-
----
 
 ## Planned
 
@@ -62,3 +46,17 @@ Generated from tracked files; binary assets excluded.
 
 ---
 
+## Completed
+<details>
+<summary>1 EPICs, 9 IMPs completed</summary>
+
+- [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002]] At tui stabilization daily driver — 2026-07-06
+  - [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
+  - [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — completed
+  - [[AI-IMP-002-3-view-pagination-stack-preservation|IMP-002-3]] 3 view pagination stack preservation — completed
+  - [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — completed
+  - [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — completed
+  - [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — completed
+  - [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — completed
+
+</details>
