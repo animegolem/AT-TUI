@@ -1,16 +1,24 @@
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use crate::config::{Session, SessionStore};
 use crate::model::PostRef;
 
+/// Session tokens live behind a shared lock so every clone handed to a
+/// background task sees a refresh performed by any other clone. ATProto
+/// rotates refresh tokens on use, so a clone refreshing privately would
+/// strand all the others with revoked credentials.
 #[derive(Debug, Clone)]
 pub struct BskyClient {
     http: Client,
     store: SessionStore,
-    session: Session,
+    session: Arc<RwLock<Session>>,
+    refresh_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +32,8 @@ impl BskyClient {
         Self {
             http: Client::new(),
             store,
-            session,
+            session: Arc::new(RwLock::new(session)),
+            refresh_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -67,8 +76,23 @@ impl BskyClient {
         Ok(session)
     }
 
-    pub fn session(&self) -> &Session {
-        &self.session
+    pub fn session(&self) -> Session {
+        self.session.read().expect("session lock poisoned").clone()
+    }
+
+    fn access_jwt(&self) -> String {
+        self.session
+            .read()
+            .expect("session lock poisoned")
+            .access_jwt
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn set_tokens_for_test(&self, access_jwt: &str, refresh_jwt: &str) {
+        let mut session = self.session.write().expect("session lock poisoned");
+        session.access_jwt = access_jwt.to_owned();
+        session.refresh_jwt = refresh_jwt.to_owned();
     }
 
     pub fn store(&self) -> SessionStore {
@@ -138,31 +162,45 @@ impl BskyClient {
     }
 
     pub async fn refresh_session(&mut self) -> Result<()> {
+        let observed_access = self.access_jwt();
+        let gate = self.refresh_gate.clone();
+        let _guard = gate.lock().await;
+        if self.access_jwt() != observed_access {
+            // Another task refreshed while we waited on the gate; the
+            // rotated refresh token must not be used a second time.
+            return Ok(());
+        }
+
+        let (service, refresh_jwt) = {
+            let session = self.session.read().expect("session lock poisoned");
+            (session.service.clone(), session.refresh_jwt.clone())
+        };
         let response = self
             .http
-            .post(xrpc_url(
-                &self.session.service,
-                "com.atproto.server.refreshSession",
-            ))
-            .bearer_auth(&self.session.refresh_jwt)
+            .post(xrpc_url(&service, "com.atproto.server.refreshSession"))
+            .bearer_auth(&refresh_jwt)
             .send()
             .await
             .context("could not refresh Bluesky session")?;
 
         let value = response_json(response).await?;
-        self.session.access_jwt = required_string(&value, "accessJwt")?;
-        self.session.refresh_jwt = required_string(&value, "refreshJwt")?;
-        self.session.handle = value
-            .get("handle")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.session.handle)
-            .to_owned();
-        self.session.did = value
-            .get("did")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.session.did)
-            .to_owned();
-        self.store.save(&self.session)?;
+        let access_jwt = required_string(&value, "accessJwt")?;
+        let refresh_jwt = required_string(&value, "refreshJwt")?;
+        let handle = value.get("handle").and_then(Value::as_str);
+        let did = value.get("did").and_then(Value::as_str);
+        let updated = {
+            let mut session = self.session.write().expect("session lock poisoned");
+            session.access_jwt = access_jwt;
+            session.refresh_jwt = refresh_jwt;
+            if let Some(handle) = handle {
+                session.handle = handle.to_owned();
+            }
+            if let Some(did) = did {
+                session.did = did.to_owned();
+            }
+            session.clone()
+        };
+        self.store.save(&updated)?;
         Ok(())
     }
 
@@ -203,7 +241,7 @@ impl BskyClient {
 
     async fn create_record(&mut self, collection: &str, record: Value) -> Result<CreatedRecord> {
         let body = json!({
-            "repo": self.session.did,
+            "repo": self.session().did,
             "collection": collection,
             "record": record,
         });
@@ -241,9 +279,13 @@ impl BskyClient {
     }
 
     async fn send_get(&self, endpoint: &str, query: &[(String, String)]) -> Result<Response> {
+        let (service, access_jwt) = {
+            let session = self.session.read().expect("session lock poisoned");
+            (session.service.clone(), session.access_jwt.clone())
+        };
         self.http
-            .get(xrpc_url(&self.session.service, endpoint))
-            .bearer_auth(&self.session.access_jwt)
+            .get(xrpc_url(&service, endpoint))
+            .bearer_auth(access_jwt)
             .query(query)
             .send()
             .await
@@ -251,9 +293,13 @@ impl BskyClient {
     }
 
     async fn send_post(&self, endpoint: &str, body: &Value) -> Result<Response> {
+        let (service, access_jwt) = {
+            let session = self.session.read().expect("session lock poisoned");
+            (session.service.clone(), session.access_jwt.clone())
+        };
         self.http
-            .post(xrpc_url(&self.session.service, endpoint))
-            .bearer_auth(&self.session.access_jwt)
+            .post(xrpc_url(&service, endpoint))
+            .bearer_auth(access_jwt)
             .json(body)
             .send()
             .await
@@ -568,6 +614,57 @@ mod tests {
         let quote = post_record_json("quote text", None, Some(subject));
         assert_eq!(quote["embed"]["$type"], "app.bsky.embed.record");
         assert_eq!(quote["embed"]["record"]["cid"], "postcid");
+    }
+
+    #[test]
+    fn clones_share_one_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let session = Session {
+            service: "https://bsky.social".into(),
+            handle: "alice.test".into(),
+            did: "did:plc:alice".into(),
+            access_jwt: "old-access".into(),
+            refresh_jwt: "old-refresh".into(),
+        };
+        let client = BskyClient::new(session, store);
+        let clone = client.clone();
+
+        clone.set_tokens_for_test("new-access", "new-refresh");
+
+        assert_eq!(client.session().access_jwt, "new-access");
+        assert_eq!(client.session().refresh_jwt, "new-refresh");
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_when_another_task_already_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let session = Session {
+            service: "https://bsky.social".into(),
+            handle: "alice.test".into(),
+            did: "did:plc:alice".into(),
+            access_jwt: "old-access".into(),
+            refresh_jwt: "old-refresh".into(),
+        };
+        let client = BskyClient::new(session, store);
+
+        // Hold the gate as a concurrent refresher would, rotate the tokens,
+        // then release: the waiting refresh must observe the change and
+        // return without spending the refresh token (no HTTP happens).
+        let gate = client.refresh_gate.clone();
+        let guard = gate.lock().await;
+        let concurrent = client.clone();
+        let waiting = tokio::spawn(async move {
+            let mut concurrent = concurrent;
+            concurrent.refresh_session().await
+        });
+        tokio::task::yield_now().await;
+        client.set_tokens_for_test("new-access", "new-refresh");
+        drop(guard);
+
+        waiting.await.unwrap().unwrap();
+        assert_eq!(client.session().access_jwt, "new-access");
     }
 
     #[test]

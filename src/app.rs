@@ -457,6 +457,7 @@ pub struct App {
     pub should_quit: bool,
     pub pending_new_items: Vec<FeedItem>,
     pub unread_notifications: u64,
+    consecutive_poll_failures: u32,
     events_tx: UnboundedSender<AppEvent>,
     events_rx: UnboundedReceiver<AppEvent>,
     next_request_id: RequestId,
@@ -523,6 +524,7 @@ impl App {
             should_quit: false,
             pending_new_items: Vec::new(),
             unread_notifications: 0,
+            consecutive_poll_failures: 0,
             events_tx,
             events_rx,
             next_request_id: 1,
@@ -695,8 +697,16 @@ impl App {
                     self.pending_notification_count = None;
                     if account_did == self.client.session().did {
                         match result {
-                            Ok(count) => self.unread_notifications = count,
-                            Err(_) => self.unread_notifications = 0,
+                            Ok(count) => {
+                                self.unread_notifications = count;
+                                self.consecutive_poll_failures = 0;
+                            }
+                            // Keep the last known badge value; a failed poll
+                            // says nothing about the number of notifications.
+                            Err(_) => {
+                                self.consecutive_poll_failures =
+                                    self.consecutive_poll_failures.saturating_add(1);
+                            }
                         }
                     }
                 }
@@ -1202,7 +1212,7 @@ impl App {
                     load_feed_page(&mut client, &source, &home_feed_prefs, None).await?;
                 Ok::<_, anyhow::Error>(AccountSwitchData {
                     account,
-                    session: client.session().clone(),
+                    session: client.session(),
                     home_feed_prefs,
                     feeds,
                     items,
@@ -1280,8 +1290,12 @@ impl App {
         }
 
         let refreshed = match result {
-            Ok(items) => items,
+            Ok(items) => {
+                self.consecutive_poll_failures = 0;
+                items
+            }
             Err(error) => {
+                self.consecutive_poll_failures = self.consecutive_poll_failures.saturating_add(1);
                 self.set_status(format!("Refresh check failed: {error}"));
                 return;
             }
@@ -2062,6 +2076,12 @@ impl App {
         self.pending_new_items.len()
     }
 
+    /// Two consecutive background-poll failures: show a persistent
+    /// indicator instead of relying on 2-second transient statuses.
+    pub fn is_offline(&self) -> bool {
+        self.consecutive_poll_failures >= 2
+    }
+
     pub fn has_pending_tasks(&self) -> bool {
         self.pending_feed.is_some()
             || self.pending_pagination.is_some()
@@ -2419,6 +2439,54 @@ mod tests {
 
         assert_eq!(app.visible_status(), None);
         assert_eq!(app.pending_task_label(), Some("Loading feed"));
+    }
+
+    #[test]
+    fn failed_notification_poll_keeps_badge_and_flags_offline() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.unread_notifications = 4;
+
+        for request_id in [2, 3] {
+            app.pending_notification_count = Some(request_id);
+            app.apply_event(AppEvent::NotificationCountLoaded {
+                request_id,
+                account_did: "did:plc:alice".into(),
+                result: Err("network".into()),
+            })
+            .unwrap();
+        }
+
+        assert_eq!(app.unread_notifications, 4);
+        assert!(app.is_offline());
+        let line = line_text(&ui::status_left_line(&app, 200));
+        assert!(line.contains("offline"));
+
+        app.pending_notification_count = Some(4);
+        app.apply_event(AppEvent::NotificationCountLoaded {
+            request_id: 4,
+            account_did: "did:plc:alice".into(),
+            result: Ok(6),
+        })
+        .unwrap();
+
+        assert_eq!(app.unread_notifications, 6);
+        assert!(!app.is_offline());
+    }
+
+    #[test]
+    fn single_refresh_failure_is_not_offline() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.pending_refresh = Some(1);
+
+        app.apply_event(AppEvent::FeedRefreshLoaded {
+            request_id: 1,
+            source: FeedSource::home(),
+            result: Err("network".into()),
+        })
+        .unwrap();
+
+        assert!(!app.is_offline());
+        assert_eq!(app.consecutive_poll_failures, 1);
     }
 
     #[test]
@@ -2872,6 +2940,7 @@ mod tests {
             should_quit: false,
             pending_new_items: Vec::new(),
             unread_notifications: 0,
+            consecutive_poll_failures: 0,
             events_tx,
             events_rx,
             next_request_id: 1,

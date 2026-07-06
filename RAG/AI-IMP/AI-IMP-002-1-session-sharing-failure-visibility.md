@@ -6,12 +6,12 @@ tags:
   - at-tui
   - auth
   - reliability
-kanban_status: planned
+kanban_status: completed
 depends_on:
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.9
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-1-session-sharing-failure-visibility
@@ -35,15 +35,15 @@ Wrap the session in `Arc<std::sync::RwLock<Session>>` inside `BskyClient` — re
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] `api.rs`: store `session: Arc<RwLock<Session>>` and `refresh_gate: Arc<tokio::sync::Mutex<()>>`; `Clone` shares both.
-- [ ] `api.rs`: `send_get`/`send_post` read the access JWT through the lock per request.
-- [ ] `api.rs`: `refresh_session` is single-flight with a skip when another task refreshed while waiting.
-- [ ] `api.rs`: replace `session()` with `session_snapshot()` + `did()`/`handle()`; update all call sites.
-- [ ] `app.rs`: add `consecutive_poll_failures`, increment on refresh-check and unread-poll errors, reset on success.
-- [ ] `app.rs`: failed unread poll no longer zeroes `unread_notifications`.
-- [ ] `ui.rs`: persistent `⚠ offline` segment while `consecutive_poll_failures >= 2`.
-- [ ] Tests: single-flight skip logic (JWT-changed short-circuit), badge retention on error, offline segment rendering.
-- [ ] Gate: `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo build`.
+- [x] `api.rs`: store `session: Arc<RwLock<Session>>` and `refresh_gate: Arc<tokio::sync::Mutex<()>>`; `Clone` shares both.
+- [x] `api.rs`: `send_get`/`send_post` read the access JWT through the lock per request.
+- [x] `api.rs`: `refresh_session` is single-flight with a skip when another task refreshed while waiting.
+- [x] `api.rs`: replace `session()` with `session_snapshot()` + `did()`/`handle()`; update all call sites.
+- [x] `app.rs`: add `consecutive_poll_failures`, increment on refresh-check and unread-poll errors, reset on success.
+- [x] `app.rs`: failed unread poll no longer zeroes `unread_notifications`.
+- [x] `ui.rs`: persistent `⚠ offline` segment while `consecutive_poll_failures >= 2`.
+- [x] Tests: single-flight skip logic (JWT-changed short-circuit), badge retention on error, offline segment rendering.
+- [x] Gate: `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo build`.
 
 ### Acceptance Criteria
 **Scenario:** Access token expires while the app is idle.
@@ -65,3 +65,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+No blockers. `session()` kept its name but now returns an owned snapshot, which let every existing call site compile unchanged. Single-flight skip is tested by holding the gate, rotating tokens from a second clone, and asserting the waiting refresh returns without spending the refresh token; a true concurrent-401 integration test would need an HTTP mock and was skipped as out of proportion. The offline threshold (2 consecutive failures) is intentionally conservative so a single flaky poll does not flash the indicator.

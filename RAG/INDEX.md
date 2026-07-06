@@ -7,10 +7,10 @@
 | Status | EPICs | IMPs |
 |--------|-------|------|
 | In Progress | 1 | 0 |
-| Planned | 1 | 8 |
+| Planned | 1 | 7 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 0 | 2 |
+| Completed | 0 | 3 |
 | **Total** | **2** | **10** |
 
 ## In Progress
@@ -19,7 +19,7 @@
 > AT-TUI cannot currently be left running: after roughly two hours idle the access token expires, the refreshing clone strands the main client with a...
 
 **IMPs:**
-- [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — planned
+- [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
 - [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — planned
 - [[AI-IMP-002-3-view-pagination-stack-preservation|IMP-002-3]] 3 view pagination stack preservation — planned
 - [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — planned
@@ -48,14 +48,14 @@ Generated from tracked files; binary assets excluded.
 ### > 600 LOC
 
 - Cargo.lock (4145 LOC)
-- src/app.rs (2942 LOC)
+- src/app.rs (3011 LOC)
 - src/model.rs (1976 LOC)
-- src/ui.rs (1311 LOC)
+- src/ui.rs (1315 LOC)
 - src/media.rs (746 LOC)
+- src/api.rs (675 LOC)
 
 ### > 300 LOC
 
-- src/api.rs (578 LOC)
 - RAG/scripts/generate-index.sh (575 LOC)
 - src/navigation.rs (424 LOC)
 - src/config.rs (360 LOC)

@@ -472,6 +472,10 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
         ));
     }
 
+    if app.is_offline() {
+        spans.push(segment(" ⚠ offline ".to_owned(), Color::Black, Color::Red));
+    }
+
     if app.has_pending_tasks() {
         spans.push(segment(" … ".to_owned(), Color::Black, Color::Magenta));
     }
