@@ -6,12 +6,12 @@ tags:
   - at-tui
   - ui
   - polish
-kanban_status: planned
+kanban_status: completed
 depends_on: [[AI-IMP-002-2]]
 parent_epic: [[AI-EPIC-002-at-tui-stabilization-daily-driver]]
 confidence_score: 0.9
 date_created: 2026-07-06
-date_completed:
+date_completed: 2026-07-06
 ---
 
 # AI-IMP-002-7-visual-quick-wins
@@ -34,11 +34,11 @@ Spinner: `⠋⠙⠹⠸⠼⠴⠦⠧` indexed by a frame counter the main loop adv
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Spinner frames cycle in the pending segment while tasks run; static state gone.
-- [ ] Quote posts render with `╭─`/`│`/`╰─` box-drawing frame and `❞` marker.
-- [ ] Nested-quote and media summary lines align inside the frame.
-- [ ] Tests updated for the new quote frame text and spinner presence.
-- [ ] Gate: fmt, test, clippy -D warnings, build.
+- [x] Spinner frames cycle in the pending segment while tasks run; static state gone.
+- [x] Quote posts render with `╭─`/`│`/`╰─` box-drawing frame and `❞` marker.
+- [x] Nested-quote and media summary lines align inside the frame.
+- [x] Tests updated for the new quote frame text and spinner presence.
+- [x] Gate: fmt, test, clippy -D warnings, build.
 
 ### Acceptance Criteria
 **Scenario:** Background load in flight.
@@ -58,3 +58,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+Spinner cadence is 120ms gated on has_pending_tasks; the dirty-flag loop from 002-2 already redraws while tasks pend so no extra wakeups were added. Minor known inconsistency: media-summary rows inside a quote frame render their │ prefix in the summary color rather than frame yellow; left as-is to keep push_wrapped_summary generic.

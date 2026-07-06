@@ -513,7 +513,11 @@ pub struct App {
     last_notification_poll: Instant,
     notification_interval: Duration,
     last_video_frame: Instant,
+    spinner_index: usize,
+    last_spinner_tick: Instant,
 }
+
+const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 impl App {
     pub async fn bootstrap(mut client: BskyClient, media: MediaCache) -> Result<Self> {
@@ -580,6 +584,8 @@ impl App {
             last_notification_poll: now - Duration::from_secs(60),
             notification_interval: Duration::from_secs(60),
             last_video_frame: now,
+            spinner_index: 0,
+            last_spinner_tick: now,
         })
     }
 
@@ -2427,6 +2433,22 @@ impl App {
     pub fn video_playing(&self) -> bool {
         matches!(self.overlay.as_ref(), Some(Overlay::Media(state)) if state.playing)
     }
+
+    pub fn advance_spinner(&mut self) -> bool {
+        if !self.has_pending_tasks() {
+            return false;
+        }
+        if self.last_spinner_tick.elapsed() < Duration::from_millis(120) {
+            return false;
+        }
+        self.spinner_index = self.spinner_index.wrapping_add(1);
+        self.last_spinner_tick = Instant::now();
+        true
+    }
+
+    pub fn spinner_char(&self) -> char {
+        SPINNER_FRAMES[self.spinner_index % SPINNER_FRAMES.len()]
+    }
 }
 
 pub fn post_grapheme_count(text: &str) -> usize {
@@ -2521,6 +2543,9 @@ pub async fn run_tui(
         app.maybe_refresh_active_feed();
         app.maybe_poll_notifications();
         if app.advance_video_frame() {
+            dirty = true;
+        }
+        if app.advance_spinner() {
             dirty = true;
         }
         let status_visible = app.visible_status().is_some();
@@ -2979,6 +3004,25 @@ mod tests {
         app.expire_status_for_test();
 
         assert_eq!(app.visible_status(), None);
+    }
+
+    #[test]
+    fn spinner_animates_only_while_tasks_pend() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        assert!(!app.advance_spinner());
+
+        app.pending_feed = Some(1);
+        app.last_spinner_tick = Instant::now() - Duration::from_millis(200);
+        let first = app.spinner_char();
+        assert!(app.advance_spinner());
+        assert_ne!(app.spinner_char(), first);
+        assert!(SPINNER_FRAMES.contains(&app.spinner_char()));
+
+        // Too soon for the next frame.
+        assert!(!app.advance_spinner());
+
+        let line = line_text(&ui::status_left_line(&app, 200));
+        assert!(line.contains(app.spinner_char()));
     }
 
     #[test]
@@ -3562,6 +3606,8 @@ mod tests {
             last_notification_poll: Instant::now(),
             notification_interval: Duration::from_secs(60),
             last_video_frame: Instant::now(),
+            spinner_index: 0,
+            last_spinner_tick: Instant::now(),
         }
     }
 

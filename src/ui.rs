@@ -501,7 +501,11 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
     }
 
     if app.has_pending_tasks() {
-        spans.push(segment(" … ".to_owned(), Color::Black, Color::Magenta));
+        spans.push(segment(
+            format!(" {} ", app.spinner_char()),
+            Color::Black,
+            Color::Magenta,
+        ));
     }
 
     let status = if include_transient_status {
@@ -893,21 +897,25 @@ fn render_quote_lines(
     width: usize,
     body_prefix: &str,
 ) {
-    let quote_prefix = format!("{body_prefix}| ");
+    let frame_style = Style::default().fg(Color::Yellow);
+    let quote_prefix = format!("{body_prefix}│ ");
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "{body_prefix}+-- quote {} @{} {}",
+            "{body_prefix}╭─ ❞ {} @{} {}",
             quote.author_name,
             quote.author_handle,
             compact_time(quote.indexed_at.as_deref())
         ),
-        Style::default().fg(Color::Yellow),
+        frame_style,
     )]));
     for line in wrap_text(
         &quote.text,
-        width.saturating_sub(quote_prefix.len()).max(10),
+        width.saturating_sub(quote_prefix.chars().count()).max(10),
     ) {
-        lines.push(Line::from(format!("{quote_prefix}{line}")));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{body_prefix}│ "), frame_style),
+            Span::raw(line),
+        ]));
     }
     render_media_summary(
         lines,
@@ -918,8 +926,15 @@ fn render_quote_lines(
         quote.external.as_ref(),
     );
     if let Some(nested) = &quote.nested_quote {
-        lines.push(Line::from(format!("{quote_prefix}nested quote: {nested}")));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{body_prefix}│ "), frame_style),
+            Span::raw(format!("nested quote: {nested}")),
+        ]));
     }
+    lines.push(Line::from(vec![Span::styled(
+        format!("{body_prefix}╰─"),
+        frame_style,
+    )]));
 }
 
 fn render_media_summary(
@@ -1080,6 +1095,41 @@ mod tests {
         assert_eq!(line.spans[4].content.as_ref(), "♥ 5");
         assert_eq!(line.spans[4].style.fg, Some(Color::Red));
         assert!(line.spans[4].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn renders_quote_in_box_drawing_frame() {
+        let mut item = item();
+        item.quote = Some(QuotePost {
+            uri: "quote".into(),
+            cid: None,
+            author_name: "Bob".into(),
+            author_handle: "bob.test".into(),
+            text: "quoted words".into(),
+            indexed_at: None,
+            images: Vec::new(),
+            videos: Vec::new(),
+            external: None,
+            links: Vec::new(),
+            nested_quote: None,
+        });
+
+        let lines = render_item_lines(&item, false, 80);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("╭─ ❞ Bob @bob.test"));
+        assert!(text.contains("│ quoted words"));
+        assert!(text.contains("╰─"));
+        assert!(!text.contains("+--"));
     }
 
     #[test]

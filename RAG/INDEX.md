@@ -7,10 +7,10 @@
 | Status | EPICs | IMPs |
 |--------|-------|------|
 | In Progress | 1 | 0 |
-| Planned | 1 | 2 |
+| Planned | 1 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 0 | 8 |
+| Completed | 0 | 9 |
 | **Total** | **2** | **10** |
 
 ## In Progress
@@ -25,7 +25,7 @@
 - [[AI-IMP-002-4-keymap-rework-page-scroll|IMP-002-4]] 4 keymap rework page scroll — completed
 - [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — completed
 - [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — completed
-- [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — planned
+- [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — completed
 
 ---
 
@@ -48,9 +48,9 @@ Generated from tracked files; binary assets excluded.
 ### > 600 LOC
 
 - Cargo.lock (4146 LOC)
-- src/app.rs (3615 LOC)
+- src/app.rs (3661 LOC)
 - src/model.rs (1976 LOC)
-- src/ui.rs (1339 LOC)
+- src/ui.rs (1389 LOC)
 - src/media.rs (941 LOC)
 - src/api.rs (833 LOC)
 
