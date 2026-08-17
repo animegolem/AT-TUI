@@ -7,13 +7,13 @@ tags:
   - async
   - lifecycle
   - reliability
-kanban_status: planned
+kanban_status: completed
 depends_on:
   - AI-IMP-003-1
 parent_epic: [[AI-EPIC-003-trustworthy-runtime-interaction-foundation]]
 confidence_score: 0.88
 date_created: 2026-08-17
-date_completed:
+date_completed: 2026-08-17
 ---
 
 # AI-IMP-003-2-task-context-timeouts
@@ -37,16 +37,16 @@ Add a compact task context containing request ID, account DID where applicable, 
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Define task context and generation semantics for loads, polls, writes, and media work.
-- [ ] Make every state-changing `AppEvent` carry or resolve a valid context.
-- [ ] Include account identity on write completions and reject old-account results.
-- [ ] Invalidate outstanding account-scoped work when an account switch commits.
-- [ ] Add explicit deadlines for API operations and surface timeout as a recoverable event result.
-- [ ] Guarantee pending flags/counters clear after success, error, timeout, cancellation, and stale completion.
-- [ ] Prevent late events from replacing navigation state created after their request began.
-- [ ] Add tests for stale account writes, stale view loads, timeout recovery, and late completion after cancellation.
-- [ ] Perform a hands-on account-switch and navigation smoke check.
-- [ ] Run the full validation gate.
+- [x] Define task context and generation semantics for loads, polls, writes, and media work.
+- [x] Make every state-changing `AppEvent` carry or resolve a valid context.
+- [x] Include account identity on write completions and reject old-account results.
+- [x] Invalidate outstanding account-scoped work when an account switch commits.
+- [x] Add explicit deadlines for API operations and surface timeout as a recoverable event result.
+- [x] Guarantee pending flags/counters clear after success, error, timeout, cancellation, and stale completion.
+- [x] Prevent late events from replacing navigation state created after their request began.
+- [x] Add tests for stale account writes, stale view loads, timeout recovery, and late completion after cancellation.
+- [x] Perform a hands-on account-switch and navigation smoke check.
+- [x] Run the full validation gate.
 
 ### Acceptance Criteria
 **Scenario:** A write completes after switching accounts.
@@ -66,3 +66,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+All spawned results now travel inside a `TaskEvent` carrying request ID, origin account DID, view generation, and scope. Invalidation is logical rather than `JoinHandle`-based: obsolete tasks may finish until the 30-second HTTP deadline, but their events are rejected centrally and clear only their own pending slot. Physical cancellation remains correctly owned by the media scheduler/video tickets, where child and worker handles will exist. The hands-on check launched the real TUI with images disabled, opened and returned from a thread, switched from `littledrummer` to `animegolem`, switched back to `littledrummer`, and exited cleanly; the original account remained active and no Bluesky content was written. No blockers or missing ticket-scoped tests remain.

@@ -13,6 +13,8 @@ use tokio::sync::Mutex;
 use crate::config::{Session, SessionStore};
 use crate::model::PostRef;
 
+const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Session tokens live behind a shared lock so every clone handed to a
 /// background task sees a refresh performed by any other clone. ATProto
 /// rotates refresh tokens on use, so a clone refreshing privately would
@@ -114,8 +116,19 @@ impl AuthenticatedRequest<'_> {
 
 impl BskyClient {
     pub fn new(session: Session, store: SessionStore) -> Self {
+        Self::with_http_timeout(session, store, DEFAULT_HTTP_TIMEOUT)
+    }
+
+    fn with_http_timeout(
+        session: Session,
+        store: SessionStore,
+        timeout: std::time::Duration,
+    ) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("valid Bluesky HTTP client configuration"),
             store,
             session: Arc::new(RwLock::new(session)),
             refresh_gate: Arc::new(Mutex::new(())),
@@ -138,7 +151,10 @@ impl BskyClient {
         identifier: &str,
         app_password: &str,
     ) -> Result<Session> {
-        let http = Client::new();
+        let http = Client::builder()
+            .timeout(DEFAULT_HTTP_TIMEOUT)
+            .build()
+            .expect("valid Bluesky HTTP client configuration");
         let url = xrpc_url(service, "com.atproto.server.createSession");
         let response = http
             .post(url)
@@ -744,6 +760,20 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    fn spawn_stalled_server(delay: Duration) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _ = read_http_request(&mut stream);
+            thread::sleep(delay);
+        });
+        (format!("http://{address}"), handle)
+    }
+
     fn read_http_request(stream: &mut TcpStream) -> String {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -1174,6 +1204,20 @@ mod tests {
         assert_eq!(xrpc.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(xrpc.code(), Some("UpstreamFailure"));
         assert_eq!(client.session().access_jwt, "new-access");
+    }
+
+    #[tokio::test]
+    async fn api_request_respects_configured_deadline() {
+        let (service, server) = spawn_stalled_server(Duration::from_millis(100));
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let mut client =
+            BskyClient::with_http_timeout(test_session(service), store, Duration::from_millis(20));
+
+        let error = client.get_timeline(None, 1).await.unwrap_err();
+
+        server.join().unwrap();
+        assert!(format!("{error:#}").contains("operation timed out"));
     }
 
     #[test]

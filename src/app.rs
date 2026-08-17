@@ -318,6 +318,27 @@ impl LinkPickerState {
 
 type RequestId = u64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskScope {
+    Global,
+    Account,
+    View,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContext {
+    request_id: RequestId,
+    account_did: String,
+    view_generation: u64,
+    scope: TaskScope,
+}
+
+#[derive(Debug)]
+struct TaskEvent {
+    context: TaskContext,
+    event: AppEvent,
+}
+
 #[derive(Debug)]
 enum AppEvent {
     ImageLoaded {
@@ -496,9 +517,10 @@ pub struct App {
     pub pending_new_items: Vec<FeedItem>,
     pub unread_notifications: u64,
     consecutive_poll_failures: u32,
-    events_tx: UnboundedSender<AppEvent>,
-    events_rx: UnboundedReceiver<AppEvent>,
+    events_tx: UnboundedSender<TaskEvent>,
+    events_rx: UnboundedReceiver<TaskEvent>,
     next_request_id: RequestId,
+    view_generation: u64,
     pending_feed: Option<RequestId>,
     pending_pagination: Option<RequestId>,
     pending_refresh: Option<RequestId>,
@@ -570,6 +592,7 @@ impl App {
             events_tx,
             events_rx,
             next_request_id: 1,
+            view_generation: 0,
             pending_feed: None,
             pending_pagination: None,
             pending_refresh: None,
@@ -592,7 +615,7 @@ impl App {
     pub fn drain_events(&mut self) -> Result<usize> {
         let mut applied = 0;
         while let Ok(event) = self.events_rx.try_recv() {
-            self.apply_event(event)?;
+            self.apply_task_event(event)?;
             applied += 1;
         }
         Ok(applied)
@@ -604,14 +627,49 @@ impl App {
         id
     }
 
-    fn spawn_event<F>(&self, task: F)
+    fn task_context(&mut self, scope: TaskScope) -> TaskContext {
+        TaskContext {
+            request_id: self.next_request_id(),
+            account_did: self.client.session().did,
+            view_generation: self.view_generation,
+            scope,
+        }
+    }
+
+    fn advance_view_generation(&mut self) {
+        self.view_generation = self.view_generation.saturating_add(1);
+    }
+
+    fn clear_account_pending_state(&mut self) {
+        self.pending_feed = None;
+        self.pending_pagination = None;
+        self.pending_refresh = None;
+        self.pending_notification_count = None;
+        self.pending_notifications = None;
+        self.pending_thread = None;
+        self.pending_profile = None;
+        self.pending_writes = 0;
+    }
+
+    fn task_context_is_current(&self, context: &TaskContext) -> bool {
+        match context.scope {
+            TaskScope::Global => true,
+            TaskScope::Account => context.account_did == self.client.session().did,
+            TaskScope::View => {
+                context.account_did == self.client.session().did
+                    && context.view_generation == self.view_generation
+            }
+        }
+    }
+
+    fn spawn_event<F>(&self, context: TaskContext, task: F)
     where
         F: Future<Output = AppEvent> + Send + 'static,
     {
         let tx = self.events_tx.clone();
         tokio::spawn(async move {
             let event = task.await;
-            let _ = tx.send(event);
+            let _ = tx.send(TaskEvent { context, event });
         });
     }
 
@@ -637,6 +695,81 @@ impl App {
     #[cfg(test)]
     fn expire_status_for_test(&mut self) {
         self.status_expires_at = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    fn apply_task_event(&mut self, event: TaskEvent) -> Result<()> {
+        if !self.task_context_is_current(&event.context) {
+            self.clear_pending_for_stale_event(&event.event, event.context.request_id);
+            return Ok(());
+        }
+        self.apply_event(event.event)
+    }
+
+    fn clear_pending_for_stale_event(&mut self, event: &AppEvent, request_id: RequestId) {
+        match event {
+            AppEvent::FeedLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_feed == Some(*id) {
+                    self.pending_feed = None;
+                    self.nav.root_mut().loading = false;
+                }
+            }
+            AppEvent::FeedRefreshLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_refresh == Some(*id) {
+                    self.pending_refresh = None;
+                }
+            }
+            AppEvent::PageLoaded { request_id: id, .. }
+            | AppEvent::ProfilePageLoaded { request_id: id, .. }
+            | AppEvent::NotificationsPageLoaded { request_id: id, .. }
+                if *id == request_id =>
+            {
+                if self.pending_pagination == Some(*id) {
+                    self.pending_pagination = None;
+                    self.nav.current_mut().loading = false;
+                }
+            }
+            AppEvent::ThreadLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_thread == Some(*id) {
+                    self.pending_thread = None;
+                }
+            }
+            AppEvent::ProfileLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_profile == Some(*id) {
+                    self.pending_profile = None;
+                }
+            }
+            AppEvent::NotificationsLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_notifications == Some(*id) {
+                    self.pending_notifications = None;
+                }
+            }
+            AppEvent::AccountLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_account == Some(*id) {
+                    self.pending_account = None;
+                }
+            }
+            AppEvent::WriteCompleted { .. } => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
+            }
+            AppEvent::NotificationCountLoaded { request_id: id, .. } if *id == request_id => {
+                if self.pending_notification_count == Some(*id) {
+                    self.pending_notification_count = None;
+                }
+            }
+            AppEvent::ImageLoaded { .. }
+            | AppEvent::VideoLoaded { .. }
+            | AppEvent::LinkOpened { .. }
+            | AppEvent::FeedLoaded { .. }
+            | AppEvent::FeedRefreshLoaded { .. }
+            | AppEvent::PageLoaded { .. }
+            | AppEvent::ProfilePageLoaded { .. }
+            | AppEvent::NotificationsPageLoaded { .. }
+            | AppEvent::ThreadLoaded { .. }
+            | AppEvent::ProfileLoaded { .. }
+            | AppEvent::NotificationsLoaded { .. }
+            | AppEvent::AccountLoaded { .. }
+            | AppEvent::NotificationCountLoaded { .. } => {}
+        }
     }
 
     fn apply_event(&mut self, event: AppEvent) -> Result<()> {
@@ -1124,7 +1257,8 @@ impl App {
             let Some(job) = self.media.load_job_url(&url) else {
                 continue;
             };
-            self.spawn_event(async move {
+            let context = self.task_context(TaskScope::Global);
+            self.spawn_event(context, async move {
                 let (url, result) = job.run().await;
                 AppEvent::ImageLoaded { url, result }
             });
@@ -1165,7 +1299,8 @@ impl App {
             return;
         };
         self.set_status("Decoding video frames");
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Global);
+        self.spawn_event(context, async move {
             let (playlist_url, result) = job.run().await;
             AppEvent::VideoLoaded {
                 playlist_url,
@@ -1193,7 +1328,8 @@ impl App {
 
     fn open_uri(&mut self, uri: String) {
         self.set_status(format!("Opening {uri}"));
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Global);
+        self.spawn_event(context, async move {
             let opened_uri = uri.clone();
             #[cfg(test)]
             let result = Ok(());
@@ -1245,14 +1381,16 @@ impl App {
     }
 
     fn queue_feed_load(&mut self, source: FeedSource, status: String) {
-        let id = self.next_request_id();
+        self.advance_view_generation();
+        let context = self.task_context(TaskScope::View);
+        let id = context.request_id;
         self.pending_feed = Some(id);
         // Feed loads always target the root timeline, wherever the user is.
         self.nav.root_mut().loading = true;
         self.set_status(status);
         let mut client = self.client.clone();
         let prefs = self.home_feed_prefs;
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let result = load_feed_page(&mut client, &source, &prefs, None)
                 .await
                 .map_err(|error| format!("{error:#}"));
@@ -1265,12 +1403,14 @@ impl App {
     }
 
     fn queue_thread_load(&mut self, action: ThreadAction) {
-        let id = self.next_request_id();
+        self.advance_view_generation();
+        let context = self.task_context(TaskScope::View);
+        let id = context.request_id;
         let uri = action.root_uri().to_owned();
         self.pending_thread = Some(id);
         self.set_status(action.loading_status());
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let result = client
                 .get_post_thread(&uri)
                 .await
@@ -1285,11 +1425,13 @@ impl App {
     }
 
     fn queue_profile_load(&mut self, actor: String, status: String) {
-        let id = self.next_request_id();
+        self.advance_view_generation();
+        let context = self.task_context(TaskScope::View);
+        let id = context.request_id;
         self.pending_profile = Some(id);
         self.set_status(status);
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let result = async {
                 let root = client.get_profile(&actor).await?;
                 let profile = profile_summary(&root);
@@ -1317,12 +1459,14 @@ impl App {
     }
 
     fn queue_notifications_load(&mut self, status: impl Into<String>) {
-        let id = self.next_request_id();
+        self.advance_view_generation();
+        let context = self.task_context(TaskScope::View);
+        let id = context.request_id;
         self.pending_notifications = Some(id);
         self.set_status(status);
         let account_did = self.client.session().did.clone();
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let result = async {
                 let root = client.list_notifications(None, 50).await?;
                 let (items, cursor, _) = notification_items(&root);
@@ -1346,11 +1490,13 @@ impl App {
     }
 
     fn queue_account_switch(&mut self, account: AccountSession) {
-        let id = self.next_request_id();
+        self.advance_view_generation();
+        let context = self.task_context(TaskScope::View);
+        let id = context.request_id;
         self.pending_account = Some(id);
         self.set_status(format!("Switching to @{}", account.session.handle));
         let store = self.client.store();
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let mut client = BskyClient::new(account.session.clone(), store);
             let result = async {
                 client.refresh_session().await?;
@@ -1763,6 +1909,8 @@ impl App {
                 let store = self.client.store();
                 store.switch_account(&data.account.label)?;
                 self.client = BskyClient::new(data.session, store.clone());
+                self.advance_view_generation();
+                self.clear_account_pending_state();
                 self.accounts = store.list_accounts().unwrap_or_default();
                 self.home_feed_prefs = data.home_feed_prefs;
                 self.feeds = if data.feeds.is_empty() {
@@ -2023,7 +2171,8 @@ impl App {
         self.pending_writes = self.pending_writes.saturating_add(1);
         self.set_status("Posting");
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Account);
+        self.spawn_event(context, async move {
             let result = client
                 .create_post(&text, reply, quote)
                 .await
@@ -2051,7 +2200,8 @@ impl App {
         self.pending_writes = self.pending_writes.saturating_add(1);
         self.set_status("Deleting post");
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Account);
+        self.spawn_event(context, async move {
             let result = client
                 .delete_record_uri(&uri)
                 .await
@@ -2080,7 +2230,8 @@ impl App {
         let target_uri = item.uri.clone();
         let existing = item.viewer_like.clone();
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Account);
+        self.spawn_event(context, async move {
             let result = async {
                 if let Some(record_uri) = existing {
                     client.delete_record_uri(&record_uri).await?;
@@ -2123,7 +2274,8 @@ impl App {
         let target_uri = item.uri.clone();
         let existing = item.viewer_repost.clone();
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Account);
+        self.spawn_event(context, async move {
             let result = async {
                 if let Some(record_uri) = existing {
                     client.delete_record_uri(&record_uri).await?;
@@ -2172,7 +2324,8 @@ impl App {
         let target_did = target.did.clone();
         let target_handle = target.handle.clone();
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        let context = self.task_context(TaskScope::Account);
+        self.spawn_event(context, async move {
             let result = async {
                 if let Some(record_uri) = existing {
                     client.delete_record_uri(&record_uri).await?;
@@ -2218,11 +2371,12 @@ impl App {
             ViewKind::Timeline => {
                 self.nav.current_mut().loading = true;
                 let source = self.feeds[self.active_feed].clone();
-                let id = self.next_request_id();
+                let context = self.task_context(TaskScope::View);
+                let id = context.request_id;
                 self.pending_pagination = Some(id);
                 let mut client = self.client.clone();
                 let prefs = self.home_feed_prefs;
-                self.spawn_event(async move {
+                self.spawn_event(context, async move {
                     let result = load_feed_page(&mut client, &source, &prefs, Some(&cursor))
                         .await
                         .map_err(|error| format!("{error:#}"));
@@ -2235,10 +2389,11 @@ impl App {
             }
             ViewKind::Profile { actor } => {
                 self.nav.current_mut().loading = true;
-                let id = self.next_request_id();
+                let context = self.task_context(TaskScope::View);
+                let id = context.request_id;
                 self.pending_pagination = Some(id);
                 let mut client = self.client.clone();
-                self.spawn_event(async move {
+                self.spawn_event(context, async move {
                     let result = client
                         .get_author_feed(&actor, Some(&cursor), 50)
                         .await
@@ -2253,11 +2408,12 @@ impl App {
             }
             ViewKind::Notifications => {
                 self.nav.current_mut().loading = true;
-                let id = self.next_request_id();
+                let context = self.task_context(TaskScope::View);
+                let id = context.request_id;
                 self.pending_pagination = Some(id);
                 let account_did = self.client.session().did.clone();
                 let mut client = self.client.clone();
-                self.spawn_event(async move {
+                self.spawn_event(context, async move {
                     // Deliberately no updateSeen here: reading history is
                     // not the same as acknowledging new notifications.
                     let result = client
@@ -2290,11 +2446,12 @@ impl App {
         }
 
         let source = self.feeds[self.active_feed].clone();
-        let id = self.next_request_id();
+        let context = self.task_context(TaskScope::View);
+        let id = context.request_id;
         self.pending_refresh = Some(id);
         let mut client = self.client.clone();
         let prefs = self.home_feed_prefs;
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let result = load_feed_page(&mut client, &source, &prefs, None)
                 .await
                 .map(|(items, _)| items)
@@ -2314,12 +2471,13 @@ impl App {
             return;
         }
 
-        let id = self.next_request_id();
+        let context = self.task_context(TaskScope::Account);
+        let id = context.request_id;
         self.pending_notification_count = Some(id);
         self.last_notification_poll = Instant::now();
         let account_did = self.client.session().did.clone();
         let mut client = self.client.clone();
-        self.spawn_event(async move {
+        self.spawn_event(context, async move {
             let result = client
                 .get_unread_notification_count()
                 .await
@@ -2743,10 +2901,14 @@ mod tests {
         let mut app = app_with_items(vec![item("post", "hello")]);
         assert_eq!(app.drain_events().unwrap(), 0);
 
+        let context = app.task_context(TaskScope::Global);
         app.events_tx
-            .send(AppEvent::LinkOpened {
-                uri: "https://example.com".into(),
-                result: Ok(()),
+            .send(TaskEvent {
+                context,
+                event: AppEvent::LinkOpened {
+                    uri: "https://example.com".into(),
+                    result: Ok(()),
+                },
             })
             .unwrap();
 
@@ -2767,6 +2929,83 @@ mod tests {
 
         assert_eq!(app.nav.current().items.len(), 1);
         assert_eq!(app.nav.current().items[0].uri(), "original");
+    }
+
+    #[test]
+    fn stale_view_context_clears_pending_without_replacing_root() {
+        let mut app = app_with_items(vec![item("original", "hello")]);
+        let context = app.task_context(TaskScope::View);
+        app.pending_feed = Some(context.request_id);
+        app.advance_view_generation();
+
+        app.apply_task_event(TaskEvent {
+            context: context.clone(),
+            event: AppEvent::FeedLoaded {
+                request_id: context.request_id,
+                source: FeedSource::home(),
+                result: Ok((vec![item("stale", "stale")], None)),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(app.pending_feed, None);
+        assert_eq!(app.nav.root_mut().items[0].uri(), "original");
+    }
+
+    #[test]
+    fn stale_account_write_cannot_mutate_current_navigation() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        let context = app.task_context(TaskScope::Account);
+        app.pending_writes = 1;
+        let store = app.client.store();
+        app.client = BskyClient::new(
+            Session {
+                service: "https://bsky.social".into(),
+                handle: "bob.test".into(),
+                did: "did:plc:bob".into(),
+                access_jwt: "bob-access".into(),
+                refresh_jwt: "bob-refresh".into(),
+            },
+            store,
+        );
+
+        app.apply_task_event(TaskEvent {
+            context,
+            event: AppEvent::WriteCompleted {
+                result: Ok(WriteResult::Like {
+                    target_uri: "post".into(),
+                    liked: true,
+                    record_uri: Some("at://did:plc:alice/app.bsky.feed.like/1".into()),
+                }),
+            },
+        })
+        .unwrap();
+
+        let post = app.nav.current().selected_item().unwrap();
+        assert_eq!(post.viewer_like, None);
+        assert_eq!(post.like_count, 0);
+        assert_eq!(app.pending_writes, 0);
+    }
+
+    #[test]
+    fn timed_out_refresh_completion_releases_pending_slot() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        let context = app.task_context(TaskScope::View);
+        app.pending_refresh = Some(context.request_id);
+
+        app.apply_task_event(TaskEvent {
+            context: context.clone(),
+            event: AppEvent::FeedRefreshLoaded {
+                request_id: context.request_id,
+                source: FeedSource::home(),
+                result: Err("request operation timed out".into()),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(app.pending_refresh, None);
+        assert_eq!(app.consecutive_poll_failures, 1);
+        assert!(app.status.contains("timed out"));
     }
 
     #[test]
@@ -3592,6 +3831,7 @@ mod tests {
             events_tx,
             events_rx,
             next_request_id: 1,
+            view_generation: 0,
             pending_feed: None,
             pending_pagination: None,
             pending_refresh: None,
