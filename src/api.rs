@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
@@ -26,6 +29,87 @@ pub struct BskyClient {
 pub struct CreatedRecord {
     pub uri: String,
     pub cid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrpcError {
+    status: StatusCode,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+impl XrpcError {
+    fn from_body(status: StatusCode, body: &str) -> Self {
+        let value = serde_json::from_str::<Value>(body).ok();
+        Self {
+            status,
+            code: value
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            message: value
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        }
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    fn requires_session_refresh(&self) -> bool {
+        self.code() == Some("ExpiredToken") || self.status == StatusCode::UNAUTHORIZED
+    }
+}
+
+impl fmt::Display for XrpcError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Bluesky API returned {}", self.status)?;
+        if let Some(code) = self.code() {
+            write!(formatter, " ({code})")?;
+        }
+        if let Some(message) = self.message() {
+            write!(formatter, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for XrpcError {}
+
+enum AuthenticatedRequest<'a> {
+    Get {
+        endpoint: &'a str,
+        query: &'a [(String, String)],
+    },
+    Post {
+        endpoint: &'a str,
+        body: &'a Value,
+    },
+}
+
+struct AuthenticatedResponse {
+    response: Response,
+    access_jwt: String,
+}
+
+impl AuthenticatedRequest<'_> {
+    fn endpoint(&self) -> &str {
+        match self {
+            Self::Get { endpoint, .. } | Self::Post { endpoint, .. } => endpoint,
+        }
+    }
 }
 
 impl BskyClient {
@@ -164,6 +248,10 @@ impl BskyClient {
 
     pub async fn refresh_session(&mut self) -> Result<()> {
         let observed_access = self.access_jwt();
+        self.refresh_session_if_unchanged(&observed_access).await
+    }
+
+    async fn refresh_session_if_unchanged(&mut self, observed_access: &str) -> Result<()> {
         let gate = self.refresh_gate.clone();
         let _guard = gate.lock().await;
         if self.access_jwt() != observed_access {
@@ -271,55 +359,68 @@ impl BskyClient {
     }
 
     async fn get(&mut self, endpoint: &str, query: &[(String, String)]) -> Result<Value> {
-        let response = self.send_get(endpoint, query).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            self.refresh_session().await?;
-            let retry = self.send_get(endpoint, query).await?;
-            return response_json(retry).await;
-        }
-        response_json(response).await
+        self.authenticated_json(AuthenticatedRequest::Get { endpoint, query })
+            .await
     }
 
     async fn post_json(&mut self, endpoint: &str, body: Value) -> Result<Value> {
-        let response = self.send_post(endpoint, &body).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            self.refresh_session().await?;
-            let retry = self.send_post(endpoint, &body).await?;
-            return response_json(retry).await;
-        }
-        response_json(response).await
+        self.authenticated_json(AuthenticatedRequest::Post {
+            endpoint,
+            body: &body,
+        })
+        .await
     }
 
     async fn post_empty(&mut self, endpoint: &str, body: Value) -> Result<()> {
         self.post_json(endpoint, body).await.map(|_| ())
     }
 
-    async fn send_get(&self, endpoint: &str, query: &[(String, String)]) -> Result<Response> {
-        let (service, access_jwt) = {
-            let session = self.session.read().expect("session lock poisoned");
-            (session.service.clone(), session.access_jwt.clone())
-        };
-        self.http
-            .get(xrpc_url(&service, endpoint))
-            .bearer_auth(access_jwt)
-            .query(query)
-            .send()
-            .await
-            .with_context(|| format!("could not call {endpoint}"))
+    async fn authenticated_json(&mut self, request: AuthenticatedRequest<'_>) -> Result<Value> {
+        let AuthenticatedResponse {
+            response,
+            access_jwt,
+        } = self.send_authenticated(&request).await?;
+        match response_json(response).await {
+            Err(error)
+                if error
+                    .downcast_ref::<XrpcError>()
+                    .is_some_and(XrpcError::requires_session_refresh) =>
+            {
+                self.refresh_session_if_unchanged(&access_jwt)
+                    .await
+                    .context("could not refresh expired Bluesky session")?;
+                let retry = self.send_authenticated(&request).await?;
+                response_json(retry.response).await
+            }
+            result => result,
+        }
     }
 
-    async fn send_post(&self, endpoint: &str, body: &Value) -> Result<Response> {
+    async fn send_authenticated(
+        &self,
+        request: &AuthenticatedRequest<'_>,
+    ) -> Result<AuthenticatedResponse> {
         let (service, access_jwt) = {
             let session = self.session.read().expect("session lock poisoned");
             (session.service.clone(), session.access_jwt.clone())
         };
-        self.http
-            .post(xrpc_url(&service, endpoint))
-            .bearer_auth(access_jwt)
-            .json(body)
+        let request_builder = match request {
+            AuthenticatedRequest::Get { endpoint, query } => {
+                self.http.get(xrpc_url(&service, endpoint)).query(*query)
+            }
+            AuthenticatedRequest::Post { endpoint, body } => {
+                self.http.post(xrpc_url(&service, endpoint)).json(*body)
+            }
+        };
+        let response = request_builder
+            .bearer_auth(&access_jwt)
             .send()
             .await
-            .with_context(|| format!("could not call {endpoint}"))
+            .with_context(|| format!("could not call {}", request.endpoint()))?;
+        Ok(AuthenticatedResponse {
+            response,
+            access_jwt,
+        })
     }
 }
 
@@ -572,7 +673,7 @@ async fn response_json(response: Response) -> Result<Value> {
         .await
         .context("could not read response body")?;
     if !status.is_success() {
-        return Err(anyhow!("Bluesky API returned {status}: {text}"));
+        return Err(XrpcError::from_body(status, &text).into());
     }
     serde_json::from_str(&text).context("could not parse Bluesky API response")
 }
@@ -594,7 +695,123 @@ fn unread_notification_count(value: &Value) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread::{self, JoinHandle},
+        time::Duration,
+    };
+
     use super::*;
+
+    struct ExpectedRequest {
+        method: &'static str,
+        path: &'static str,
+        authorization: &'static str,
+        status: u16,
+        body: &'static str,
+    }
+
+    fn spawn_xrpc_server(expectations: Vec<ExpectedRequest>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for expected in expectations {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let request = read_http_request(&mut stream);
+                let expected_request_line =
+                    format!("{} {} HTTP/1.1", expected.method, expected.path);
+                let expected_authorization =
+                    format!("authorization: Bearer {}", expected.authorization);
+                let request_matches = request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line == expected_request_line)
+                    && request
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&expected_authorization));
+
+                write_http_response(&mut stream, expected.status, expected.body);
+                assert!(
+                    request_matches,
+                    "unexpected request; wanted {expected_request_line} with {expected_authorization}, got:\n{request}"
+                );
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_len = None;
+
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+
+            if expected_len.is_none()
+                && let Some(header_end) = find_bytes(&request, b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(header_end + 4 + content_len);
+            }
+
+            if expected_len.is_some_and(|expected| request.len() >= expected) {
+                break;
+            }
+        }
+
+        String::from_utf8(request).unwrap()
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            500 => "Internal Server Error",
+            _ => "Test Response",
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn test_session(service: String) -> Session {
+        Session {
+            service,
+            handle: "alice.test".into(),
+            did: "did:plc:alice".into(),
+            access_jwt: "old-access".into(),
+            refresh_jwt: "old-refresh".into(),
+        }
+    }
 
     #[test]
     fn builds_xrpc_url_without_double_slash() {
@@ -822,6 +1039,140 @@ mod tests {
         drop(guard);
 
         waiting.await.unwrap().unwrap();
+        assert_eq!(client.session().access_jwt, "new-access");
+    }
+
+    #[tokio::test]
+    async fn expired_token_400_refreshes_and_retries_get() {
+        let (service, server) = spawn_xrpc_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/xrpc/app.bsky.feed.getTimeline?limit=1",
+                authorization: "old-access",
+                status: 400,
+                body: r#"{"error":"ExpiredToken","message":"Token has expired"}"#,
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/xrpc/com.atproto.server.refreshSession",
+                authorization: "old-refresh",
+                status: 200,
+                body: r#"{"accessJwt":"new-access","refreshJwt":"new-refresh"}"#,
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/xrpc/app.bsky.feed.getTimeline?limit=1",
+                authorization: "new-access",
+                status: 200,
+                body: r#"{"feed":[]}"#,
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let mut client = BskyClient::new(test_session(service), store.clone());
+        let clone = client.clone();
+
+        let root = client.get_timeline(None, 1).await.unwrap();
+
+        server.join().unwrap();
+        assert_eq!(root, json!({"feed": []}));
+        assert_eq!(client.session().access_jwt, "new-access");
+        assert_eq!(clone.session().refresh_jwt, "new-refresh");
+        assert_eq!(store.load().unwrap().access_jwt, "new-access");
+    }
+
+    #[tokio::test]
+    async fn unrelated_400_does_not_refresh_post() {
+        let (service, server) = spawn_xrpc_server(vec![ExpectedRequest {
+            method: "POST",
+            path: "/xrpc/com.atproto.repo.createRecord",
+            authorization: "old-access",
+            status: 400,
+            body: r#"{"error":"InvalidRequest","message":"Bad record"}"#,
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let mut client = BskyClient::new(test_session(service), store);
+        let subject = PostRef {
+            uri: "at://did:plc:bob/app.bsky.feed.post/1".into(),
+            cid: "postcid".into(),
+        };
+
+        let error = client.create_like(&subject).await.unwrap_err();
+
+        server.join().unwrap();
+        let xrpc = error.downcast_ref::<XrpcError>().unwrap();
+        assert_eq!(xrpc.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(xrpc.code(), Some("InvalidRequest"));
+        assert_eq!(xrpc.message(), Some("Bad record"));
+        assert_eq!(client.session().refresh_jwt, "old-refresh");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_returns_typed_cause_without_retrying_request() {
+        let (service, server) = spawn_xrpc_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/xrpc/app.bsky.feed.getTimeline?limit=1",
+                authorization: "old-access",
+                status: 400,
+                body: r#"{"error":"ExpiredToken","message":"Token has expired"}"#,
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/xrpc/com.atproto.server.refreshSession",
+                authorization: "old-refresh",
+                status: 400,
+                body: r#"{"error":"InvalidToken","message":"Refresh token rejected"}"#,
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let mut client = BskyClient::new(test_session(service), store);
+
+        let error = client.get_timeline(None, 1).await.unwrap_err();
+
+        server.join().unwrap();
+        let xrpc = error.downcast_ref::<XrpcError>().unwrap();
+        assert_eq!(xrpc.code(), Some("InvalidToken"));
+        assert_eq!(client.session().access_jwt, "old-access");
+    }
+
+    #[tokio::test]
+    async fn failed_retry_returns_typed_cause_without_refresh_loop() {
+        let (service, server) = spawn_xrpc_server(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/xrpc/app.bsky.feed.getTimeline?limit=1",
+                authorization: "old-access",
+                status: 400,
+                body: r#"{"error":"ExpiredToken","message":"Token has expired"}"#,
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/xrpc/com.atproto.server.refreshSession",
+                authorization: "old-refresh",
+                status: 200,
+                body: r#"{"accessJwt":"new-access","refreshJwt":"new-refresh"}"#,
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/xrpc/app.bsky.feed.getTimeline?limit=1",
+                authorization: "new-access",
+                status: 500,
+                body: r#"{"error":"UpstreamFailure","message":"Try later"}"#,
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let mut client = BskyClient::new(test_session(service), store);
+
+        let error = client.get_timeline(None, 1).await.unwrap_err();
+
+        server.join().unwrap();
+        let xrpc = error.downcast_ref::<XrpcError>().unwrap();
+        assert_eq!(xrpc.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(xrpc.code(), Some("UpstreamFailure"));
         assert_eq!(client.session().access_jwt, "new-access");
     }
 

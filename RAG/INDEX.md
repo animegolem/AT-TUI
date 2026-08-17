@@ -7,10 +7,10 @@
 | Status | EPICs | IMPs |
 |--------|-------|------|
 | In Progress | 0 | 0 |
-| Planned | 2 | 8 |
+| Planned | 2 | 7 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 1 | 9 |
+| Completed | 1 | 10 |
 | **Total** | **3** | **17** |
 
 ## Planned
@@ -29,7 +29,7 @@
 > AT-TUI is attractive and usable, but several lifecycle boundaries remain prototype-grade. A live access token expires with HTTP 400 `ExpiredToken`,...
 
 **IMPs:**
-- [[AI-IMP-003-1-xrpc-expired-token-retry|IMP-003-1]] Expired access tokens do not trigger the refresh path — planned
+- [[AI-IMP-003-1-xrpc-expired-token-retry|IMP-003-1]] Expired access tokens do not trigger the refresh path — completed
 - [[AI-IMP-003-2-task-context-timeouts|IMP-003-2]] Background completions have inconsistent ownership and no deadline — planned
 - [[AI-IMP-003-3-atomic-session-persistence|IMP-003-3]] Session saves can destroy recoverable account state — planned
 - [[AI-IMP-003-4-contextual-keymap-registry|IMP-003-4]] Key behavior has two sources of truth — planned
@@ -49,8 +49,8 @@ Generated from tracked files; binary assets excluded.
 - src/app.rs (3661 LOC)
 - src/model.rs (1976 LOC)
 - src/ui.rs (1389 LOC)
+- src/api.rs (1184 LOC)
 - src/media.rs (941 LOC)
-- src/api.rs (833 LOC)
 
 ### > 300 LOC
 
@@ -62,7 +62,7 @@ Generated from tracked files; binary assets excluded.
 
 ## Completed
 <details>
-<summary>1 EPICs, 9 IMPs completed</summary>
+<summary>1 EPICs, 10 IMPs completed</summary>
 
 - [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002]] At tui stabilization daily driver — 2026-07-06
   - [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed

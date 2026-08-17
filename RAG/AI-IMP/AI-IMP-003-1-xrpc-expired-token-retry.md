@@ -7,12 +7,12 @@ tags:
   - auth
   - xrpc
   - reliability
-kanban_status: planned
+kanban_status: completed
 depends_on:
 parent_epic: [[AI-EPIC-003-trustworthy-runtime-interaction-foundation]]
 confidence_score: 0.95
 date_created: 2026-08-17
-date_completed:
+date_completed: 2026-08-17
 ---
 
 # AI-IMP-003-1-xrpc-expired-token-retry
@@ -35,15 +35,15 @@ Introduce a typed XRPC failure containing HTTP status plus optional `error` and 
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Add a typed XRPC error representation that retains status, error code, and safe message.
-- [ ] Refactor response parsing so callers can classify an error before it becomes a string.
-- [ ] Route authenticated GET and POST through one refresh-and-retry policy.
-- [ ] Refresh on `ExpiredToken` and retry the original operation exactly once.
-- [ ] Preserve the existing single-flight guard for concurrent expiries.
-- [ ] Ensure generic HTTP 400 responses do not trigger refresh.
-- [ ] Ensure a failed refresh or failed retry returns the typed causal error without looping.
-- [ ] Add HTTP-boundary tests for 400 `ExpiredToken`, successful refresh/retry, unrelated 400, and failed refresh.
-- [ ] Run formatting, tests, Clippy with warnings denied, build, and `git diff --check`.
+- [x] Add a typed XRPC error representation that retains status, error code, and safe message.
+- [x] Refactor response parsing so callers can classify an error before it becomes a string.
+- [x] Route authenticated GET and POST through one refresh-and-retry policy.
+- [x] Refresh on `ExpiredToken` and retry the original operation exactly once.
+- [x] Preserve the existing single-flight guard for concurrent expiries.
+- [x] Ensure generic HTTP 400 responses do not trigger refresh.
+- [x] Ensure a failed refresh or failed retry returns the typed causal error without looping.
+- [x] Add HTTP-boundary tests for 400 `ExpiredToken`, successful refresh/retry, unrelated 400, and failed refresh.
+- [x] Run formatting, tests, Clippy with warnings denied, build, and `git diff --check`.
 
 ### Acceptance Criteria
 **Scenario:** Access token expires while AT-TUI is running.
@@ -64,3 +64,4 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+Implemented without a new dependency by exercising `reqwest` against a local TCP HTTP server. The authenticated response retains the access JWT actually used for the failed request; the refresh gate compares against that value so a delayed expired response cannot spend a second refresh token after another task already rotated the session. The first targeted-test command incorrectly supplied multiple Cargo filters; rerunning the complete `api::tests` module exercised all intended cases. No implementation blockers or missing automated cases remain for this ticket. The epic-level 24-hour live idle check remains intentionally deferred to AI-IMP-003-7.
