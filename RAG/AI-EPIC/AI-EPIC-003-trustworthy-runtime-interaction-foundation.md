@@ -66,8 +66,8 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 - [x] FR-5: Every app task result shall carry enough context to prove it belongs to the active request, account, and view generation.
 - [x] FR-6: Account switches shall invalidate or reject all prior account-scoped completions, including writes.
 - [ ] FR-7: Network operations now have explicit deadlines and recoverable pending state; media deadlines remain with AI-IMP-003-5 and AI-IMP-003-6 before this cross-cutting requirement is complete.
-- [ ] FR-8: Account configuration writes shall be atomic and shall never treat a read/parse error as an empty configuration.
-- [ ] FR-9: Successful legacy-session migration shall not leave a stale credential source that can later be re-imported.
+- [x] FR-8: Account configuration writes shall be atomic and shall never treat a read/parse error as an empty configuration.
+- [x] FR-9: Successful legacy-session migration shall not leave a stale credential source that can later be re-imported.
 - [ ] FR-10: Normal and overlay key handling shall dispatch through one contextual binding registry.
 - [ ] FR-11: Key help shall derive from the same binding metadata used for dispatch.
 - [ ] FR-12: Media work shall use bounded, priority-aware scheduling with deduplication and obsolete-prefetch cancellation.
@@ -89,7 +89,7 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 ## Implementation Breakdown
 - [x] [[AI-IMP-003-1-xrpc-expired-token-retry]]: typed XRPC errors, HTTP 400 `ExpiredToken` refresh/retry, HTTP-boundary tests (FR-1..4).
 - [x] [[AI-IMP-003-2-task-context-timeouts]]: uniform task context, stale completion rejection, logical cancellation, API deadlines (FR-5..7 network scope).
-- [ ] [[AI-IMP-003-3-atomic-session-persistence]]: atomic account saves and safe legacy migration (FR-8..9).
+- [x] [[AI-IMP-003-3-atomic-session-persistence]]: atomic account saves and safe legacy migration (FR-8..9).
 - [ ] [[AI-IMP-003-4-contextual-keymap-registry]]: contextual dispatch and generated help (FR-10..11).
 - [ ] [[AI-IMP-003-5-prioritized-media-scheduler]]: bounded priority queue, retry, cancellation, disk-cache lifecycle (FR-12..14).
 - [ ] [[AI-IMP-003-6-progressive-video-events]]: progressive ffmpeg frame delivery and bounded cancellation (FR-15..16).
