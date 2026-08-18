@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod keymap;
 pub mod media;
+pub mod media_scheduler;
 pub mod model;
 pub mod navigation;
 pub mod ui;

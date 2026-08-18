@@ -1,8 +1,10 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -21,7 +23,10 @@ use ratatui_image::{
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 
-use crate::model::{FeedItem, VideoRef};
+use crate::{
+    media_scheduler::{MediaExecutionLimits, MediaJobId, MediaJobKind},
+    model::{FeedItem, VideoRef},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestedImageProtocol {
@@ -83,6 +88,9 @@ impl PreviewImageSource {
 
 const IMAGE_CACHE_CAP: usize = 48;
 const VIDEO_CACHE_CAP: usize = 4;
+const DISK_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const DISK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct MediaCache {
     enabled: bool,
@@ -91,19 +99,20 @@ pub struct MediaCache {
     picker: Option<Picker>,
     images: HashMap<String, ImageState>,
     videos: HashMap<String, VideoState>,
+    loading_images: HashSet<String>,
+    loading_videos: HashSet<String>,
+    session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
     // Access-ordered keys backing the LRU bound; disk cache makes re-loads cheap.
     image_order: VecDeque<String>,
     video_order: VecDeque<String>,
 }
 
 enum ImageState {
-    Loading,
     Ready(Box<StatefulProtocol>),
     Failed(String),
 }
 
 enum VideoState {
-    Loading,
     Ready {
         frames: Vec<StatefulProtocol>,
         frame: usize,
@@ -116,12 +125,14 @@ pub struct ImageLoadJob {
     url: String,
     cache_dir: PathBuf,
     http: Client,
+    session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct VideoLoadJob {
     playlist_url: String,
     cache_dir: PathBuf,
+    session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl MediaCache {
@@ -131,6 +142,17 @@ impl MediaCache {
         let cache_dir = dirs.cache_dir().join("images");
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("could not create {}", cache_dir.display()))?;
+        cleanup_cache_dir(
+            &cache_dir,
+            DISK_CACHE_MAX_AGE,
+            DISK_CACHE_MAX_BYTES,
+            &HashSet::new(),
+            SystemTime::now(),
+        );
+        let http = Client::builder()
+            .timeout(MEDIA_REQUEST_TIMEOUT)
+            .build()
+            .context("could not build media HTTP client")?;
 
         let picker = if enabled {
             let mut picker = match requested {
@@ -154,10 +176,13 @@ impl MediaCache {
         Ok(Self {
             enabled,
             cache_dir,
-            http: Client::new(),
+            http,
             picker,
             images: HashMap::new(),
             videos: HashMap::new(),
+            loading_images: HashSet::new(),
+            loading_videos: HashSet::new(),
+            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
             image_order: VecDeque::new(),
             video_order: VecDeque::new(),
         })
@@ -171,6 +196,9 @@ impl MediaCache {
             picker: None,
             images: HashMap::new(),
             videos: HashMap::new(),
+            loading_images: HashSet::new(),
+            loading_videos: HashSet::new(),
+            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
             image_order: VecDeque::new(),
             video_order: VecDeque::new(),
         }
@@ -185,6 +213,9 @@ impl MediaCache {
             picker: Some(Picker::halfblocks()),
             images: HashMap::new(),
             videos: HashMap::new(),
+            loading_images: HashSet::new(),
+            loading_videos: HashSet::new(),
+            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
             image_order: VecDeque::new(),
             video_order: VecDeque::new(),
         }
@@ -213,12 +244,28 @@ impl MediaCache {
     }
 
     pub fn should_load_url(&self, url: &str) -> bool {
-        self.enabled && !self.images.contains_key(url)
+        self.enabled && !self.images.contains_key(url) && !self.loading_images.contains(url)
+    }
+
+    pub fn prepare_image_load(&mut self, url: &str, retry_failed: bool) -> bool {
+        if !self.enabled || self.loading_images.contains(url) {
+            return false;
+        }
+        match self.images.get(url) {
+            Some(ImageState::Ready(_)) => false,
+            Some(ImageState::Failed(_)) if retry_failed => {
+                self.images.remove(url);
+                self.image_order.retain(|key| key != url);
+                true
+            }
+            Some(ImageState::Failed(_)) => false,
+            None => true,
+        }
     }
 
     pub fn mark_loading_url(&mut self, url: &str) {
         if self.enabled && !self.images.contains_key(url) {
-            self.record_image(url.to_owned(), ImageState::Loading);
+            self.loading_images.insert(url.to_owned());
         }
     }
 
@@ -227,6 +274,7 @@ impl MediaCache {
             url: url.to_owned(),
             cache_dir: self.cache_dir.clone(),
             http: self.http.clone(),
+            session_disk_entries: self.session_disk_entries.clone(),
         })
     }
 
@@ -253,21 +301,46 @@ impl MediaCache {
     }
 
     pub fn should_load_video(&self, video: &PreviewVideo) -> bool {
-        self.enabled && !self.videos.contains_key(&video.playlist_url)
+        self.enabled
+            && !self.videos.contains_key(&video.playlist_url)
+            && !self.loading_videos.contains(&video.playlist_url)
+    }
+
+    pub fn prepare_video_load(&mut self, playlist_url: &str, retry_failed: bool) -> bool {
+        if !self.enabled || self.loading_videos.contains(playlist_url) {
+            return false;
+        }
+        match self.videos.get(playlist_url) {
+            Some(VideoState::Ready { .. }) => false,
+            Some(VideoState::Failed(_)) if retry_failed => {
+                self.videos.remove(playlist_url);
+                self.video_order.retain(|key| key != playlist_url);
+                true
+            }
+            Some(VideoState::Failed(_)) => false,
+            None => true,
+        }
     }
 
     pub fn mark_video_loading(&mut self, video: &PreviewVideo) {
-        if self.enabled {
-            self.videos
-                .entry(video.playlist_url.clone())
-                .or_insert(VideoState::Loading);
+        self.mark_video_loading_url(&video.playlist_url);
+    }
+
+    pub fn mark_video_loading_url(&mut self, playlist_url: &str) {
+        if self.enabled && !self.videos.contains_key(playlist_url) {
+            self.loading_videos.insert(playlist_url.to_owned());
         }
     }
 
     pub fn video_job(&self, video: &PreviewVideo) -> Option<VideoLoadJob> {
+        self.video_job_url(&video.playlist_url)
+    }
+
+    pub fn video_job_url(&self, playlist_url: &str) -> Option<VideoLoadJob> {
         self.enabled.then(|| VideoLoadJob {
-            playlist_url: video.playlist_url.clone(),
+            playlist_url: playlist_url.to_owned(),
             cache_dir: self.cache_dir.join("videos"),
+            session_disk_entries: self.session_disk_entries.clone(),
         })
     }
 
@@ -275,6 +348,7 @@ impl MediaCache {
         if !self.enabled {
             return;
         }
+        self.loading_images.remove(&url);
 
         let state = match result {
             Ok(image) => match self.picker.as_ref() {
@@ -294,6 +368,7 @@ impl MediaCache {
         if !self.enabled {
             return;
         }
+        self.loading_videos.remove(&playlist_url);
 
         let state = match result {
             Ok(frames) if frames.is_empty() => {
@@ -322,8 +397,10 @@ impl MediaCache {
     }
 
     pub fn state_name(&self, url: &str) -> &'static str {
+        if self.loading_images.contains(url) {
+            return "loading";
+        }
         match self.images.get(url) {
-            Some(ImageState::Loading) => "loading",
             Some(ImageState::Ready(_)) => "ready",
             Some(ImageState::Failed(_)) => "failed",
             None => "missing",
@@ -331,8 +408,10 @@ impl MediaCache {
     }
 
     pub fn video_state_name(&self, playlist_url: &str) -> &'static str {
+        if self.loading_videos.contains(playlist_url) {
+            return "loading";
+        }
         match self.videos.get(playlist_url) {
-            Some(VideoState::Loading) => "loading",
             Some(VideoState::Ready { .. }) => "ready",
             Some(VideoState::Failed(_)) => "failed",
             None => "missing",
@@ -362,7 +441,7 @@ impl MediaCache {
             return Ok(thumb);
         }
         Err(match self.images.get(&image.url) {
-            Some(ImageState::Loading) => "Image loading".into(),
+            _ if self.loading_images.contains(&image.url) => "Image loading".into(),
             Some(ImageState::Failed(error)) => error.clone(),
             Some(ImageState::Ready(_)) => unreachable!("handled above"),
             None => "Image queued".into(),
@@ -439,7 +518,7 @@ impl MediaCache {
                     &mut frames[frame_index],
                 );
             }
-            Some(VideoState::Loading) => {
+            _ if self.loading_videos.contains(&video.playlist_url) => {
                 frame.render_widget(
                     Paragraph::new("Video decoding with ffmpeg").block(media_block(title)),
                     area,
@@ -461,6 +540,17 @@ impl MediaCache {
             }
         }
     }
+
+    pub fn cancel_loading(&mut self, id: &MediaJobId) {
+        match id.kind {
+            MediaJobKind::Image => {
+                self.loading_images.remove(&id.source);
+            }
+            MediaJobKind::Video => {
+                self.loading_videos.remove(&id.source);
+            }
+        }
+    }
 }
 
 impl ImageLoadJob {
@@ -474,9 +564,52 @@ impl ImageLoadJob {
         (url, result)
     }
 
+    pub async fn run_limited(
+        self,
+        limits: MediaExecutionLimits,
+    ) -> (String, std::result::Result<DynamicImage, String>) {
+        let url = self.url.clone();
+        let result = self
+            .load_limited(limits)
+            .await
+            .map_err(|error| error.to_string());
+        (url, result)
+    }
+
+    async fn load_limited(self, limits: MediaExecutionLimits) -> Result<DynamicImage> {
+        let path = self.cache_dir.join(cache_key(&self.url));
+        {
+            let _decode = limits.decode_permit().await;
+            if let Some(image) = read_cached_image(&path).await {
+                remember_session_paths(&self.session_disk_entries, [path]);
+                return Ok(image);
+            }
+        }
+        let bytes = {
+            let _download = limits.download_permit().await;
+            self.http
+                .get(&self.url)
+                .send()
+                .await
+                .with_context(|| format!("could not download {}", self.url))?
+                .error_for_status()
+                .with_context(|| format!("image request failed for {}", self.url))?
+                .bytes()
+                .await
+                .with_context(|| format!("could not read image bytes for {}", self.url))?
+        };
+        if fs::write(&path, &bytes).is_ok() {
+            remember_session_paths(&self.session_disk_entries, [path]);
+            clean_disk_cache(self.cache_dir.clone(), self.session_disk_entries.clone()).await;
+        }
+        let _decode = limits.decode_permit().await;
+        decode_image_bytes(bytes.to_vec(), self.url).await
+    }
+
     async fn load(self) -> Result<DynamicImage> {
         let path = self.cache_dir.join(cache_key(&self.url));
         if let Some(image) = read_cached_image(&path).await {
+            remember_session_paths(&self.session_disk_entries, [path]);
             return Ok(image);
         }
 
@@ -493,7 +626,10 @@ impl ImageLoadJob {
             .with_context(|| format!("could not read image bytes for {}", self.url))?;
 
         // Best effort: a failed cache write should not fail the render.
-        let _ = fs::write(&path, &bytes);
+        if fs::write(&path, &bytes).is_ok() {
+            remember_session_paths(&self.session_disk_entries, [path]);
+            clean_disk_cache(self.cache_dir.clone(), self.session_disk_entries.clone()).await;
+        }
         decode_image_bytes(bytes.to_vec(), self.url).await
     }
 }
@@ -534,6 +670,14 @@ impl VideoLoadJob {
         (playlist_url, result)
     }
 
+    pub async fn run_limited(
+        self,
+        limits: MediaExecutionLimits,
+    ) -> (String, std::result::Result<Vec<DynamicImage>, String>) {
+        let _decode = limits.decode_permit().await;
+        self.run().await
+    }
+
     fn decode_frames(self) -> Result<Vec<DynamicImage>> {
         fs::create_dir_all(&self.cache_dir)
             .with_context(|| format!("could not create {}", self.cache_dir.display()))?;
@@ -570,13 +714,133 @@ impl VideoLoadJob {
             .collect::<Vec<_>>();
         paths.sort();
 
-        paths
+        remember_session_paths(&self.session_disk_entries, paths.iter().cloned());
+        let frames = paths
             .into_iter()
             .take(120)
             .map(|path| {
                 image::open(&path).with_context(|| format!("could not decode {}", path.display()))
             })
-            .collect()
+            .collect();
+        let cache_root = self
+            .cache_dir
+            .parent()
+            .map(Path::to_owned)
+            .unwrap_or_else(|| self.cache_dir.clone());
+        let preserved = self
+            .session_disk_entries
+            .lock()
+            .map(|entries| entries.clone())
+            .unwrap_or_default();
+        cleanup_cache_dir(
+            &cache_root,
+            DISK_CACHE_MAX_AGE,
+            DISK_CACHE_MAX_BYTES,
+            &preserved,
+            SystemTime::now(),
+        );
+        frames
+    }
+}
+
+fn remember_session_paths(
+    entries: &Arc<Mutex<HashSet<PathBuf>>>,
+    paths: impl IntoIterator<Item = PathBuf>,
+) {
+    if let Ok(mut entries) = entries.lock() {
+        entries.extend(paths);
+    }
+}
+
+async fn clean_disk_cache(cache_dir: PathBuf, session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let preserved = session_disk_entries
+            .lock()
+            .map(|entries| entries.clone())
+            .unwrap_or_default();
+        cleanup_cache_dir(
+            &cache_dir,
+            DISK_CACHE_MAX_AGE,
+            DISK_CACHE_MAX_BYTES,
+            &preserved,
+            SystemTime::now(),
+        );
+    })
+    .await;
+}
+
+#[derive(Debug)]
+struct CacheFile {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+    removed: bool,
+}
+
+fn cleanup_cache_dir(
+    cache_dir: &Path,
+    max_age: Duration,
+    max_bytes: u64,
+    preserved: &HashSet<PathBuf>,
+    now: SystemTime,
+) {
+    let mut paths = Vec::new();
+    collect_cache_files(cache_dir, &mut paths);
+    let mut total_bytes = 0_u64;
+    let mut candidates = Vec::new();
+    for path in paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let size = metadata.len();
+        total_bytes = total_bytes.saturating_add(size);
+        if !preserved.contains(&path) {
+            candidates.push(CacheFile {
+                path,
+                size,
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                removed: false,
+            });
+        }
+    }
+
+    for candidate in &mut candidates {
+        if now
+            .duration_since(candidate.modified)
+            .is_ok_and(|age| age > max_age)
+            && fs::remove_file(&candidate.path).is_ok()
+        {
+            candidate.removed = true;
+            total_bytes = total_bytes.saturating_sub(candidate.size);
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for candidate in candidates {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        if !candidate.removed && fs::remove_file(&candidate.path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(candidate.size);
+        }
+    }
+}
+
+fn collect_cache_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cache_files(&path, files);
+        } else if path.is_file() {
+            files.push(path);
+        }
     }
 }
 
@@ -773,6 +1037,7 @@ mod tests {
             url: url.into(),
             cache_dir: dir.path().to_owned(),
             http: Client::new(),
+            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
         };
 
         let (returned_url, result) = job.run().await;
@@ -810,6 +1075,65 @@ mod tests {
         cache.finish_load("https://example.com/extra.png".into(), Ok(tiny_image()));
         assert_eq!(cache.state_name("https://example.com/2.png"), "ready");
         assert_eq!(cache.state_name("https://example.com/3.png"), "missing");
+    }
+
+    #[test]
+    fn disk_cleanup_enforces_size_while_preserving_session_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a");
+        let second = dir.path().join("b");
+        let preserved_path = dir.path().join("current");
+        fs::write(&first, [0_u8; 5]).unwrap();
+        fs::write(&second, [0_u8; 5]).unwrap();
+        fs::write(&preserved_path, [0_u8; 5]).unwrap();
+
+        cleanup_cache_dir(
+            dir.path(),
+            Duration::from_secs(365 * 24 * 60 * 60),
+            8,
+            &HashSet::from([preserved_path.clone()]),
+            SystemTime::now(),
+        );
+
+        assert!(preserved_path.exists());
+        let remaining_bytes = [first, second, preserved_path]
+            .into_iter()
+            .filter_map(|path| fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        assert_eq!(remaining_bytes, 5);
+    }
+
+    #[test]
+    fn disk_cleanup_removes_expired_entries_but_keeps_session_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let expired = dir.path().join("expired");
+        let preserved_path = dir.path().join("current");
+        fs::write(&expired, b"old").unwrap();
+        fs::write(&preserved_path, b"current").unwrap();
+
+        cleanup_cache_dir(
+            dir.path(),
+            Duration::from_secs(30 * 24 * 60 * 60),
+            u64::MAX,
+            &HashSet::from([preserved_path.clone()]),
+            SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60),
+        );
+
+        assert!(!expired.exists());
+        assert!(preserved_path.exists());
+    }
+
+    #[test]
+    fn explicit_load_can_retry_a_sticky_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = MediaCache::test_enabled(dir.path().to_owned());
+        let url = "https://example.com/retry.jpg";
+        cache.finish_load(url.into(), Err("permanent decode error".into()));
+
+        assert!(!cache.prepare_image_load(url, false));
+        assert!(cache.prepare_image_load(url, true));
+        assert_eq!(cache.state_name(url), "missing");
     }
 
     #[test]

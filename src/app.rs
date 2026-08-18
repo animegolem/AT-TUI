@@ -22,8 +22,10 @@ use crate::{
     api::BskyClient,
     config::{AccountSession, Session},
     keymap::{InputContext as KeyContext, KeyAction, action_for_key},
-    media::{
-        MediaCache, PreviewImage, PreviewMedia, PreviewVideo, RequestedImageProtocol, preview_media,
+    media::{MediaCache, PreviewMedia, PreviewVideo, RequestedImageProtocol, preview_media},
+    media_scheduler::{
+        CompletionResult, MediaJobId, MediaJobKind, MediaPriority, MediaScheduler,
+        ScheduledMediaJob, retryable_media_error,
     },
     model::{
         FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, NotificationItem,
@@ -252,11 +254,11 @@ struct TaskEvent {
 #[derive(Debug)]
 enum AppEvent {
     ImageLoaded {
-        url: String,
+        job: ScheduledMediaJob,
         result: std::result::Result<DynamicImage, String>,
     },
     VideoLoaded {
-        playlist_url: String,
+        job: ScheduledMediaJob,
         result: std::result::Result<Vec<DynamicImage>, String>,
     },
     FeedLoaded {
@@ -415,6 +417,9 @@ pub struct App {
     pub client: BskyClient,
     pub nav: NavigationStack,
     pub media: MediaCache,
+    media_scheduler: MediaScheduler,
+    media_generation: u64,
+    media_anchor: Option<(u64, usize)>,
     pub accounts: Vec<AccountSession>,
     pub feeds: Vec<FeedSource>,
     pub active_feed: usize,
@@ -487,6 +492,9 @@ impl App {
             client,
             nav: NavigationStack::new(timeline),
             media,
+            media_scheduler: MediaScheduler::default(),
+            media_generation: 0,
+            media_anchor: None,
             accounts,
             feeds,
             active_feed: 0,
@@ -548,6 +556,21 @@ impl App {
 
     fn advance_view_generation(&mut self) {
         self.view_generation = self.view_generation.saturating_add(1);
+        self.set_media_anchor(None);
+    }
+
+    fn set_media_anchor(&mut self, anchor: Option<(u64, usize)>) {
+        if self.media_anchor == anchor {
+            return;
+        }
+        self.media_generation = self.media_generation.saturating_add(1);
+        for id in self
+            .media_scheduler
+            .cancel_speculation_before(self.media_generation)
+        {
+            self.media.cancel_loading(&id);
+        }
+        self.media_anchor = anchor;
     }
 
     fn clear_account_pending_state(&mut self) {
@@ -684,22 +707,45 @@ impl App {
 
     fn apply_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
-            AppEvent::ImageLoaded { url, result } => {
-                self.media.finish_load(url.clone(), result);
-                if matches!(self.media.state_name(&url), "ready") {
-                    self.set_status("Image loaded");
+            AppEvent::ImageLoaded { job, result } => {
+                let succeeded = result.is_ok();
+                let retryable = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| retryable_media_error(error));
+                match self.media_scheduler.complete(&job, succeeded, retryable) {
+                    CompletionResult::Accepted => {
+                        let url = job.id.source;
+                        self.media.finish_load(url.clone(), result);
+                        if matches!(self.media.state_name(&url), "ready") {
+                            self.set_status("Image loaded");
+                        }
+                    }
+                    CompletionResult::Discarded => self.media.cancel_loading(&job.id),
+                    CompletionResult::Retrying => {}
                 }
+                self.pump_media_jobs();
             }
-            AppEvent::VideoLoaded {
-                playlist_url,
-                result,
-            } => {
-                self.media.finish_video_load(playlist_url.clone(), result);
-                match self.media.video_state_name(&playlist_url) {
-                    "ready" => self.set_status("Video frames ready"),
-                    "failed" => self.set_status("Video decode failed"),
-                    _ => {}
+            AppEvent::VideoLoaded { job, result } => {
+                let succeeded = result.is_ok();
+                let retryable = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| retryable_media_error(error));
+                match self.media_scheduler.complete(&job, succeeded, retryable) {
+                    CompletionResult::Accepted => {
+                        let playlist_url = job.id.source;
+                        self.media.finish_video_load(playlist_url.clone(), result);
+                        match self.media.video_state_name(&playlist_url) {
+                            "ready" => self.set_status("Video frames ready"),
+                            "failed" => self.set_status("Video decode failed"),
+                            _ => {}
+                        }
+                    }
+                    CompletionResult::Discarded => self.media.cancel_loading(&job.id),
+                    CompletionResult::Retrying => {}
                 }
+                self.pump_media_jobs();
             }
             AppEvent::FeedLoaded {
                 request_id,
@@ -912,6 +958,7 @@ impl App {
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
             PlayVideo(Option<PreviewVideo>),
+            PrioritizeMedia(Option<PreviewMedia>),
             SubmitComposer(Option<ComposerState>),
             DeletePost(String),
         }
@@ -952,8 +999,14 @@ impl App {
             Some(Overlay::Media(state)) => match key_action {
                 Some(KeyAction::Quit) => effect = Effect::Quit,
                 Some(KeyAction::CloseOverlay) => effect = Effect::Close,
-                Some(KeyAction::MediaPrevious) => state.previous(),
-                Some(KeyAction::MediaNext) => state.next(),
+                Some(KeyAction::MediaPrevious) => {
+                    state.previous();
+                    effect = Effect::PrioritizeMedia(state.selected_media().cloned());
+                }
+                Some(KeyAction::MediaNext) => {
+                    state.next();
+                    effect = Effect::PrioritizeMedia(state.selected_media().cloned());
+                }
                 Some(KeyAction::PlayVideo) => {
                     let video = match state.selected_media() {
                         Some(PreviewMedia::Video(video)) => Some(video.clone()),
@@ -1016,7 +1069,10 @@ impl App {
         match effect {
             Effect::None => {}
             Effect::Quit => self.should_quit = true,
-            Effect::Close => self.overlay = None,
+            Effect::Close => {
+                self.overlay = None;
+                self.set_media_anchor(None);
+            }
             Effect::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
             Effect::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
             Effect::OpenLink(link) => {
@@ -1036,6 +1092,11 @@ impl App {
                     self.queue_video_load(&video);
                 } else {
                     self.set_status("Selected media is not a video");
+                }
+            }
+            Effect::PrioritizeMedia(media) => {
+                if let Some(media) = media {
+                    self.queue_selected_media(&media);
                 }
             }
             Effect::SubmitComposer(state) => {
@@ -1147,52 +1208,66 @@ impl App {
     }
 
     fn queue_media_thumbnail_loads(&mut self, media: &[PreviewMedia]) {
-        let images = media
-            .iter()
-            .filter_map(|media| match media {
-                PreviewMedia::Image(image) => Some(image.clone()),
-                PreviewMedia::Video(video) => video.thumb_url.as_ref().map(|url| PreviewImage {
-                    url: url.clone(),
-                    thumb_url: None,
-                    alt: video.alt.clone(),
-                    source: video.source,
-                }),
-            })
-            .collect::<Vec<_>>();
-        self.queue_image_loads(&images);
-    }
-
-    fn queue_image_loads(&mut self, images: &[PreviewImage]) {
-        let mut urls = Vec::new();
-        for image in images {
-            // Thumb first so the overlay has something immediately; the
-            // fullsize load replaces it when it lands.
-            if let Some(thumb) = &image.thumb_url {
-                urls.push(thumb.clone());
+        for (index, media) in media.iter().enumerate() {
+            match media {
+                PreviewMedia::Image(image) => {
+                    if let Some(thumb) = &image.thumb_url {
+                        let priority = if index == 0 {
+                            MediaPriority::VisibleMedia
+                        } else {
+                            MediaPriority::SelectedThumbnail
+                        };
+                        self.submit_image_load(thumb.clone(), priority, true);
+                    }
+                    let priority = if index == 0 {
+                        MediaPriority::VisibleMedia
+                    } else {
+                        MediaPriority::FullsizeSpeculation
+                    };
+                    self.submit_image_load(image.url.clone(), priority, index == 0);
+                }
+                PreviewMedia::Video(video) => {
+                    if let Some(thumb) = &video.thumb_url {
+                        let priority = if index == 0 {
+                            MediaPriority::VisibleMedia
+                        } else {
+                            MediaPriority::SelectedThumbnail
+                        };
+                        self.submit_image_load(thumb.clone(), priority, true);
+                    }
+                }
             }
-            urls.push(image.url.clone());
         }
-        self.queue_image_url_loads(urls);
+        self.pump_media_jobs();
     }
 
-    fn queue_image_url_loads(&mut self, urls: Vec<String>) {
-        for url in urls {
-            if !self.media.should_load_url(&url) {
-                continue;
+    fn queue_selected_media(&mut self, media: &PreviewMedia) {
+        match media {
+            PreviewMedia::Image(image) => {
+                if let Some(thumb) = &image.thumb_url {
+                    self.submit_image_load(thumb.clone(), MediaPriority::SelectedThumbnail, true);
+                }
+                self.submit_image_load(image.url.clone(), MediaPriority::VisibleMedia, true);
             }
-            self.media.mark_loading_url(&url);
-            let Some(job) = self.media.load_job_url(&url) else {
-                continue;
-            };
-            let context = self.task_context(TaskScope::Global);
-            self.spawn_event(context, async move {
-                let (url, result) = job.run().await;
-                AppEvent::ImageLoaded { url, result }
-            });
+            PreviewMedia::Video(video) => {
+                if let Some(thumb) = &video.thumb_url {
+                    self.submit_image_load(thumb.clone(), MediaPriority::VisibleMedia, true);
+                }
+            }
+        }
+        self.pump_media_jobs();
+    }
+
+    fn submit_image_load(&mut self, url: String, priority: MediaPriority, retry_failed: bool) {
+        if self.media.prepare_image_load(&url, retry_failed) {
+            self.media_scheduler
+                .submit(MediaJobId::image(url), priority, self.media_generation);
         }
     }
 
     fn prefetch_nearby_media(&mut self) {
+        let anchor = (self.view_generation, self.nav.current().selected);
+        self.set_media_anchor(Some(anchor));
         let urls = {
             let view = self.nav.current();
             if view.items.is_empty() {
@@ -1206,11 +1281,14 @@ impl App {
                 .flat_map(crate::media::prefetch_thumb_urls)
                 .collect::<Vec<_>>()
         };
-        self.queue_image_url_loads(urls);
+        for url in urls {
+            self.submit_image_load(url, MediaPriority::NearbyThumbnail, false);
+        }
+        self.pump_media_jobs();
     }
 
     fn queue_video_load(&mut self, video: &PreviewVideo) {
-        if !self.media.should_load_video(video) {
+        if !self.media.prepare_video_load(&video.playlist_url, true) {
             match self.media.video_state_name(&video.playlist_url) {
                 "ready" => self.set_status("Video frames ready"),
                 "loading" => self.set_status("Video decode already running"),
@@ -1220,20 +1298,47 @@ impl App {
             return;
         }
 
-        self.media.mark_video_loading(video);
-        let Some(job) = self.media.video_job(video) else {
-            self.set_status("Video rendering disabled");
-            return;
-        };
+        self.media_scheduler.submit(
+            MediaJobId::video(video.playlist_url.clone()),
+            MediaPriority::VisibleMedia,
+            self.media_generation,
+        );
         self.set_status("Decoding video frames");
-        let context = self.task_context(TaskScope::Global);
-        self.spawn_event(context, async move {
-            let (playlist_url, result) = job.run().await;
-            AppEvent::VideoLoaded {
-                playlist_url,
-                result,
+        self.pump_media_jobs();
+    }
+
+    fn pump_media_jobs(&mut self) {
+        while let Some(job) = self.media_scheduler.take_next() {
+            let limits = self.media_scheduler.execution_limits();
+            match job.id.kind {
+                MediaJobKind::Image => {
+                    self.media.mark_loading_url(&job.id.source);
+                    let Some(load) = self.media.load_job_url(&job.id.source) else {
+                        self.media_scheduler.complete(&job, false, false);
+                        self.media.cancel_loading(&job.id);
+                        continue;
+                    };
+                    let context = self.task_context(TaskScope::Global);
+                    self.spawn_event(context, async move {
+                        let (_, result) = load.run_limited(limits).await;
+                        AppEvent::ImageLoaded { job, result }
+                    });
+                }
+                MediaJobKind::Video => {
+                    self.media.mark_video_loading_url(&job.id.source);
+                    let Some(load) = self.media.video_job_url(&job.id.source) else {
+                        self.media_scheduler.complete(&job, false, false);
+                        self.media.cancel_loading(&job.id);
+                        continue;
+                    };
+                    let context = self.task_context(TaskScope::Global);
+                    self.spawn_event(context, async move {
+                        let (_, result) = load.run_limited(limits).await;
+                        AppEvent::VideoLoaded { job, result }
+                    });
+                }
             }
-        });
+        }
     }
 
     fn open_links_for_selected(&mut self) {
@@ -2691,7 +2796,7 @@ mod tests {
     use super::*;
     use crate::{
         config::SessionStore,
-        media::PreviewImageSource,
+        media::{PreviewImage, PreviewImageSource},
         model::{ImageRef, LinkSource, NotificationReason},
         ui,
     };
@@ -3835,6 +3940,9 @@ mod tests {
             client: BskyClient::new(session, store),
             nav: NavigationStack::new(ViewState::new("Timeline", ViewKind::Timeline, items)),
             media: MediaCache::disabled(),
+            media_scheduler: MediaScheduler::default(),
+            media_generation: 0,
+            media_anchor: None,
             accounts: Vec::new(),
             feeds: vec![FeedSource::home()],
             active_feed: 0,

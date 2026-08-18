@@ -6,8 +6,8 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 0 | 0 |
-| Planned | 2 | 4 |
+| In Progress | 0 | 1 |
+| Planned | 2 | 3 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
 | Completed | 1 | 13 |
@@ -33,7 +33,7 @@
 - [[AI-IMP-003-2-task-context-timeouts|IMP-003-2]] Background completions have inconsistent ownership and no deadline — completed
 - [[AI-IMP-003-3-atomic-session-persistence|IMP-003-3]] Session saves can destroy recoverable account state — completed
 - [[AI-IMP-003-4-contextual-keymap-registry|IMP-003-4]] Key behavior has two sources of truth — completed
-- [[AI-IMP-003-5-prioritized-media-scheduler|IMP-003-5]] Speculative media work is unbounded and cannot yield to visible work — planned
+- [[AI-IMP-003-5-prioritized-media-scheduler|IMP-003-5]] Speculative media work is unbounded and cannot yield to visible work — in-progress
 - [[AI-IMP-003-6-progressive-video-events|IMP-003-6]] Video waits for complete decoding before the UI can play — planned
 - [[AI-IMP-003-7-runtime-diagnostics|IMP-003-7]] Runtime failures are visible only as transient symptoms — planned
 
@@ -46,11 +46,11 @@ Generated from tracked files; binary assets excluded.
 ### > 600 LOC
 
 - Cargo.lock (4146 LOC)
-- src/app.rs (3920 LOC)
+- src/app.rs (4028 LOC)
 - src/model.rs (1976 LOC)
 - src/ui.rs (1379 LOC)
+- src/media.rs (1265 LOC)
 - src/api.rs (1228 LOC)
-- src/media.rs (941 LOC)
 - src/keymap.rs (932 LOC)
 - src/config.rs (761 LOC)
 
@@ -58,6 +58,7 @@ Generated from tracked files; binary assets excluded.
 
 - RAG/scripts/generate-index.sh (575 LOC)
 - src/navigation.rs (503 LOC)
+- src/media_scheduler.rs (425 LOC)
 
 ---
 
