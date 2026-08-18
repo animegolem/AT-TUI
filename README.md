@@ -60,63 +60,85 @@ cargo run -- --no-images
 
 ## Keys
 
-- `j` / Down: move down
-- `k` / Up: move up
-- `Ctrl-d` / `Ctrl-u`: half page down/up
-- PgDn / PgUp: page down/up
-- `g`: top
-- `G`: bottom
-- `l` / Right / Enter: open replies/thread for the selected post
-- `h` / Left / Esc: go back
-- `q`: go back; quits when already at the timeline root
-- `[` / `]`: previous/next saved feed
-- Space: open media overlay for selected post
-- Mouse wheel: move selection
-- `u`: merge pending new posts and jump to top
-- `f`: like/unlike selected post
-- `b`: repost/unrepost selected post
-- `F`: follow/unfollow selected post author, notification author, or active profile
-- `p`: compose a new text post
-- `r`: reply to selected post
-- `Q`: quote selected post
-- `d`: delete your own selected post (with confirmation)
-- `o`: open selected post's link, or show a picker when multiple links exist
-- `e`: open selected post's quoted post
-- `/`: search within loaded posts in the current view
-- `n`: next search match
-- `R`: reload current view
-- `?`: menu with keys, account, feed, and image settings
-- `Ctrl-C`: quit from anywhere
+Mouse-wheel selection is handled separately from keyboard bindings.
 
-Menu:
+<!-- BEGIN GENERATED KEYMAP -->
+### Normal
 
-- `j` / Down: next section
-- `k` / Up: previous section
-- Tab: next account/feed when the Accounts or Feeds section is selected
-- Shift-Tab: previous account/feed when the Accounts or Feeds section is selected
-- `[` / `]`: previous/next feed
-- Esc / `?` / Enter / `q`: close menu
+- `Ctrl-C` — quit
+- `j/k or arrows` — move
+- `Ctrl-d/Ctrl-u` — half page
+- `PgUp/PgDn` — page
+- `g/G` — top/bottom
+- `l/Enter/Right` — open selected
+- `h/Left` — back
+- `Esc` — back/settings
+- `q` — back; quit at root
+- `P` — profile
+- `N` — notifications
+- `Space` — media
+- `o` — links
+- `e` — quoted post
+- `f` — like
+- `b` — repost
+- `F` — follow
+- `d` — delete
+- `p` — post
+- `r` — reply
+- `Q` — quote
+- `[/]` — previous/next feed
+- `/` — search
+- `n` — next match
+- `R` — reload
+- `u` — load pending
+- `?` — menu
 
-Media overlay:
+### Menu
 
-- `h` / Left: previous item
-- `l` / Right: next item
-- Enter / `p`: decode video frames when selected media is a video
-- `u`: open selected video externally
-- Space / Esc: close overlay
+- `Ctrl-C` — quit
+- `Esc/?/Enter/q` — close
+- `j/k or arrows` — change section
+- `Tab/Shift-Tab` — section action
+- `[/]` — previous/next feed
 
-Composer:
+### Media overlay
 
-- Type normally; Enter inserts a newline
-- Ctrl-S: send
-- Esc: cancel
+- `Ctrl-C` — quit
+- `Space/Esc/q` — close
+- `h/l or arrows` — switch
+- `Enter/p` — play video
+- `u` — open externally
 
-Link picker:
+### Composer
 
-- `j` / Down: next link
-- `k` / Up: previous link
-- Enter / `u`: open selected link in the default browser
-- Esc: close picker
+- `Ctrl-C` — quit
+- `Esc` — cancel
+- `Ctrl-S` — send
+- `Enter` — newline
+- `Backspace` — delete character
+- `Text` — type normally
+
+### Link picker
+
+- `Ctrl-C` — quit
+- `Esc/q` — close
+- `j/k or arrows` — move
+- `Enter/u` — open
+
+### Delete confirmation
+
+- `Ctrl-C` — quit
+- `y/Y` — delete
+- `Any other key` — cancel
+
+### Search
+
+- `Ctrl-C` — quit
+- `Esc` — cancel
+- `Enter` — search
+- `Backspace` — delete character
+- `Text` — type query
+<!-- END GENERATED KEYMAP -->
 
 ## Timeline Semantics
 

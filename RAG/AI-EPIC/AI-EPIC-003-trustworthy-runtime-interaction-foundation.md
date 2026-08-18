@@ -68,8 +68,8 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 - [ ] FR-7: Network operations now have explicit deadlines and recoverable pending state; media deadlines remain with AI-IMP-003-5 and AI-IMP-003-6 before this cross-cutting requirement is complete.
 - [x] FR-8: Account configuration writes shall be atomic and shall never treat a read/parse error as an empty configuration.
 - [x] FR-9: Successful legacy-session migration shall not leave a stale credential source that can later be re-imported.
-- [ ] FR-10: Normal and overlay key handling shall dispatch through one contextual binding registry.
-- [ ] FR-11: Key help shall derive from the same binding metadata used for dispatch.
+- [x] FR-10: Normal and overlay key handling shall dispatch through one contextual binding registry.
+- [x] FR-11: Key help shall derive from the same binding metadata used for dispatch.
 - [ ] FR-12: Media work shall use bounded, priority-aware scheduling with deduplication and obsolete-prefetch cancellation.
 - [ ] FR-13: Failed media entries shall support an explicit or policy-bounded retry path.
 - [ ] FR-14: The on-disk media cache shall have a tested cleanup bound.
@@ -90,7 +90,7 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 - [x] [[AI-IMP-003-1-xrpc-expired-token-retry]]: typed XRPC errors, HTTP 400 `ExpiredToken` refresh/retry, HTTP-boundary tests (FR-1..4).
 - [x] [[AI-IMP-003-2-task-context-timeouts]]: uniform task context, stale completion rejection, logical cancellation, API deadlines (FR-5..7 network scope).
 - [x] [[AI-IMP-003-3-atomic-session-persistence]]: atomic account saves and safe legacy migration (FR-8..9).
-- [ ] [[AI-IMP-003-4-contextual-keymap-registry]]: contextual dispatch and generated help (FR-10..11).
+- [x] [[AI-IMP-003-4-contextual-keymap-registry]]: contextual dispatch and generated help (FR-10..11).
 - [ ] [[AI-IMP-003-5-prioritized-media-scheduler]]: bounded priority queue, retry, cancellation, disk-cache lifecycle (FR-12..14).
 - [ ] [[AI-IMP-003-6-progressive-video-events]]: progressive ffmpeg frame delivery and bounded cancellation (FR-15..16).
 - [ ] [[AI-IMP-003-7-runtime-diagnostics]]: diagnostics surface, sanitized logging, live idle record (FR-17..18).

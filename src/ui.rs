@@ -7,9 +7,8 @@ use ratatui::{
 };
 
 use crate::{
-    app::{
-        App, ComposerKind, ComposerState, InputMode, MenuSection, Overlay, normal_key_help_lines,
-    },
+    app::{App, ComposerKind, ComposerState, InputMode, MenuSection, Overlay},
+    keymap::{InputContext as KeyContext, compact_help_line, help_lines},
     media::{PreviewImage, PreviewMedia},
     model::{
         ExternalRef, FeedItem, FeedReason, ImageRef, NotificationItem, NotificationTarget,
@@ -214,18 +213,12 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_confirm_delete_overlay(frame: &mut Frame<'_>, area: Rect) {
-    let area = centered_rect(60, 20, area);
+    let area = centered_rect(60, 28, area);
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from("This permanently deletes the post from Bluesky."),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "y",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" delete · any other key cancels"),
-        ]),
+        Line::from(compact_help_line(KeyContext::Confirmation)),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -236,14 +229,12 @@ fn render_confirm_delete_overlay(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: MenuSection) {
-    let area = centered_rect(86, 82, area);
+    let area = centered_rect(86, 96, area);
     frame.render_widget(Clear, area);
 
     let mut lines = Vec::new();
     lines.push(section_line(MenuSection::Keys, selected));
-    lines.extend(normal_key_help_lines().into_iter().map(Line::from));
-    lines.push(Line::from(""));
-
+    lines.extend(help_lines(KeyContext::Normal).into_iter().map(Line::from));
     lines.push(section_line(MenuSection::Accounts, selected));
     lines.push(Line::from(format!(
         "  active: @{}",
@@ -263,8 +254,6 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: M
     lines.push(Line::from(
         "  Tab next account · Shift-Tab previous account",
     ));
-    lines.push(Line::from(""));
-
     lines.push(section_line(MenuSection::Feeds, selected));
     for (index, feed) in app.feeds.iter().take(8).enumerate() {
         let marker = if index == app.active_feed { "*" } else { " " };
@@ -273,14 +262,15 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: M
     lines.push(Line::from(
         "  Tab next feed · Shift-Tab previous feed · [ and ] also switch feeds",
     ));
-    lines.push(Line::from(""));
-
     lines.push(section_line(MenuSection::Settings, selected));
     lines.push(Line::from(format!(
         "  images: {}",
         app.media.protocol_name()
     )));
-    lines.push(Line::from("  Esc, ?, Enter, or q closes this menu"));
+    lines.push(Line::from(format!(
+        "  {}",
+        compact_help_line(KeyContext::Menu)
+    )));
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -319,7 +309,7 @@ fn render_link_overlay(
         )]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Enter/u open · j/k move · Esc close"));
+    lines.push(Line::from(compact_help_line(KeyContext::Links)));
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -382,7 +372,7 @@ fn render_media_overlay(
         }
     }
     frame.render_widget(
-        Paragraph::new(" h/l switch · Enter/p play video · u open · Space/Esc close ")
+        Paragraph::new(format!(" {} ", compact_help_line(KeyContext::Media)))
             .style(Style::default().fg(Color::Black).bg(Color::Gray)),
         chunks[1],
     );
@@ -421,7 +411,7 @@ fn render_composer_overlay(frame: &mut Frame<'_>, area: Rect, state: ComposerSta
     };
     lines.push(Line::from(vec![
         Span::styled(format!("{count}/300"), count_style),
-        Span::raw(" · Ctrl-S send · Esc cancel"),
+        Span::raw(format!(" · {}", compact_help_line(KeyContext::Composer))),
     ]));
 
     frame.render_widget(

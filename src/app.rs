@@ -21,6 +21,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::{
     api::BskyClient,
     config::{AccountSession, Session},
+    keymap::{InputContext as KeyContext, KeyAction, action_for_key},
     media::{
         MediaCache, PreviewImage, PreviewMedia, PreviewVideo, RequestedImageProtocol, preview_media,
     },
@@ -134,97 +135,6 @@ fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
         MenuSection::Feeds => MenuTabAction::SwitchFeed(delta),
         MenuSection::Keys | MenuSection::Settings => MenuTabAction::MoveSection(delta),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Quit,
-    BackOrQuit,
-    MoveDown,
-    MoveUp,
-    HalfPageDown,
-    HalfPageUp,
-    PageDown,
-    PageUp,
-    OpenMenu,
-    PreviewMedia,
-    OpenLinks,
-    PreviousFeed,
-    NextFeed,
-    LoadPending,
-    ToggleLike,
-    ToggleRepost,
-    ToggleFollow,
-    DeleteOwnPost,
-    ComposePost,
-    ComposeReply,
-    ComposeQuote,
-    JumpTop,
-    JumpBottom,
-    StartSearch,
-    SearchNext,
-    Back,
-    Escape,
-    OpenSelected,
-    OpenQuote,
-    OpenProfile,
-    OpenNotifications,
-    Reload,
-}
-
-// Keymap principles (AI-EPIC-002): navigation keys are sacred, lowercase
-// acts on the selected post, shift acts on the view or the person, and `q`
-// layers back-then-quit so quote and quit are no longer one shift apart.
-pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(Action::HalfPageDown)
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(Action::HalfPageUp)
-        }
-        KeyCode::Char('q') => Some(Action::BackOrQuit),
-        KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
-        KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
-        KeyCode::PageDown => Some(Action::PageDown),
-        KeyCode::PageUp => Some(Action::PageUp),
-        KeyCode::Char('?') => Some(Action::OpenMenu),
-        KeyCode::Char(' ') => Some(Action::PreviewMedia),
-        KeyCode::Char('o') => Some(Action::OpenLinks),
-        KeyCode::Char('[') => Some(Action::PreviousFeed),
-        KeyCode::Char(']') => Some(Action::NextFeed),
-        KeyCode::Char('u') => Some(Action::LoadPending),
-        KeyCode::Char('f') => Some(Action::ToggleLike),
-        KeyCode::Char('F') => Some(Action::ToggleFollow),
-        KeyCode::Char('b') => Some(Action::ToggleRepost),
-        KeyCode::Char('d') => Some(Action::DeleteOwnPost),
-        KeyCode::Char('p') => Some(Action::ComposePost),
-        KeyCode::Char('r') => Some(Action::ComposeReply),
-        KeyCode::Char('R') => Some(Action::Reload),
-        KeyCode::Char('Q') => Some(Action::ComposeQuote),
-        KeyCode::Char('g') => Some(Action::JumpTop),
-        KeyCode::Char('G') => Some(Action::JumpBottom),
-        KeyCode::Char('/') => Some(Action::StartSearch),
-        KeyCode::Char('n') => Some(Action::SearchNext),
-        KeyCode::Char('h') | KeyCode::Left => Some(Action::Back),
-        KeyCode::Esc => Some(Action::Escape),
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => Some(Action::OpenSelected),
-        KeyCode::Char('e') => Some(Action::OpenQuote),
-        KeyCode::Char('P') => Some(Action::OpenProfile),
-        KeyCode::Char('N') => Some(Action::OpenNotifications),
-        _ => None,
-    }
-}
-
-pub fn normal_key_help_lines() -> Vec<&'static str> {
-    vec![
-        "  j/k or arrows: move · Ctrl-d/Ctrl-u half page · PgUp/PgDn page",
-        "  l/Enter/Right: open selected · h/Left back · q back, quit at root",
-        "  P profile · N notifications · Space media · o links · e quoted post",
-        "  f like · b repost · F follow · p post · r reply · Q quote · d delete",
-        "  / search · n next · R reload · u load pending · Ctrl-C quit",
-    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -925,12 +835,13 @@ impl App {
             self.handle_overlay_key(key).await?;
         } else {
             match &mut self.input_mode {
-                InputMode::Search { buffer } => match key.code {
-                    KeyCode::Esc => {
+                InputMode::Search { buffer } => match action_for_key(KeyContext::Search, key) {
+                    Some(KeyAction::Quit) => self.should_quit = true,
+                    Some(KeyAction::CancelSearch) => {
                         self.input_mode = InputMode::Normal;
                         self.set_status("Search cancelled");
                     }
-                    KeyCode::Enter => {
+                    Some(KeyAction::SubmitSearch) => {
                         let query = buffer.clone();
                         self.input_mode = InputMode::Normal;
                         if self.nav.current_mut().search_next(&query) {
@@ -939,15 +850,16 @@ impl App {
                             self.set_status(format!("No match: {query}"));
                         }
                     }
-                    KeyCode::Backspace => {
+                    Some(KeyAction::Backspace) => {
                         buffer.pop();
                     }
-                    KeyCode::Char(c)
-                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    None if matches!(key.code, KeyCode::Char(_))
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
                     {
-                        buffer.push(c);
+                        if let KeyCode::Char(character) = key.code {
+                            buffer.push(character);
+                        }
                     }
-                    KeyCode::Char(_) => {}
                     _ => {}
                 },
                 InputMode::Normal => self.handle_normal_key(key).await?,
@@ -991,8 +903,9 @@ impl App {
     }
 
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
-        enum Action {
+        enum Effect {
             None,
+            Quit,
             Close,
             SwitchAccount(isize),
             SwitchFeed(isize),
@@ -1003,37 +916,45 @@ impl App {
             DeletePost(String),
         }
 
-        let mut action = Action::None;
+        let context = match self.overlay.as_ref() {
+            Some(Overlay::Menu(_)) => KeyContext::Menu,
+            Some(Overlay::Media(_)) => KeyContext::Media,
+            Some(Overlay::Links(_)) => KeyContext::Links,
+            Some(Overlay::Composer(_)) => KeyContext::Composer,
+            Some(Overlay::ConfirmDelete(_)) => KeyContext::Confirmation,
+            None => return Ok(()),
+        };
+        let key_action = action_for_key(context, key);
+        let mut effect = Effect::None;
         match self.overlay.as_mut() {
-            Some(Overlay::Menu(state)) => match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
-                    action = Action::Close;
-                }
-                KeyCode::Char('j') | KeyCode::Down => state.next(),
-                KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                KeyCode::Tab | KeyCode::BackTab => {
-                    match menu_tab_action(state.section, matches!(key.code, KeyCode::BackTab)) {
+            Some(Overlay::Menu(state)) => match key_action {
+                Some(KeyAction::Quit) => effect = Effect::Quit,
+                Some(KeyAction::CloseOverlay) => effect = Effect::Close,
+                Some(KeyAction::MenuNextSection) => state.next(),
+                Some(KeyAction::MenuPreviousSection) => state.previous(),
+                Some(KeyAction::MenuTabNext | KeyAction::MenuTabPrevious) => {
+                    let reverse = key_action == Some(KeyAction::MenuTabPrevious);
+                    match menu_tab_action(state.section, reverse) {
                         MenuTabAction::MoveSection(delta) if delta > 0 => state.next(),
                         MenuTabAction::MoveSection(_) => state.previous(),
                         MenuTabAction::SwitchAccount(delta) => {
-                            action = Action::SwitchAccount(delta);
+                            effect = Effect::SwitchAccount(delta);
                         }
                         MenuTabAction::SwitchFeed(delta) => {
-                            action = Action::SwitchFeed(delta);
+                            effect = Effect::SwitchFeed(delta);
                         }
                     }
                 }
-                KeyCode::Char('[') => action = Action::SwitchFeed(-1),
-                KeyCode::Char(']') => action = Action::SwitchFeed(1),
+                Some(KeyAction::PreviousFeed) => effect = Effect::SwitchFeed(-1),
+                Some(KeyAction::NextFeed) => effect = Effect::SwitchFeed(1),
                 _ => {}
             },
-            Some(Overlay::Media(state)) => match key.code {
-                KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q') => {
-                    action = Action::Close;
-                }
-                KeyCode::Char('h') | KeyCode::Left => state.previous(),
-                KeyCode::Char('l') | KeyCode::Right => state.next(),
-                KeyCode::Enter | KeyCode::Char('p') => {
+            Some(Overlay::Media(state)) => match key_action {
+                Some(KeyAction::Quit) => effect = Effect::Quit,
+                Some(KeyAction::CloseOverlay) => effect = Effect::Close,
+                Some(KeyAction::MediaPrevious) => state.previous(),
+                Some(KeyAction::MediaNext) => state.next(),
+                Some(KeyAction::PlayVideo) => {
                     let video = match state.selected_media() {
                         Some(PreviewMedia::Video(video)) => Some(video.clone()),
                         _ => None,
@@ -1041,83 +962,88 @@ impl App {
                     if video.is_some() {
                         state.playing = true;
                     }
-                    action = Action::PlayVideo(video);
+                    effect = Effect::PlayVideo(video);
                 }
-                KeyCode::Char('u') => {
-                    action = Action::OpenUri(match state.selected_media() {
+                Some(KeyAction::OpenMediaExternally) => {
+                    effect = Effect::OpenUri(match state.selected_media() {
                         Some(PreviewMedia::Video(video)) => Some(video.playlist_url.clone()),
                         _ => None,
                     });
                 }
                 _ => {}
             },
-            Some(Overlay::Links(state)) => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    action = Action::Close;
-                }
-                KeyCode::Char('j') | KeyCode::Down => state.next(),
-                KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                KeyCode::Enter | KeyCode::Char('u') => {
-                    action = Action::OpenLink(state.selected_link().cloned());
+            Some(Overlay::Links(state)) => match key_action {
+                Some(KeyAction::Quit) => effect = Effect::Quit,
+                Some(KeyAction::CloseOverlay) => effect = Effect::Close,
+                Some(KeyAction::LinkNext) => state.next(),
+                Some(KeyAction::LinkPrevious) => state.previous(),
+                Some(KeyAction::OpenLink) => {
+                    effect = Effect::OpenLink(state.selected_link().cloned());
                 }
                 _ => {}
             },
-            Some(Overlay::ConfirmDelete(state)) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    action = Action::DeletePost(state.uri.clone());
+            Some(Overlay::ConfirmDelete(state)) => match key_action {
+                Some(KeyAction::Quit) => effect = Effect::Quit,
+                Some(KeyAction::ConfirmDelete) => {
+                    effect = Effect::DeletePost(state.uri.clone());
                 }
                 // Anything but an explicit yes cancels a destructive action.
-                _ => action = Action::Close,
+                Some(KeyAction::CancelDelete) | None => effect = Effect::Close,
+                _ => {}
             },
-            Some(Overlay::Composer(state)) => match key.code {
-                KeyCode::Esc => action = Action::Close,
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    action = Action::SubmitComposer(Some(state.clone()));
+            Some(Overlay::Composer(state)) => match key_action {
+                Some(KeyAction::Quit) => effect = Effect::Quit,
+                Some(KeyAction::CloseOverlay) => effect = Effect::Close,
+                Some(KeyAction::SubmitComposer) => {
+                    effect = Effect::SubmitComposer(Some(state.clone()));
                 }
-                KeyCode::Enter => state.buffer.push('\n'),
-                KeyCode::Backspace => {
+                Some(KeyAction::InsertNewline) => state.buffer.push('\n'),
+                Some(KeyAction::Backspace) => {
                     state.buffer.pop();
                 }
-                KeyCode::Char(c)
-                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                None if matches!(key.code, KeyCode::Char(_))
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
                 {
-                    state.buffer.push(c);
+                    if let KeyCode::Char(character) = key.code {
+                        state.buffer.push(character);
+                    }
                 }
                 _ => {}
             },
             None => {}
         }
 
-        match action {
-            Action::None => {}
-            Action::Close => self.overlay = None,
-            Action::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
-            Action::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
-            Action::OpenLink(link) => {
+        match effect {
+            Effect::None => {}
+            Effect::Quit => self.should_quit = true,
+            Effect::Close => self.overlay = None,
+            Effect::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
+            Effect::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
+            Effect::OpenLink(link) => {
                 if let Some(link) = link {
                     self.open_link(link);
                 }
             }
-            Action::OpenUri(uri) => {
+            Effect::OpenUri(uri) => {
                 if let Some(uri) = uri {
                     self.open_uri(uri);
                 } else {
                     self.set_status("No external media URL for selected item");
                 }
             }
-            Action::PlayVideo(video) => {
+            Effect::PlayVideo(video) => {
                 if let Some(video) = video {
                     self.queue_video_load(&video);
                 } else {
                     self.set_status("Selected media is not a video");
                 }
             }
-            Action::SubmitComposer(state) => {
+            Effect::SubmitComposer(state) => {
                 if let Some(state) = state {
                     self.submit_composer(state);
                 }
             }
-            Action::DeletePost(uri) => {
+            Effect::DeletePost(uri) => {
                 self.overlay = None;
                 self.delete_post(uri);
             }
@@ -1126,50 +1052,50 @@ impl App {
     }
 
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
-        let Some(action) = normal_action_for_key(key) else {
+        let Some(action) = action_for_key(KeyContext::Normal, key) else {
             return Ok(());
         };
 
         match action {
-            Action::Quit => self.should_quit = true,
-            Action::BackOrQuit => {
+            KeyAction::Quit => self.should_quit = true,
+            KeyAction::BackOrQuit => {
                 if self.nav.pop() {
                     self.set_status("Back");
                 } else {
                     self.should_quit = true;
                 }
             }
-            Action::MoveDown => self.nav.current_mut().move_down(),
-            Action::MoveUp => self.nav.current_mut().move_up(),
-            Action::HalfPageDown => self.nav.current_mut().move_by(5),
-            Action::HalfPageUp => self.nav.current_mut().move_by(-5),
-            Action::PageDown => self.nav.current_mut().move_by(10),
-            Action::PageUp => self.nav.current_mut().move_by(-10),
-            Action::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
-            Action::PreviewMedia => self.open_media_overlay_for_selected().await?,
-            Action::OpenLinks => self.open_links_for_selected(),
-            Action::PreviousFeed => self.switch_feed_delta(-1).await?,
-            Action::NextFeed => self.switch_feed_delta(1).await?,
-            Action::LoadPending => {
+            KeyAction::MoveDown => self.nav.current_mut().move_down(),
+            KeyAction::MoveUp => self.nav.current_mut().move_up(),
+            KeyAction::HalfPageDown => self.nav.current_mut().move_by(5),
+            KeyAction::HalfPageUp => self.nav.current_mut().move_by(-5),
+            KeyAction::PageDown => self.nav.current_mut().move_by(10),
+            KeyAction::PageUp => self.nav.current_mut().move_by(-10),
+            KeyAction::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
+            KeyAction::PreviewMedia => self.open_media_overlay_for_selected().await?,
+            KeyAction::OpenLinks => self.open_links_for_selected(),
+            KeyAction::PreviousFeed => self.switch_feed_delta(-1).await?,
+            KeyAction::NextFeed => self.switch_feed_delta(1).await?,
+            KeyAction::LoadPending => {
                 self.nav.current_mut().jump_top();
                 self.merge_pending_new_items(true);
             }
-            Action::ToggleLike => self.toggle_like_selected(),
-            Action::ToggleRepost => self.toggle_repost_selected(),
-            Action::ToggleFollow => self.toggle_follow_selected(),
-            Action::DeleteOwnPost => self.confirm_delete_selected(),
-            Action::ComposePost => self.open_post_composer(),
-            Action::ComposeReply => self.open_reply_composer(),
-            Action::ComposeQuote => self.open_quote_composer(),
-            Action::JumpTop => self.nav.current_mut().jump_top(),
-            Action::JumpBottom => self.nav.current_mut().jump_bottom(),
-            Action::StartSearch => {
+            KeyAction::ToggleLike => self.toggle_like_selected(),
+            KeyAction::ToggleRepost => self.toggle_repost_selected(),
+            KeyAction::ToggleFollow => self.toggle_follow_selected(),
+            KeyAction::DeleteOwnPost => self.confirm_delete_selected(),
+            KeyAction::ComposePost => self.open_post_composer(),
+            KeyAction::ComposeReply => self.open_reply_composer(),
+            KeyAction::ComposeQuote => self.open_quote_composer(),
+            KeyAction::JumpTop => self.nav.current_mut().jump_top(),
+            KeyAction::JumpBottom => self.nav.current_mut().jump_bottom(),
+            KeyAction::StartSearch => {
                 self.input_mode = InputMode::Search {
                     buffer: String::new(),
                 };
                 self.set_status("Search current view");
             }
-            Action::SearchNext => {
+            KeyAction::SearchNext => {
                 let query = self.nav.current().search_query.clone();
                 if let Some(query) = query {
                     if self.nav.current_mut().search_next(&query) {
@@ -1179,25 +1105,26 @@ impl App {
                     }
                 }
             }
-            Action::Back => {
+            KeyAction::Back => {
                 if self.nav.pop() {
                     self.set_status("Back");
                 } else {
                     self.set_status("Already at timeline");
                 }
             }
-            Action::Escape => {
+            KeyAction::Escape => {
                 if self.nav.pop() {
                     self.set_status("Back");
                 } else {
                     self.overlay = Some(Overlay::Menu(MenuState::settings()));
                 }
             }
-            Action::OpenSelected => self.open_selected_detail().await?,
-            Action::OpenQuote => self.open_quote_for_selected().await?,
-            Action::OpenProfile => self.open_profile_for_selected(),
-            Action::OpenNotifications => self.queue_notifications_load("Loading notifications"),
-            Action::Reload => self.reload_current().await?,
+            KeyAction::OpenSelected => self.open_selected_detail().await?,
+            KeyAction::OpenQuote => self.open_quote_for_selected().await?,
+            KeyAction::OpenProfile => self.open_profile_for_selected(),
+            KeyAction::OpenNotifications => self.queue_notifications_load("Loading notifications"),
+            KeyAction::Reload => self.reload_current().await?,
+            _ => {}
         }
         Ok(())
     }
@@ -3234,6 +3161,80 @@ mod tests {
         assert_eq!(app.pending_writes, 0);
     }
 
+    #[tokio::test]
+    async fn contextual_overlay_commands_dispatch_through_registry() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+
+        app.overlay = Some(Overlay::Menu(MenuState::default()));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+
+        app.overlay = Some(Overlay::Media(MediaOverlayState::new(vec![
+            PreviewMedia::Image(image("one")),
+        ])));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+
+        app.overlay = Some(Overlay::Links(LinkPickerState::new(vec![LinkRef {
+            uri: "https://example.com".into(),
+            label: "example".into(),
+            source: LinkSource::Text,
+        }])));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+
+        app.overlay = Some(Overlay::Menu(MenuState::default()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn composer_keeps_literal_text_separate_from_commands() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.overlay = Some(Overlay::Composer(ComposerState {
+            kind: ComposerKind::Post,
+            buffer: String::new(),
+        }));
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ] {
+            app.handle_key(key).await.unwrap();
+        }
+        let Some(Overlay::Composer(state)) = app.overlay.as_ref() else {
+            panic!("composer should remain open");
+        };
+        assert_eq!(state.buffer, "xY");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+
+        app.overlay = Some(Overlay::Composer(ComposerState {
+            kind: ComposerKind::Post,
+            buffer: " ".into(),
+        }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(matches!(app.overlay, Some(Overlay::Composer(_))));
+        assert_eq!(app.status, "Post text is empty");
+        assert_eq!(app.pending_writes, 0);
+    }
+
     #[test]
     fn status_messages_expire() {
         let mut app = app_with_items(vec![item("post", "hello")]);
@@ -3365,47 +3366,65 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
 
         let expectations = [
-            (KeyCode::Char('q'), Action::BackOrQuit),
-            (KeyCode::Char('f'), Action::ToggleLike),
-            (KeyCode::Char('F'), Action::ToggleFollow),
-            (KeyCode::Char('b'), Action::ToggleRepost),
-            (KeyCode::Char('d'), Action::DeleteOwnPost),
-            (KeyCode::Char('r'), Action::ComposeReply),
-            (KeyCode::Char('R'), Action::Reload),
-            (KeyCode::Char('Q'), Action::ComposeQuote),
-            (KeyCode::Char('o'), Action::OpenLinks),
-            (KeyCode::Char('e'), Action::OpenQuote),
-            (KeyCode::Char('u'), Action::LoadPending),
-            (KeyCode::Char('p'), Action::ComposePost),
-            (KeyCode::Char('P'), Action::OpenProfile),
-            (KeyCode::Char('N'), Action::OpenNotifications),
-            (KeyCode::Char('l'), Action::OpenSelected),
-            (KeyCode::Char('h'), Action::Back),
-            (KeyCode::PageDown, Action::PageDown),
-            (KeyCode::PageUp, Action::PageUp),
+            (KeyCode::Char('q'), KeyAction::BackOrQuit),
+            (KeyCode::Char('f'), KeyAction::ToggleLike),
+            (KeyCode::Char('F'), KeyAction::ToggleFollow),
+            (KeyCode::Char('b'), KeyAction::ToggleRepost),
+            (KeyCode::Char('d'), KeyAction::DeleteOwnPost),
+            (KeyCode::Char('r'), KeyAction::ComposeReply),
+            (KeyCode::Char('R'), KeyAction::Reload),
+            (KeyCode::Char('Q'), KeyAction::ComposeQuote),
+            (KeyCode::Char('o'), KeyAction::OpenLinks),
+            (KeyCode::Char('e'), KeyAction::OpenQuote),
+            (KeyCode::Char('u'), KeyAction::LoadPending),
+            (KeyCode::Char('p'), KeyAction::ComposePost),
+            (KeyCode::Char('P'), KeyAction::OpenProfile),
+            (KeyCode::Char('N'), KeyAction::OpenNotifications),
+            (KeyCode::Char('l'), KeyAction::OpenSelected),
+            (KeyCode::Char('h'), KeyAction::Back),
+            (KeyCode::PageDown, KeyAction::PageDown),
+            (KeyCode::PageUp, KeyAction::PageUp),
         ];
         for (code, action) in expectations {
-            assert_eq!(normal_action_for_key(key(code)), Some(action));
+            assert_eq!(action_for_key(KeyContext::Normal, key(code)), Some(action));
         }
 
-        assert_eq!(normal_action_for_key(ctrl('c')), Some(Action::Quit));
-        assert_eq!(normal_action_for_key(ctrl('d')), Some(Action::HalfPageDown));
-        assert_eq!(normal_action_for_key(ctrl('u')), Some(Action::HalfPageUp));
+        assert_eq!(
+            action_for_key(KeyContext::Normal, ctrl('c')),
+            Some(KeyAction::Quit)
+        );
+        assert_eq!(
+            action_for_key(KeyContext::Normal, ctrl('d')),
+            Some(KeyAction::HalfPageDown)
+        );
+        assert_eq!(
+            action_for_key(KeyContext::Normal, ctrl('u')),
+            Some(KeyAction::HalfPageUp)
+        );
 
         // Retired bindings must be unmapped.
-        assert_eq!(normal_action_for_key(key(KeyCode::Char('w'))), None);
-        assert_eq!(normal_action_for_key(key(KeyCode::Char('U'))), None);
-        assert_eq!(normal_action_for_key(key(KeyCode::Char('c'))), None);
+        assert_eq!(
+            action_for_key(KeyContext::Normal, key(KeyCode::Char('w'))),
+            None
+        );
+        assert_eq!(
+            action_for_key(KeyContext::Normal, key(KeyCode::Char('U'))),
+            None
+        );
+        assert_eq!(
+            action_for_key(KeyContext::Normal, key(KeyCode::Char('c'))),
+            None
+        );
 
         assert!(
-            normal_key_help_lines()
+            crate::keymap::help_lines(KeyContext::Normal)
                 .iter()
                 .any(|line| line.contains("P profile") && line.contains("N notifications"))
         );
         assert!(
-            normal_key_help_lines()
+            crate::keymap::help_lines(KeyContext::Normal)
                 .iter()
-                .any(|line| line.contains("F follow") && line.contains("f like"))
+                .any(|line| line.contains("f/b/F like/repost/follow"))
         );
     }
 

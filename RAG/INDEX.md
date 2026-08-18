@@ -7,10 +7,10 @@
 | Status | EPICs | IMPs |
 |--------|-------|------|
 | In Progress | 0 | 0 |
-| Planned | 2 | 5 |
+| Planned | 2 | 4 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 1 | 12 |
+| Completed | 1 | 13 |
 | **Total** | **3** | **17** |
 
 ## Planned
@@ -32,7 +32,7 @@
 - [[AI-IMP-003-1-xrpc-expired-token-retry|IMP-003-1]] Expired access tokens do not trigger the refresh path — completed
 - [[AI-IMP-003-2-task-context-timeouts|IMP-003-2]] Background completions have inconsistent ownership and no deadline — completed
 - [[AI-IMP-003-3-atomic-session-persistence|IMP-003-3]] Session saves can destroy recoverable account state — completed
-- [[AI-IMP-003-4-contextual-keymap-registry|IMP-003-4]] Key behavior has two sources of truth — planned
+- [[AI-IMP-003-4-contextual-keymap-registry|IMP-003-4]] Key behavior has two sources of truth — completed
 - [[AI-IMP-003-5-prioritized-media-scheduler|IMP-003-5]] Speculative media work is unbounded and cannot yield to visible work — planned
 - [[AI-IMP-003-6-progressive-video-events|IMP-003-6]] Video waits for complete decoding before the UI can play — planned
 - [[AI-IMP-003-7-runtime-diagnostics|IMP-003-7]] Runtime failures are visible only as transient symptoms — planned
@@ -46,11 +46,12 @@ Generated from tracked files; binary assets excluded.
 ### > 600 LOC
 
 - Cargo.lock (4146 LOC)
-- src/app.rs (3901 LOC)
+- src/app.rs (3920 LOC)
 - src/model.rs (1976 LOC)
-- src/ui.rs (1389 LOC)
+- src/ui.rs (1379 LOC)
 - src/api.rs (1228 LOC)
 - src/media.rs (941 LOC)
+- src/keymap.rs (932 LOC)
 - src/config.rs (761 LOC)
 
 ### > 300 LOC
@@ -62,7 +63,7 @@ Generated from tracked files; binary assets excluded.
 
 ## Completed
 <details>
-<summary>1 EPICs, 12 IMPs completed</summary>
+<summary>1 EPICs, 13 IMPs completed</summary>
 
 - [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002]] At tui stabilization daily driver — 2026-07-06
   - [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
