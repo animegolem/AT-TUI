@@ -19,6 +19,7 @@ AI_IMP_spawned:
   - AI-IMP-003-5
   - AI-IMP-003-6
   - AI-IMP-003-7
+  - AI-IMP-003-8
 ---
 
 # AI-EPIC-003-trustworthy-runtime-interaction-foundation
@@ -86,6 +87,7 @@ framework. Inline timeline images remain a later product decision.
 - [x] FR-16: AT-TUI shall restore terminal modes and input after mpv exits or fails to start.
 - [ ] FR-17: Diagnostics shall expose sanitized poll, refresh, task, and media health without revealing tokens or private response bodies.
 - [ ] FR-18: A live idle validation shall be recorded before this epic is completed.
+- [ ] FR-19: Profile metadata and persistent view errors shall scroll in the same line-addressable buffer as view items.
 
 ### Non-Functional Requirements
 - Preserve the narrow, single-column, keyboard-first product contract.
@@ -103,5 +105,6 @@ framework. Inline timeline images remain a later product decision.
 - [ ] [[AI-IMP-003-5-prioritized-media-scheduler]]: bounded priority queue, retry, cancellation, disk-cache lifecycle (FR-12..14).
 - [ ] [[AI-IMP-003-6-progressive-video-events]]: modal mpv Kitty playback and terminal restoration (FR-15..16).
 - [ ] [[AI-IMP-003-7-runtime-diagnostics]]: diagnostics surface, sanitized logging, live idle record (FR-17..18).
+- [ ] [[AI-IMP-003-8-unified-view-buffer]]: line-based view scrolling for profile and error content (FR-19).
 
 Dependency order: 003-1 first. 003-2 depends on 003-1. 003-3 may proceed after 003-1 with care around `api.rs`. 003-4 depends on 003-2 because both restructure `app.rs`. 003-5 depends on 003-2. 003-6 depends on 003-5. 003-7 closes the epic after 003-1, 003-2, 003-5, and 003-6 provide the signals it reports.

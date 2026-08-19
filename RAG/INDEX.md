@@ -6,12 +6,12 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 1 | 2 |
+| In Progress | 1 | 3 |
 | Planned | 0 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
 | Completed | 2 | 14 |
-| **Total** | **3** | **17** |
+| **Total** | **3** | **18** |
 
 ## In Progress
 
@@ -26,6 +26,7 @@
 - [[AI-IMP-003-5-prioritized-media-scheduler|IMP-003-5]] Speculative media work is unbounded and cannot yield to visible work — in-progress
 - [[AI-IMP-003-6-progressive-video-events|IMP-003-6]] Frame extraction is not real video playback — in-progress
 - [[AI-IMP-003-7-runtime-diagnostics|IMP-003-7]] Runtime failures are visible only as transient symptoms — planned
+- [[AI-IMP-003-8-unified-view-buffer|IMP-003-8]] Profile content is pinned outside the scroll buffer — in-progress
 
 ---
 
