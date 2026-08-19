@@ -29,14 +29,16 @@ AT-TUI is organized around a small set of large modules:
 - `src/navigation.rs` owns view stack state, selection, scrolling, and render cache metadata.
 - `src/app.rs` owns the event loop, background task orchestration, key actions, overlays, and write flows.
 - `src/ui.rs` renders the list, statusline, overlays, post rows, profile rows, and notification rows.
-- `src/media.rs` owns terminal image/video cache state, image protocol setup, and experimental ffmpeg frame decoding.
+- `src/media.rs` owns image cache state, image protocol setup, thumbnail loading, and Ratatui image rendering.
+- `src/media_scheduler.rs` owns bounded, priority-aware image work.
+- `src/video_player.rs` discovers mpv and constructs Kitty video playback commands.
 
-The current split is workable for a prototype, but several files are beyond the point where future feature work will stay easy:
+The current split works, but several files are large enough to constrain future changes:
 
 - `src/app.rs` is the main pressure point. It should eventually split into action/keymap handling, task/event handling, composer/write flows, and feed/view loading.
 - `src/model.rs` mixes response parsing for posts, preferences, profiles, notifications, links, and media. Split by domain once follow/unfollow or notification browsing grows.
 - `src/ui.rs` mixes layout, row rendering, overlays, and statusline rendering. Split row renderers and overlays before adding more surfaces.
-- `src/media.rs` combines image cache, video decode, and Ratatui rendering. Split video support when audio/playback work starts.
+- `src/media.rs` combines image cache, disk cleanup, loading, and Ratatui rendering. Split these concerns before adding inline media surfaces.
 - `RAG/scripts/generate-index.sh` is long but acceptable for now because it is an isolated repo utility. If it grows, split extraction/index rendering helpers into smaller shell scripts or replace it with a tiny Rust/Python tool.
 
 ## Practical Defaults

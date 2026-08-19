@@ -6,12 +6,12 @@ tags:
   - at-tui
   - video
   - spike
-kanban_status: planned
+kanban_status: completed
 depends_on: [[AI-EPIC-001-at-tui-public-readiness-polish]]
 parent_epic: [[AI-EPIC-001-at-tui-public-readiness-polish]]
 confidence_score: 0.78
 date_created: 2026-05-22
-date_completed:
+date_completed: 2026-08-19
 ---
 
 # AI-IMP-001-3-video-audio-spike
@@ -35,14 +35,14 @@ Inspect the existing video path and produce `RAG/spikes/video-audio-implementati
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Map the current video overlay and frame-decoding path.
-- [ ] Document how Bluesky video playlist URLs are represented and consumed.
-- [ ] Document required/optional local tools: `ffmpeg`, `ffprobe`, and platform audio players.
-- [ ] Compare audio extraction plus local playback, external-player delegation, and no-audio fallback.
-- [ ] Identify frame/audio sync risks and acceptable v1 compromises.
-- [ ] Cover macOS and Ghostty constraints explicitly.
-- [ ] Recommend one v1 implementation path.
-- [ ] Include a future implementation checklist with test and manual QA items.
+- [x] Map the current video overlay and frame-decoding path.
+- [x] Document how Bluesky video playlist URLs are represented and consumed.
+- [x] Document required/optional local tools: `ffmpeg`, `ffprobe`, and platform audio players.
+- [x] Compare audio extraction plus local playback, external-player delegation, and no-audio fallback.
+- [x] Identify frame/audio sync risks and acceptable v1 compromises.
+- [x] Cover macOS and Ghostty constraints explicitly.
+- [x] Recommend one v1 implementation path.
+- [x] Include a future implementation checklist with test and manual QA items.
 
 ### Acceptance Criteria
 **Scenario:** A future implementer starts video audio work.  
@@ -51,4 +51,7 @@ Before marking an item complete on the checklist MUST **stop** and **think**. Ha
 **THEN** they can begin implementation without re-discovering current media flow, local tool assumptions, or playback tradeoffs.
 
 ### Issues Encountered
-None yet.
+The spike produced `RAG/spikes/video-audio-implementation-brief.md`. The later
+AI-IMP-003-6 implementation replaced the brief's ffmpeg and `afplay` proposal
+with a modal mpv Kitty handoff. The brief now labels that recommendation as
+historical.

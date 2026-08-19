@@ -7,8 +7,8 @@ tags:
   - public-readiness
   - polish
 date_created: 2026-05-22
-date_completed:
-kanban_status: planned
+date_completed: 2026-08-19
+kanban_status: completed
 AI_IMP_spawned:
   - AI-IMP-001-1
   - AI-IMP-001-2
@@ -32,13 +32,13 @@ Within this epic, AT-TUI should have a compact statusline without visual divider
 ## Requirements
 
 ### Functional Requirements
-- [ ] FR-1: The statusline shall render compact colored segments without literal slash separators.
-- [ ] FR-2: Media alt text and external link descriptions shall wrap within the timeline width.
-- [ ] FR-3: Media and link summary lines shall use distinct colors from normal post body text.
-- [ ] FR-4: Active liked posts shall render with a red bold heart, matching active repost state clarity.
-- [ ] FR-5: Users shall be able to follow or unfollow the selected/profile account with a provisional keyboard action.
-- [ ] FR-6: Profile views shall expose follow state in the header.
-- [ ] FR-7: Video-audio work shall produce a brief covering implementation options, risks, and a recommended v1 path.
+- [x] FR-1: The statusline shall render compact colored segments without literal slash separators.
+- [x] FR-2: Media alt text and external link descriptions shall wrap within the timeline width.
+- [x] FR-3: Media and link summary lines shall use distinct colors from normal post body text.
+- [x] FR-4: Active liked posts shall render with a red bold heart, matching active repost state clarity.
+- [x] FR-5: Users shall be able to follow or unfollow the selected/profile account with a provisional keyboard action.
+- [x] FR-6: Profile views shall expose follow state in the header.
+- [x] FR-7: Video-audio work shall produce a brief covering implementation options, risks, and a recommended v1 path.
 
 ### Non-Functional Requirements
 - Keep the app keyboard-first and terminal-portable.
@@ -46,6 +46,6 @@ Within this epic, AT-TUI should have a compact statusline without visual divider
 - Preserve the current test gate: format check, unit tests, clippy with warnings denied, build, and diff whitespace check.
 
 ## Implementation Breakdown
-- [ ] [[AI-IMP-001-1-cosmetic-polish]]: Compact statusline and timeline readability polish.
-- [ ] [[AI-IMP-001-2-follow-unfollow-accounts]]: Keyboard follow/unfollow support.
-- [ ] [[AI-IMP-001-3-video-audio-spike]]: Research artifact for video audio.
+- [x] [[AI-IMP-001-1-cosmetic-polish]]: Compact statusline and timeline readability polish.
+- [x] [[AI-IMP-001-2-follow-unfollow-accounts]]: Keyboard follow/unfollow support.
+- [x] [[AI-IMP-001-3-video-audio-spike]]: Research artifact for video audio.

@@ -10,7 +10,7 @@ tags:
   - media
 date_created: 2026-08-17
 date_completed:
-kanban_status: planned
+kanban_status: in-progress
 AI_IMP_spawned:
   - AI-IMP-003-1
   - AI-IMP-003-2
@@ -24,7 +24,11 @@ AI_IMP_spawned:
 # AI-EPIC-003-trustworthy-runtime-interaction-foundation
 
 ## Problem Statement/Feature Scope
-AT-TUI is attractive and usable, but several lifecycle boundaries remain prototype-grade. A live access token expires with HTTP 400 `ExpiredToken`, while the client refreshes only on HTTP 401; polling therefore stops until restart even though the saved login remains valid. Network tasks have uneven stale-result guards, writes are not account-scoped, credential saves can replace unreadable configuration with an empty file, key behavior is split between one normal-mode action map and direct overlay matches, and speculative media work has no shared priority or concurrency policy. These are now the main obstacles to leaving the app open and extending it confidently.
+AT-TUI is attractive and usable, but it needs explicit runtime ownership and diagnostics before it can prove long-running reliability. The completed phases
+now refresh HTTP 400 `ExpiredToken` responses, scope background work, save
+sessions atomically, centralize key bindings, bound image work, and delegate
+video playback to mpv. Runtime diagnostics and the 24-hour idle validation
+remain open.
 
 ## Proposed Solution(s)
 Deliver seven behavior-led phases. Each phase must improve the running application and extract only the module seam needed to own that behavior.
@@ -39,12 +43,17 @@ Deliver seven behavior-led phases. Each phase must improve the running applicati
 
 **Phase 5 — prioritized media scheduling.** Bound downloads and decodes, prioritize visible media over prefetch, cancel obsolete speculation, permit controlled retry, and bound the disk cache.
 
-**Phase 6 — progressive video delivery.** Stream decoded frame batches to the UI instead of waiting for the complete ffmpeg run, with bounded memory and clean cancellation.
+**Phase 6 — terminal video playback.** Hand terminal ownership to mpv for HLS
+decoding, Kitty rendering, audio, timing, and controls. Restore AT-TUI after
+playback exits.
 
 **Phase 7 — runtime diagnostics.** Add a compact diagnostics surface and optional sanitized log for poll health, XRPC failures, task age, session refresh, and media-cache behavior.
 
 ## Path(s) Not Taken
-This epic does not add OAuth, DMs, global search, moderation features, image upload, wide side panes, theming, or user-editable keymap files. It does not replace all `serde_json::Value` parsing or rewrite the application into a framework. Inline timeline images remain a later product decision after media work is bounded. Audio remains outside the progressive-video ticket and may follow the existing video/audio brief.
+This epic does not add OAuth, DMs, global search, moderation features, media
+upload, wide side panes, theming, or user-editable keymap files. It does not
+replace all `serde_json::Value` parsing or rewrite the application into a
+framework. Inline timeline images remain a later product decision.
 
 ## Success Metrics
 - A live app runs for at least 24 hours and crosses at least two access-token expiries while timeline and notification polling continue without restart.
@@ -65,16 +74,16 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 - [x] FR-4: HTTP-level regression tests shall cover expiry, successful retry, failed refresh, and non-authentication errors.
 - [x] FR-5: Every app task result shall carry enough context to prove it belongs to the active request, account, and view generation.
 - [x] FR-6: Account switches shall invalidate or reject all prior account-scoped completions, including writes.
-- [ ] FR-7: Network operations now have explicit deadlines and recoverable pending state; media deadlines remain with AI-IMP-003-5 and AI-IMP-003-6 before this cross-cutting requirement is complete.
+- [x] FR-7: Network operations shall have explicit deadlines and recoverable pending state.
 - [x] FR-8: Account configuration writes shall be atomic and shall never treat a read/parse error as an empty configuration.
 - [x] FR-9: Successful legacy-session migration shall not leave a stale credential source that can later be re-imported.
 - [x] FR-10: Normal and overlay key handling shall dispatch through one contextual binding registry.
 - [x] FR-11: Key help shall derive from the same binding metadata used for dispatch.
-- [ ] FR-12: Media work shall use bounded, priority-aware scheduling with deduplication and obsolete-prefetch cancellation.
-- [ ] FR-13: Failed media entries shall support an explicit or policy-bounded retry path.
-- [ ] FR-14: The on-disk media cache shall have a tested cleanup bound.
-- [ ] FR-15: Video decoding shall report progressive frame batches and enforce memory/frame limits.
-- [ ] FR-16: Closing or replacing a video shall stop its decoder and ignore late frames.
+- [x] FR-12: Media work shall use bounded, priority-aware scheduling with deduplication and obsolete-prefetch cancellation.
+- [x] FR-13: Failed media entries shall support an explicit or policy-bounded retry path.
+- [x] FR-14: The on-disk media cache shall have a tested cleanup bound.
+- [x] FR-15: Video playback shall delegate HLS decoding, audio, timing, and input to mpv's Kitty output.
+- [x] FR-16: AT-TUI shall restore terminal modes and input after mpv exits or fails to start.
 - [ ] FR-17: Diagnostics shall expose sanitized poll, refresh, task, and media health without revealing tokens or private response bodies.
 - [ ] FR-18: A live idle validation shall be recorded before this epic is completed.
 
@@ -82,7 +91,7 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 - Preserve the narrow, single-column, keyboard-first product contract.
 - Preserve single-owner application state; background work reports through events and cannot directly mutate `App`.
 - Never log access tokens, refresh tokens, app passwords, authorization headers, or full private API payloads.
-- Keep queues, task counts, decoded frames, memory caches, and disk caches explicitly bounded.
+- Keep queues, task counts, memory caches, and disk caches explicitly bounded.
 - Prefer behavior-led module extraction over a broad rewrite: transport, task context, keymap, and media scheduler become seams as their tickets land.
 - Each ticket lands as an independently reviewable change with focused tests and a hands-on TUI check for user-visible behavior.
 
@@ -92,7 +101,7 @@ This epic does not add OAuth, DMs, global search, moderation features, image upl
 - [x] [[AI-IMP-003-3-atomic-session-persistence]]: atomic account saves and safe legacy migration (FR-8..9).
 - [x] [[AI-IMP-003-4-contextual-keymap-registry]]: contextual dispatch and generated help (FR-10..11).
 - [ ] [[AI-IMP-003-5-prioritized-media-scheduler]]: bounded priority queue, retry, cancellation, disk-cache lifecycle (FR-12..14).
-- [ ] [[AI-IMP-003-6-progressive-video-events]]: progressive ffmpeg frame delivery and bounded cancellation (FR-15..16).
+- [ ] [[AI-IMP-003-6-progressive-video-events]]: modal mpv Kitty playback and terminal restoration (FR-15..16).
 - [ ] [[AI-IMP-003-7-runtime-diagnostics]]: diagnostics surface, sanitized logging, live idle record (FR-17..18).
 
 Dependency order: 003-1 first. 003-2 depends on 003-1. 003-3 may proceed after 003-1 with care around `api.rs`. 003-4 depends on 003-2 because both restructure `app.rs`. 003-5 depends on 003-2. 003-6 depends on 003-5. 003-7 closes the epic after 003-1, 003-2, 003-5, and 003-6 provide the signals it reports.

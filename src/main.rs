@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "at-tui")]
-#[command(about = "A Bluesky terminal client prototype")]
+#[command(about = "A keyboard-first Bluesky terminal client")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

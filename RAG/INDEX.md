@@ -6,27 +6,17 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 0 | 2 |
-| Planned | 2 | 2 |
+| In Progress | 1 | 2 |
+| Planned | 0 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 1 | 13 |
+| Completed | 2 | 14 |
 | **Total** | **3** | **17** |
 
-## Planned
-
-### [[AI-EPIC-001-at-tui-public-readiness-polish|EPIC-001: At tui public readiness polish]]
-> AT-TUI is now usable enough that small interaction gaps and visual rough edges are more noticeable than missing core browsing features. The next wo...
-
-**IMPs:**
-- [[AI-IMP-001-1-cosmetic-polish|IMP-001-1]] Compact Statusline And Timeline Readability — completed
-- [[AI-IMP-001-2-follow-unfollow-accounts|IMP-001-2]] Keyboard Follow And Unfollow — completed
-- [[AI-IMP-001-3-video-audio-spike|IMP-001-3]] Video Audio Implementation Brief — planned
-
----
+## In Progress
 
 ### [[AI-EPIC-003-trustworthy-runtime-interaction-foundation|EPIC-003: Trustworthy runtime interaction foundation]]
-> AT-TUI is attractive and usable, but several lifecycle boundaries remain prototype-grade. A live access token expires with HTTP 400 `ExpiredToken`,...
+> AT-TUI is attractive and usable, but it needs explicit runtime ownership and diagnostics before it can prove long-running reliability. The complete...
 
 **IMPs:**
 - [[AI-IMP-003-1-xrpc-expired-token-retry|IMP-003-1]] Expired access tokens do not trigger the refresh path — completed
@@ -64,8 +54,12 @@ Generated from tracked files; binary assets excluded.
 
 ## Completed
 <details>
-<summary>1 EPICs, 13 IMPs completed</summary>
+<summary>2 EPICs, 14 IMPs completed</summary>
 
+- [[AI-EPIC-001-at-tui-public-readiness-polish|EPIC-001]] At tui public readiness polish — 2026-08-19
+  - [[AI-IMP-001-1-cosmetic-polish|IMP-001-1]] Compact Statusline And Timeline Readability — completed
+  - [[AI-IMP-001-2-follow-unfollow-accounts|IMP-001-2]] Keyboard Follow And Unfollow — completed
+  - [[AI-IMP-001-3-video-audio-spike|IMP-001-3]] Video Audio Implementation Brief — completed
 - [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002]] At tui stabilization daily driver — 2026-07-06
   - [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
   - [[AI-IMP-002-2-event-loop-hygiene|IMP-002-2]] 2 event loop hygiene — completed

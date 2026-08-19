@@ -22,13 +22,19 @@ date_completed:
 # AI-IMP-003-7-runtime-diagnostics
 
 ## Runtime failures are visible only as transient symptoms
-The app can show a generic offline segment, but it does not retain enough safe operational context to distinguish expired auth, a timed-out poll, stale cancellation, media saturation, or a failed decoder. This made the idle-refresh defect appear like login loss and allowed an incorrect HTTP 401 assumption to survive. Done state: a compact in-app diagnostics surface and optional sanitized log explain current runtime health without exposing credentials or private payloads.
+The app can show a generic offline segment, but it does not retain enough safe operational context to distinguish expired auth, a timed-out poll, stale cancellation, media saturation, or a failed playback handoff. This made the idle-refresh defect appear like login loss and allowed an incorrect HTTP 401 assumption to survive. Done state: a compact in-app diagnostics surface and optional sanitized log explain current runtime health without exposing credentials or private payloads.
 
 ### Out of Scope
 Remote telemetry, crash reporting services, analytics, full request/response logging, and a general settings framework.
 
 ### Design/Approach
-Maintain bounded diagnostic state owned by `App`: last successful feed/notification poll, last safe XRPC status/code, last refresh outcome/time, current/oldest task by class, timeout/cancellation counts, media queue depth, active workers, cache hit/miss counts, and video buffer state. Render it as a menu section or dedicated overlay using the contextual keymap. Optionally write structured sanitized events to a local rotating/bounded log enabled by a CLI flag or environment variable. Centralize redaction and test forbidden fields.
+Maintain bounded diagnostic state owned by `App`: last successful feed or
+notification poll, last safe XRPC status and code, last refresh outcome and
+time, current and oldest task by class, timeout and cancellation counts, media
+queue depth, active workers, cache hit and miss counts, and the last mpv
+playback outcome. Render the state as a menu section or dedicated overlay.
+Optionally write sanitized structured events to a bounded local log. Centralize
+redaction and test forbidden fields.
 
 ### Files to Touch
 `src/diagnostics.rs`: bounded state, safe event model, redaction, optional writer.
@@ -47,7 +53,7 @@ Before marking an item complete on the checklist MUST **stop** and **think**. Ha
 - [ ] Record last poll success/failure and typed XRPC status/code.
 - [ ] Record session refresh attempts/outcomes without recording tokens.
 - [ ] Record pending task counts, oldest age, timeouts, cancellations, and stale drops.
-- [ ] Record media queue/worker/cache/video-buffer summaries.
+- [ ] Record media queue, worker, cache, and mpv playback summaries.
 - [ ] Render a compact diagnostics surface that works at narrow widths.
 - [ ] Add opt-in bounded local logging only if redaction and lifecycle are testable.
 - [ ] Add tests proving tokens, authorization headers, app passwords, and private bodies cannot enter diagnostic output.

@@ -1,68 +1,83 @@
 # at-tui
 
-A Bluesky terminal client prototype.
+AT-TUI is a keyboard-first Bluesky client for the terminal. It provides a
+single-column interface for reading feeds, browsing threads and profiles, and
+interacting with posts.
 
-## What Works
+## Features
 
-- App-password login against Bluesky's XRPC API.
-- Multi-account app-password sessions in the platform config directory, with startup refresh.
-- Authenticated Bluesky home timeline (`app.bsky.feed.getTimeline`) with cursor pagination.
-- Saved feed switching through `app.bsky.feed.getFeed`.
-- Your Posts feed through `app.bsky.feed.getAuthorFeed`.
-- Background refresh with pending-new-post counts.
-- Home feed preference reads for replies, reposts, and quote posts.
-- Repost and reply context rendering.
-- Stack-based navigation inspired by Ranger/Yazi.
-- Single-column timeline/thread/feed layout at every terminal width.
-- Background loading for pagination, threads, feeds, account switches, images, and link opening.
-- Vim-style movement with `j`/`k`.
-- Thread/reply navigation with `l`, right arrow, or Enter.
-- Back navigation with `h`, left arrow, or Esc.
-- Inline quote-post rendering, with `o` to open the quoted post as its own stack level.
-- Spacebar media preview overlay for post and quote-post images/videos.
-- Terminal-native HLS video and audio playback through mpv's Kitty output.
-- Link extraction from external cards, rich-text facets, and plain URLs, with `u` to open in the default browser.
-- Like/unlike, repost/unrepost, text posts, replies, and quote posts.
-- Filled/outline heart state for liked posts and highlighted repost state.
-- Unread notification count polling in the statusline.
-- Image fetching and terminal image rendering through `ratatui-image`.
-- Image protocol selection with `--image-protocol auto|kitty|sixel|iterm2|halfblocks`.
-- `--no-images` fallback mode.
-- Unicode text-symbol counters: `↩`, `⟳`, `♥`, and `❞`.
+- Read and paginate the home timeline, saved feeds, author feeds, profiles,
+  threads, and notifications.
+- Switch between saved app-password accounts.
+- Refresh feeds in the background and show pending posts and unread
+  notifications.
+- Search the current view and open post links in your default browser.
+- Like, repost, follow, create posts, reply, quote posts, and delete your own
+  posts.
+- Preview images with Kitty, Sixel, iTerm2, or half-block rendering.
+- Play Bluesky HLS video and audio through mpv's Kitty output.
+- Use the same single-column layout at narrow and wide terminal sizes.
 
-## Usage
+## Requirements
 
-```sh
-cargo run -- login
-cargo run --
-```
+- A Rust toolchain that supports Rust 2024 edition.
+- A Bluesky account and app password.
+- A terminal supported by `ratatui-image` for image previews. Ghostty normally
+  uses the Kitty graphics protocol.
+- mpv for optional video playback. Video output requires a terminal that
+  supports Kitty graphics.
 
-Manage accounts:
+## Install
+
+Build and install the optimized binary with Cargo:
 
 ```sh
-cargo run -- login --account main
-cargo run -- accounts
-cargo run -- switch main
-cargo run -- logout main
+cargo install --path . --locked
 ```
 
-For Ghostty, auto-detection should normally select Kitty graphics. You can force it:
+To build without installing, run:
 
 ```sh
-cargo run -- --image-protocol kitty
+cargo build --release
+./target/release/at-tui --help
 ```
 
-Video playback is optional and uses mpv's Kitty output. Install mpv, open a
-video with Space, then press Enter or `p`; mpv owns playback until it exits and
-`q` returns to AT-TUI. `u` remains available to open the playlist externally.
-AT-TUI also discovers Homebrew's standard mpv prefix when the formula is not
-linked into `PATH`. Set `AT_TUI_MPV` to an explicit executable path if needed.
+## Quickstart
 
-Disable image rendering entirely:
+Log in with an app password. The command prompts for your handle and password:
 
 ```sh
-cargo run -- --no-images
+at-tui login
+at-tui
 ```
+
+AT-TUI stores account sessions in your platform configuration directory. To
+manage saved accounts, run:
+
+```sh
+at-tui login --account main
+at-tui accounts
+at-tui switch main
+at-tui logout main
+```
+
+## Configure media
+
+AT-TUI detects the image protocol. To select one explicitly, run:
+
+```sh
+at-tui --image-protocol kitty
+```
+
+Valid values are `auto`, `kitty`, `sixel`, `iterm2`, and `halfblocks`. To
+disable image rendering, run `at-tui --no-images`.
+
+Video playback uses mpv. Open a post's media with Space, select a video, and
+press Enter or `p`. mpv controls playback until you press `q` to return to
+AT-TUI. Press `u` to open the playlist externally.
+
+AT-TUI searches `PATH`, standard Homebrew locations, and the macOS app bundle
+for mpv. Set `AT_TUI_MPV` to an explicit executable path to override discovery.
 
 ## Keys
 
@@ -146,14 +161,35 @@ Mouse-wheel selection is handled separately from keyboard bindings.
 - `Text` — type query
 <!-- END GENERATED KEYMAP -->
 
-## Timeline Semantics
+## Timeline behavior
 
-The primary list uses Bluesky's authenticated home timeline endpoint. Reposts are shown as feed items with a compact `⟳ @handle reposted` context line when the API marks the item with a repost reason. Replies are shown with an inline parent preview when the API includes reply context.
+The primary list uses Bluesky's authenticated home timeline endpoint. Reposts
+include a compact `⟳ @handle reposted` context line. Replies include a parent
+preview when the API provides reply context.
 
-The app reads the `home` feed view preference from `app.bsky.actor.getPreferences` and applies reply, repost, and quote-post hiding locally as a safety net.
+AT-TUI reads the `home` feed preference from
+`app.bsky.actor.getPreferences`. It also applies reply, repost, and quote-post
+filters locally.
 
-Saved feeds are read from `savedFeedsPrefV2` and legacy `savedFeedsPref`. Feed-generator URIs are switchable with `[` and `]`; saved lists are ignored for now. The app also adds a local `Your Posts` feed for the active account.
+AT-TUI reads saved feeds from `savedFeedsPrefV2` and the legacy
+`savedFeedsPref`. Use `[` and `]` to switch feed generators. Saved lists are
+not available. AT-TUI also adds a local **Your Posts** feed for the active
+account.
 
-## Scope
+## Limitations
 
-OAuth, image/video upload, notifications, DMs, moderation controls, list feeds, and article previews are not implemented yet. Terminal video playback is experimental and requires mpv plus a terminal that supports Kitty graphics.
+AT-TUI does not support OAuth, media upload, direct messages, moderation
+controls, list feeds, article previews, or server-wide search. Video playback
+is experimental and requires mpv and Kitty graphics.
+
+## Develop
+
+Run the project checks before you submit a change:
+
+```sh
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+git diff --check
+```

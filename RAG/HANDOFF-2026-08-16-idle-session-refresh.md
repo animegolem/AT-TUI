@@ -2,6 +2,12 @@
 
 Date: 2026-08-16
 
+> **Historical handoff:** Later work verified the real checkout, added shared
+> session state and single-flight refresh, handled typed HTTP 400
+> `ExpiredToken` responses, and scoped background task results. The 24-hour,
+> two-expiry live validation remains open in AI-IMP-003-7. Use the current RAG
+> tickets and source code for implementation status.
+
 ## User-Visible Bug
 
 After the application sits idle for long enough, feed and notification updates stop. Closing and reopening the application restores updates. The leading hypothesis is stale in-memory session state after Bluesky rotates refresh tokens.

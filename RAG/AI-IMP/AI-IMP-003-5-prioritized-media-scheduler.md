@@ -22,7 +22,7 @@ date_completed:
 Nearby-thumbnail prefetch materially improved speed, but each eligible URL spawns immediately. Rapid navigation can create many downloads/decodes, speculative work has the same priority as the selected overlay, loading entries may be evicted before completion, failures remain sticky for the process lifetime, and the disk cache has no cleanup bound. Done state: one scheduler bounds and prioritizes media work, cancels obsolete speculation, deduplicates in-flight requests, supports controlled retry, and keeps disk use bounded.
 
 ### Out of Scope
-Inline timeline image layout, audio, remote cache synchronization, image upload, and progressive video frames (AI-IMP-003-6).
+Inline timeline image layout, video playback, remote cache synchronization, and image upload.
 
 ### Design/Approach
 Introduce media job identity, priority, and lifecycle separate from rendered cache state. Use small explicit concurrency limits for download and CPU decode work. Priority order is visible selected media, selected-post thumbnail, nearby thumbnails, then full-size speculation. Reprioritize an existing job rather than duplicate it. Cancel or discard speculative jobs invalidated by view generation. Record retryable versus permanent failures and add age/size-based disk cleanup with deterministic tests.

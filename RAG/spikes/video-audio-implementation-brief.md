@@ -7,7 +7,7 @@
 > restores its terminal session. The remainder is retained as historical design
 > context.
 
-## Current State
+## Historical state at the time of the spike
 AT-TUI parses Bluesky `app.bsky.embed.video#view` embeds into `VideoRef` values containing playlist URL, thumbnail URL, alt text, CID, and aspect ratio. The media overlay treats videos as media entries after images. Thumbnail rendering uses the existing image path. Pressing Enter or `p` on a video queues experimental frame decoding through the media cache.
 
 The current video path is intentionally visual-only. `src/media.rs` shells out to `ffmpeg` for capped low-FPS frame extraction and renders decoded frames through the terminal image path. `src/app.rs` owns overlay state, playback toggling, frame advancement timing, and background task events. There is no audio process, no audio cache, and no synchronization contract.
@@ -37,7 +37,7 @@ For a v1 audio feature, the app should keep using the playlist URL as the source
 4. **External-player fallback only.**  
    Very reliable and simple, but it does not satisfy terminal-native audio exploration.
 
-## Recommended V1 Path
+## Historical v1 recommendation
 Implement opt-in audio playback as a macOS-first companion to existing video playback:
 
 - Detect `ffmpeg` and optionally `ffprobe`.
@@ -60,7 +60,7 @@ This gives AT-TUI a useful local prototype without committing to a full terminal
 ## macOS And Ghostty Constraints
 Ghostty helps with image rendering but does not provide audio. Audio must go through OS facilities or an external player. For the current primary environment, `afplay` is a reasonable default once an audio file exists. The implementation should check tool availability at runtime and avoid failing the video overlay when audio tooling is missing.
 
-## Future Implementation Checklist
+## Superseded implementation checklist
 - [ ] Add audio availability state to video media cache entries.
 - [ ] Add tool detection for `ffmpeg`, optional `ffprobe`, and macOS `afplay`.
 - [ ] Add an audio extraction job that consumes the video playlist URL and writes a temp audio file.
