@@ -1,5 +1,12 @@
 # Video Audio Implementation Brief
 
+> **Implementation correction (2026-08-19):** This brief records the original
+> ffmpeg-frame/`afplay` exploration. AI-IMP-003-6 supersedes that approach with
+> a modal handoff to mpv's Kitty video output. mpv now owns HLS decoding,
+> buffering, timing, controls, and synchronized audio; AT-TUI only suspends and
+> restores its terminal session. The remainder is retained as historical design
+> context.
+
 ## Current State
 AT-TUI parses Bluesky `app.bsky.embed.video#view` embeds into `VideoRef` values containing playlist URL, thumbnail URL, alt text, CID, and aspect ratio. The media overlay treats videos as media entries after images. Thumbnail rendering uses the existing image path. Pressing Enter or `p` on a video queues experimental frame decoding through the media cache.
 

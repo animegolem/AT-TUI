@@ -22,10 +22,10 @@ use crate::{
     api::BskyClient,
     config::{AccountSession, Session},
     keymap::{InputContext as KeyContext, KeyAction, action_for_key},
-    media::{MediaCache, PreviewMedia, PreviewVideo, RequestedImageProtocol, preview_media},
+    media::{MediaCache, PreviewMedia, RequestedImageProtocol, preview_media},
     media_scheduler::{
-        CompletionResult, MediaJobId, MediaJobKind, MediaPriority, MediaScheduler,
-        ScheduledMediaJob, retryable_media_error,
+        CompletionResult, MediaJobId, MediaPriority, MediaScheduler, ScheduledMediaJob,
+        retryable_media_error,
     },
     model::{
         FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, NotificationItem,
@@ -35,6 +35,7 @@ use crate::{
     },
     navigation::{NavigationStack, ViewKind, ViewState},
     ui,
+    video_player::MpvPlayer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,16 +144,11 @@ fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
 pub struct MediaOverlayState {
     pub media: Vec<PreviewMedia>,
     pub selected: usize,
-    pub playing: bool,
 }
 
 impl MediaOverlayState {
     pub fn new(media: Vec<PreviewMedia>) -> Self {
-        Self {
-            media,
-            selected: 0,
-            playing: false,
-        }
+        Self { media, selected: 0 }
     }
 
     pub fn selected_media(&self) -> Option<&PreviewMedia> {
@@ -162,13 +158,11 @@ impl MediaOverlayState {
     pub fn next(&mut self) {
         if !self.media.is_empty() {
             self.selected = (self.selected + 1).min(self.media.len() - 1);
-            self.playing = false;
         }
     }
 
     pub fn previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
-        self.playing = false;
     }
 }
 
@@ -256,10 +250,6 @@ enum AppEvent {
     ImageLoaded {
         job: ScheduledMediaJob,
         result: std::result::Result<DynamicImage, String>,
-    },
-    VideoLoaded {
-        job: ScheduledMediaJob,
-        result: std::result::Result<Vec<DynamicImage>, String>,
     },
     FeedLoaded {
         request_id: RequestId,
@@ -445,11 +435,11 @@ pub struct App {
     pending_profile: Option<RequestId>,
     pending_account: Option<RequestId>,
     pending_writes: usize,
+    pending_terminal_video: Option<String>,
     last_refresh: Instant,
     refresh_interval: Duration,
     last_notification_poll: Instant,
     notification_interval: Duration,
-    last_video_frame: Instant,
     spinner_index: usize,
     last_spinner_tick: Instant,
 }
@@ -520,11 +510,11 @@ impl App {
             pending_profile: None,
             pending_account: None,
             pending_writes: 0,
+            pending_terminal_video: None,
             last_refresh: now,
             refresh_interval: Duration::from_secs(60),
             last_notification_poll: now - Duration::from_secs(60),
             notification_interval: Duration::from_secs(60),
-            last_video_frame: now,
             spinner_index: 0,
             last_spinner_tick: now,
         })
@@ -690,7 +680,6 @@ impl App {
                 }
             }
             AppEvent::ImageLoaded { .. }
-            | AppEvent::VideoLoaded { .. }
             | AppEvent::LinkOpened { .. }
             | AppEvent::FeedLoaded { .. }
             | AppEvent::FeedRefreshLoaded { .. }
@@ -719,27 +708,6 @@ impl App {
                         self.media.finish_load(url.clone(), result);
                         if matches!(self.media.state_name(&url), "ready") {
                             self.set_status("Image loaded");
-                        }
-                    }
-                    CompletionResult::Discarded => self.media.cancel_loading(&job.id),
-                    CompletionResult::Retrying => {}
-                }
-                self.pump_media_jobs();
-            }
-            AppEvent::VideoLoaded { job, result } => {
-                let succeeded = result.is_ok();
-                let retryable = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| retryable_media_error(error));
-                match self.media_scheduler.complete(&job, succeeded, retryable) {
-                    CompletionResult::Accepted => {
-                        let playlist_url = job.id.source;
-                        self.media.finish_video_load(playlist_url.clone(), result);
-                        match self.media.video_state_name(&playlist_url) {
-                            "ready" => self.set_status("Video frames ready"),
-                            "failed" => self.set_status("Video decode failed"),
-                            _ => {}
                         }
                     }
                     CompletionResult::Discarded => self.media.cancel_loading(&job.id),
@@ -957,7 +925,7 @@ impl App {
             SwitchFeed(isize),
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
-            PlayVideo(Option<PreviewVideo>),
+            PlayVideo(Option<String>),
             PrioritizeMedia(Option<PreviewMedia>),
             SubmitComposer(Option<ComposerState>),
             DeletePost(String),
@@ -1008,14 +976,11 @@ impl App {
                     effect = Effect::PrioritizeMedia(state.selected_media().cloned());
                 }
                 Some(KeyAction::PlayVideo) => {
-                    let video = match state.selected_media() {
-                        Some(PreviewMedia::Video(video)) => Some(video.clone()),
+                    let playlist_url = match state.selected_media() {
+                        Some(PreviewMedia::Video(video)) => Some(video.playlist_url.clone()),
                         _ => None,
                     };
-                    if video.is_some() {
-                        state.playing = true;
-                    }
-                    effect = Effect::PlayVideo(video);
+                    effect = Effect::PlayVideo(playlist_url);
                 }
                 Some(KeyAction::OpenMediaExternally) => {
                     effect = Effect::OpenUri(match state.selected_media() {
@@ -1087,9 +1052,10 @@ impl App {
                     self.set_status("No external media URL for selected item");
                 }
             }
-            Effect::PlayVideo(video) => {
-                if let Some(video) = video {
-                    self.queue_video_load(&video);
+            Effect::PlayVideo(playlist_url) => {
+                if let Some(playlist_url) = playlist_url {
+                    self.pending_terminal_video = Some(playlist_url);
+                    self.set_status("Opening video in mpv");
                 } else {
                     self.set_status("Selected media is not a video");
                 }
@@ -1287,57 +1253,20 @@ impl App {
         self.pump_media_jobs();
     }
 
-    fn queue_video_load(&mut self, video: &PreviewVideo) {
-        if !self.media.prepare_video_load(&video.playlist_url, true) {
-            match self.media.video_state_name(&video.playlist_url) {
-                "ready" => self.set_status("Video frames ready"),
-                "loading" => self.set_status("Video decode already running"),
-                "failed" => self.set_status("Video decode previously failed"),
-                _ => {}
-            }
-            return;
-        }
-
-        self.media_scheduler.submit(
-            MediaJobId::video(video.playlist_url.clone()),
-            MediaPriority::VisibleMedia,
-            self.media_generation,
-        );
-        self.set_status("Decoding video frames");
-        self.pump_media_jobs();
-    }
-
     fn pump_media_jobs(&mut self) {
         while let Some(job) = self.media_scheduler.take_next() {
             let limits = self.media_scheduler.execution_limits();
-            match job.id.kind {
-                MediaJobKind::Image => {
-                    self.media.mark_loading_url(&job.id.source);
-                    let Some(load) = self.media.load_job_url(&job.id.source) else {
-                        self.media_scheduler.complete(&job, false, false);
-                        self.media.cancel_loading(&job.id);
-                        continue;
-                    };
-                    let context = self.task_context(TaskScope::Global);
-                    self.spawn_event(context, async move {
-                        let (_, result) = load.run_limited(limits).await;
-                        AppEvent::ImageLoaded { job, result }
-                    });
-                }
-                MediaJobKind::Video => {
-                    self.media.mark_video_loading_url(&job.id.source);
-                    let Some(load) = self.media.video_job_url(&job.id.source) else {
-                        self.media_scheduler.complete(&job, false, false);
-                        self.media.cancel_loading(&job.id);
-                        continue;
-                    };
-                    let context = self.task_context(TaskScope::Global);
-                    self.spawn_event(context, async move {
-                        let (_, result) = load.run_limited(limits).await;
-                        AppEvent::VideoLoaded { job, result }
-                    });
-                }
-            }
+            self.media.mark_loading_url(&job.id.source);
+            let Some(load) = self.media.load_job_url(&job.id.source) else {
+                self.media_scheduler.complete(&job, false, false);
+                self.media.cancel_loading(&job.id);
+                continue;
+            };
+            let context = self.task_context(TaskScope::Global);
+            self.spawn_event(context, async move {
+                let (_, result) = load.run_limited(limits).await;
+                AppEvent::ImageLoaded { job, result }
+            });
         }
     }
 
@@ -2601,27 +2530,8 @@ impl App {
         }
     }
 
-    pub fn advance_video_frame(&mut self) -> bool {
-        if self.last_video_frame.elapsed() < Duration::from_millis(125) {
-            return false;
-        }
-        let Some(Overlay::Media(state)) = self.overlay.as_ref() else {
-            return false;
-        };
-        if !state.playing {
-            return false;
-        }
-        let Some(PreviewMedia::Video(video)) = state.selected_media() else {
-            return false;
-        };
-        let playlist_url = video.playlist_url.clone();
-        self.media.advance_video(&playlist_url);
-        self.last_video_frame = Instant::now();
-        true
-    }
-
-    pub fn video_playing(&self) -> bool {
-        matches!(self.overlay.as_ref(), Some(Overlay::Media(state)) if state.playing)
+    fn take_terminal_video(&mut self) -> Option<String> {
+        self.pending_terminal_video.take()
     }
 
     pub fn advance_spinner(&mut self) -> bool {
@@ -2730,11 +2640,19 @@ pub async fn run_tui(
         if app.drain_events()? > 0 {
             dirty = true;
         }
-        app.maybe_refresh_active_feed();
-        app.maybe_poll_notifications();
-        if app.advance_video_frame() {
+        if let Some(playlist_url) = app.take_terminal_video() {
+            match MpvPlayer::discover() {
+                Some(player) => match run_mpv_handoff(&mut terminal, &player, &playlist_url)? {
+                    Ok(status) if status.success() => app.set_status("Video playback ended"),
+                    Ok(status) => app.set_status(format!("mpv exited with {status}")),
+                    Err(error) => app.set_status(format!("mpv playback failed: {error:#}")),
+                },
+                None => app.set_status("mpv not found; install mpv or press u to open externally"),
+            }
             dirty = true;
         }
+        app.maybe_refresh_active_feed();
+        app.maybe_poll_notifications();
         if app.advance_spinner() {
             dirty = true;
         }
@@ -2754,7 +2672,7 @@ pub async fn run_tui(
         if app.should_quit {
             break;
         }
-        let poll_timeout = if app.video_playing() || app.has_pending_tasks() {
+        let poll_timeout = if app.has_pending_tasks() {
             Duration::from_millis(50)
         } else {
             Duration::from_millis(250)
@@ -2781,6 +2699,33 @@ pub async fn run_tui(
     Ok(())
 }
 
+fn run_mpv_handoff(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    player: &MpvPlayer,
+    playlist_url: &str,
+) -> Result<Result<std::process::ExitStatus>> {
+    terminal.show_cursor()?;
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+
+    let playback_result = player.play(playlist_url);
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    terminal.clear()?;
+    terminal.hide_cursor()?;
+
+    Ok(playback_result)
+}
+
 struct TerminalSession;
 
 impl Drop for TerminalSession {
@@ -2796,7 +2741,7 @@ mod tests {
     use super::*;
     use crate::{
         config::SessionStore,
-        media::{PreviewImage, PreviewImageSource},
+        media::{PreviewImage, PreviewImageSource, PreviewVideo},
         model::{ImageRef, LinkSource, NotificationReason},
         ui,
     };
@@ -2807,6 +2752,17 @@ mod tests {
             thumb_url: None,
             alt: None,
             source: PreviewImageSource::Post,
+        }
+    }
+
+    fn video(url: &str) -> PreviewVideo {
+        PreviewVideo {
+            playlist_url: url.into(),
+            thumb_url: None,
+            alt: None,
+            source: PreviewImageSource::Post,
+            cid: None,
+            aspect_ratio: None,
         }
     }
 
@@ -3299,6 +3255,24 @@ mod tests {
             .await
             .unwrap();
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn video_play_command_queues_terminal_handoff() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.overlay = Some(Overlay::Media(MediaOverlayState::new(vec![
+            PreviewMedia::Video(video("https://video.example/playlist.m3u8")),
+        ])));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.take_terminal_video().as_deref(),
+            Some("https://video.example/playlist.m3u8")
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Media(_))));
     }
 
     #[tokio::test]
@@ -3968,11 +3942,11 @@ mod tests {
             pending_profile: None,
             pending_account: None,
             pending_writes: 0,
+            pending_terminal_video: None,
             last_refresh: Instant::now(),
             refresh_interval: Duration::from_secs(60),
             last_notification_poll: Instant::now(),
             notification_interval: Duration::from_secs(60),
-            last_video_frame: Instant::now(),
             spinner_index: 0,
             last_spinner_tick: Instant::now(),
         }

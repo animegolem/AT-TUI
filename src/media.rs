@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -24,7 +23,7 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    media_scheduler::{MediaExecutionLimits, MediaJobId, MediaJobKind},
+    media_scheduler::{MediaExecutionLimits, MediaJobId},
     model::{FeedItem, VideoRef},
 };
 
@@ -87,7 +86,6 @@ impl PreviewImageSource {
 }
 
 const IMAGE_CACHE_CAP: usize = 48;
-const VIDEO_CACHE_CAP: usize = 4;
 const DISK_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DISK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -98,25 +96,14 @@ pub struct MediaCache {
     http: Client,
     picker: Option<Picker>,
     images: HashMap<String, ImageState>,
-    videos: HashMap<String, VideoState>,
     loading_images: HashSet<String>,
-    loading_videos: HashSet<String>,
     session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
     // Access-ordered keys backing the LRU bound; disk cache makes re-loads cheap.
     image_order: VecDeque<String>,
-    video_order: VecDeque<String>,
 }
 
 enum ImageState {
     Ready(Box<StatefulProtocol>),
-    Failed(String),
-}
-
-enum VideoState {
-    Ready {
-        frames: Vec<StatefulProtocol>,
-        frame: usize,
-    },
     Failed(String),
 }
 
@@ -125,13 +112,6 @@ pub struct ImageLoadJob {
     url: String,
     cache_dir: PathBuf,
     http: Client,
-    session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VideoLoadJob {
-    playlist_url: String,
-    cache_dir: PathBuf,
     session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
@@ -179,12 +159,9 @@ impl MediaCache {
             http,
             picker,
             images: HashMap::new(),
-            videos: HashMap::new(),
             loading_images: HashSet::new(),
-            loading_videos: HashSet::new(),
             session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
             image_order: VecDeque::new(),
-            video_order: VecDeque::new(),
         })
     }
 
@@ -195,12 +172,9 @@ impl MediaCache {
             http: Client::new(),
             picker: None,
             images: HashMap::new(),
-            videos: HashMap::new(),
             loading_images: HashSet::new(),
-            loading_videos: HashSet::new(),
             session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
             image_order: VecDeque::new(),
-            video_order: VecDeque::new(),
         }
     }
 
@@ -212,12 +186,9 @@ impl MediaCache {
             http: Client::new(),
             picker: Some(Picker::halfblocks()),
             images: HashMap::new(),
-            videos: HashMap::new(),
             loading_images: HashSet::new(),
-            loading_videos: HashSet::new(),
             session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
             image_order: VecDeque::new(),
-            video_order: VecDeque::new(),
         }
     }
 
@@ -300,50 +271,6 @@ impl MediaCache {
         }
     }
 
-    pub fn should_load_video(&self, video: &PreviewVideo) -> bool {
-        self.enabled
-            && !self.videos.contains_key(&video.playlist_url)
-            && !self.loading_videos.contains(&video.playlist_url)
-    }
-
-    pub fn prepare_video_load(&mut self, playlist_url: &str, retry_failed: bool) -> bool {
-        if !self.enabled || self.loading_videos.contains(playlist_url) {
-            return false;
-        }
-        match self.videos.get(playlist_url) {
-            Some(VideoState::Ready { .. }) => false,
-            Some(VideoState::Failed(_)) if retry_failed => {
-                self.videos.remove(playlist_url);
-                self.video_order.retain(|key| key != playlist_url);
-                true
-            }
-            Some(VideoState::Failed(_)) => false,
-            None => true,
-        }
-    }
-
-    pub fn mark_video_loading(&mut self, video: &PreviewVideo) {
-        self.mark_video_loading_url(&video.playlist_url);
-    }
-
-    pub fn mark_video_loading_url(&mut self, playlist_url: &str) {
-        if self.enabled && !self.videos.contains_key(playlist_url) {
-            self.loading_videos.insert(playlist_url.to_owned());
-        }
-    }
-
-    pub fn video_job(&self, video: &PreviewVideo) -> Option<VideoLoadJob> {
-        self.video_job_url(&video.playlist_url)
-    }
-
-    pub fn video_job_url(&self, playlist_url: &str) -> Option<VideoLoadJob> {
-        self.enabled.then(|| VideoLoadJob {
-            playlist_url: playlist_url.to_owned(),
-            cache_dir: self.cache_dir.join("videos"),
-            session_disk_entries: self.session_disk_entries.clone(),
-        })
-    }
-
     pub fn finish_load(&mut self, url: String, result: std::result::Result<DynamicImage, String>) {
         if !self.enabled {
             return;
@@ -360,42 +287,6 @@ impl MediaCache {
         self.record_image(url, state);
     }
 
-    pub fn finish_video_load(
-        &mut self,
-        playlist_url: String,
-        result: std::result::Result<Vec<DynamicImage>, String>,
-    ) {
-        if !self.enabled {
-            return;
-        }
-        self.loading_videos.remove(&playlist_url);
-
-        let state = match result {
-            Ok(frames) if frames.is_empty() => {
-                VideoState::Failed("Video did not produce terminal frames".into())
-            }
-            Ok(frames) => match self.picker.as_ref() {
-                Some(picker) => VideoState::Ready {
-                    frames: frames
-                        .into_iter()
-                        .map(|frame| picker.new_resize_protocol(frame))
-                        .collect(),
-                    frame: 0,
-                },
-                None => VideoState::Failed("Video rendering disabled".into()),
-            },
-            Err(error) => VideoState::Failed(error),
-        };
-        if self.videos.insert(playlist_url.clone(), state).is_none() {
-            self.video_order.push_back(playlist_url);
-        }
-        while self.video_order.len() > VIDEO_CACHE_CAP {
-            if let Some(evicted) = self.video_order.pop_front() {
-                self.videos.remove(&evicted);
-            }
-        }
-    }
-
     pub fn state_name(&self, url: &str) -> &'static str {
         if self.loading_images.contains(url) {
             return "loading";
@@ -404,25 +295,6 @@ impl MediaCache {
             Some(ImageState::Ready(_)) => "ready",
             Some(ImageState::Failed(_)) => "failed",
             None => "missing",
-        }
-    }
-
-    pub fn video_state_name(&self, playlist_url: &str) -> &'static str {
-        if self.loading_videos.contains(playlist_url) {
-            return "loading";
-        }
-        match self.videos.get(playlist_url) {
-            Some(VideoState::Ready { .. }) => "ready",
-            Some(VideoState::Failed(_)) => "failed",
-            None => "missing",
-        }
-    }
-
-    pub fn advance_video(&mut self, playlist_url: &str) {
-        if let Some(VideoState::Ready { frames, frame }) = self.videos.get_mut(playlist_url)
-            && !frames.is_empty()
-        {
-            *frame = (*frame + 1) % frames.len();
         }
     }
 
@@ -495,61 +367,16 @@ impl MediaCache {
         title: impl Into<String>,
     ) {
         let title = title.into();
-        if !self.enabled {
-            frame.render_widget(
-                Paragraph::new("Video rendering disabled").block(media_block(title)),
-                area,
-            );
-            return;
-        }
-
-        match self.videos.get_mut(&video.playlist_url) {
-            Some(VideoState::Ready {
-                frames,
-                frame: frame_index,
-            }) if !frames.is_empty() => {
-                let block = media_block(title);
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
-                let frame_index = (*frame_index).min(frames.len() - 1);
-                frame.render_stateful_widget(
-                    StatefulImage::default().resize(Resize::Fit(None)),
-                    inner,
-                    &mut frames[frame_index],
-                );
-            }
-            _ if self.loading_videos.contains(&video.playlist_url) => {
-                frame.render_widget(
-                    Paragraph::new("Video decoding with ffmpeg").block(media_block(title)),
-                    area,
-                );
-            }
-            Some(VideoState::Failed(error)) => {
-                frame.render_widget(
-                    Paragraph::new(error.clone()).block(media_block(title)),
-                    area,
-                );
-            }
-            _ => {
-                let message = if video.thumb_url.is_some() {
-                    "Press Enter or p to decode terminal frames"
-                } else {
-                    "No thumbnail available. Press Enter or p to decode terminal frames"
-                };
-                frame.render_widget(Paragraph::new(message).block(media_block(title)), area);
-            }
-        }
+        let message = if video.thumb_url.is_some() {
+            "Press Enter or p for mpv playback\nq returns to AT-TUI · u opens externally"
+        } else {
+            "No thumbnail available\nPress Enter or p for mpv playback · u opens externally"
+        };
+        frame.render_widget(Paragraph::new(message).block(media_block(title)), area);
     }
 
     pub fn cancel_loading(&mut self, id: &MediaJobId) {
-        match id.kind {
-            MediaJobKind::Image => {
-                self.loading_images.remove(&id.source);
-            }
-            MediaJobKind::Video => {
-                self.loading_videos.remove(&id.source);
-            }
-        }
+        self.loading_images.remove(&id.source);
     }
 }
 
@@ -658,89 +485,6 @@ async fn decode_image_bytes(bytes: Vec<u8>, url: String) -> Result<DynamicImage>
             .with_context(|| format!("could not decode image from {url}"))
     })
     .await?
-}
-
-impl VideoLoadJob {
-    pub async fn run(self) -> (String, std::result::Result<Vec<DynamicImage>, String>) {
-        let playlist_url = self.playlist_url.clone();
-        let result = tokio::task::spawn_blocking(move || self.decode_frames())
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-        (playlist_url, result)
-    }
-
-    pub async fn run_limited(
-        self,
-        limits: MediaExecutionLimits,
-    ) -> (String, std::result::Result<Vec<DynamicImage>, String>) {
-        let _decode = limits.decode_permit().await;
-        self.run().await
-    }
-
-    fn decode_frames(self) -> Result<Vec<DynamicImage>> {
-        fs::create_dir_all(&self.cache_dir)
-            .with_context(|| format!("could not create {}", self.cache_dir.display()))?;
-        let frame_dir = self.cache_dir.join(cache_stem(&self.playlist_url));
-        fs::create_dir_all(&frame_dir)
-            .with_context(|| format!("could not create {}", frame_dir.display()))?;
-
-        let output = frame_dir.join("frame_%04d.jpg");
-        let status = Command::new("ffmpeg")
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-y")
-            .arg("-i")
-            .arg(&self.playlist_url)
-            .arg("-vf")
-            .arg("fps=8,scale=640:-2:force_original_aspect_ratio=decrease")
-            .arg("-vframes")
-            .arg("120")
-            .arg(&output)
-            .status()
-            .with_context(|| "could not run ffmpeg; install ffmpeg or open the video externally")?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "ffmpeg could not decode this video; open it externally with u"
-            ));
-        }
-
-        let mut paths = fs::read_dir(&frame_dir)
-            .with_context(|| format!("could not read {}", frame_dir.display()))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jpg"))
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        remember_session_paths(&self.session_disk_entries, paths.iter().cloned());
-        let frames = paths
-            .into_iter()
-            .take(120)
-            .map(|path| {
-                image::open(&path).with_context(|| format!("could not decode {}", path.display()))
-            })
-            .collect();
-        let cache_root = self
-            .cache_dir
-            .parent()
-            .map(Path::to_owned)
-            .unwrap_or_else(|| self.cache_dir.clone());
-        let preserved = self
-            .session_disk_entries
-            .lock()
-            .map(|entries| entries.clone())
-            .unwrap_or_default();
-        cleanup_cache_dir(
-            &cache_root,
-            DISK_CACHE_MAX_AGE,
-            DISK_CACHE_MAX_BYTES,
-            &preserved,
-            SystemTime::now(),
-        );
-        frames
-    }
 }
 
 fn remember_session_paths(

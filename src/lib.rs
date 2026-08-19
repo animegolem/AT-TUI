@@ -7,3 +7,4 @@ pub mod media_scheduler;
 pub mod model;
 pub mod navigation;
 pub mod ui;
+pub mod video_player;

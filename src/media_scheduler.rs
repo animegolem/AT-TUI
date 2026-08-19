@@ -9,7 +9,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MediaJobKind {
     Image,
-    Video,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -22,13 +21,6 @@ impl MediaJobId {
     pub fn image(source: impl Into<String>) -> Self {
         Self {
             kind: MediaJobKind::Image,
-            source: source.into(),
-        }
-    }
-
-    pub fn video(source: impl Into<String>) -> Self {
-        Self {
-            kind: MediaJobKind::Video,
             source: source.into(),
         }
     }

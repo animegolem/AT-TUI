@@ -20,7 +20,7 @@ A Bluesky terminal client prototype.
 - Back navigation with `h`, left arrow, or Esc.
 - Inline quote-post rendering, with `o` to open the quoted post as its own stack level.
 - Spacebar media preview overlay for post and quote-post images/videos.
-- Experimental terminal video frame decoding through `ffmpeg`.
+- Terminal-native HLS video and audio playback through mpv's Kitty output.
 - Link extraction from external cards, rich-text facets, and plain URLs, with `u` to open in the default browser.
 - Like/unlike, repost/unrepost, text posts, replies, and quote posts.
 - Filled/outline heart state for liked posts and highlighted repost state.
@@ -51,6 +51,12 @@ For Ghostty, auto-detection should normally select Kitty graphics. You can force
 ```sh
 cargo run -- --image-protocol kitty
 ```
+
+Video playback is optional and uses mpv's Kitty output. Install mpv, open a
+video with Space, then press Enter or `p`; mpv owns playback until it exits and
+`q` returns to AT-TUI. `u` remains available to open the playlist externally.
+AT-TUI also discovers Homebrew's standard mpv prefix when the formula is not
+linked into `PATH`. Set `AT_TUI_MPV` to an explicit executable path if needed.
 
 Disable image rendering entirely:
 
@@ -150,4 +156,4 @@ Saved feeds are read from `savedFeedsPrefV2` and legacy `savedFeedsPref`. Feed-g
 
 ## Scope
 
-OAuth, image/video upload, notifications, DMs, moderation controls, list feeds, and article previews are not implemented yet. Terminal video playback is experimental and requires `ffmpeg`.
+OAuth, image/video upload, notifications, DMs, moderation controls, list feeds, and article previews are not implemented yet. Terminal video playback is experimental and requires mpv plus a terminal that supports Kitty graphics.

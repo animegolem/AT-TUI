@@ -354,9 +354,7 @@ fn render_media_overlay(
                 video.source.label(),
                 video.alt.as_deref(),
             );
-            if app.media.video_state_name(&video.playlist_url) == "missing"
-                && let Some(thumb_url) = &video.thumb_url
-            {
+            if let Some(thumb_url) = &video.thumb_url {
                 let image = PreviewImage {
                     url: thumb_url.clone(),
                     thumb_url: None,
