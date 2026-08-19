@@ -18,6 +18,7 @@ pub struct ViewState {
     pub items: Vec<ViewItem>,
     pub profile: Option<ProfileSummary>,
     pub selected: usize,
+    /// Zero-based rendered line at the top of the view buffer.
     pub scroll: usize,
     pub cursor: Option<String>,
     pub loading: bool,
@@ -104,8 +105,8 @@ impl ViewState {
             return false;
         };
         self.selected = index;
-        if self.scroll > self.selected {
-            self.scroll = self.selected;
+        if self.selected == 0 {
+            self.scroll = 0;
         }
         true
     }
@@ -127,7 +128,7 @@ impl ViewState {
             .unwrap_or(0);
 
         self.selected = selected.min(self.items.len().saturating_sub(1));
-        self.scroll = self.scroll.min(self.selected);
+        self.scroll = 0;
     }
 
     pub fn move_down(&mut self) {
@@ -135,12 +136,13 @@ impl ViewState {
             return;
         }
         self.selected = (self.selected + 1).min(self.items.len() - 1);
-        self.ensure_cursor_visible();
     }
 
     pub fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
-        self.ensure_cursor_visible();
+        if self.selected == 0 {
+            self.scroll = 0;
+        }
     }
 
     pub fn move_by(&mut self, delta: isize) {
@@ -149,7 +151,9 @@ impl ViewState {
         }
         let last = (self.items.len() - 1) as isize;
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
-        self.ensure_cursor_visible();
+        if self.selected == 0 {
+            self.scroll = 0;
+        }
     }
 
     pub fn jump_top(&mut self) {
@@ -162,7 +166,6 @@ impl ViewState {
             return;
         }
         self.selected = self.items.len() - 1;
-        self.ensure_cursor_visible();
     }
 
     pub fn search_next(&mut self, query: &str) -> bool {
@@ -176,7 +179,9 @@ impl ViewState {
         for index in start..self.items.len() {
             if item_matches(&self.items[index], &query) {
                 self.selected = index;
-                self.ensure_cursor_visible();
+                if self.selected == 0 {
+                    self.scroll = 0;
+                }
                 return true;
             }
         }
@@ -184,30 +189,14 @@ impl ViewState {
         for index in 0..=self.selected.min(self.items.len() - 1) {
             if item_matches(&self.items[index], &query) {
                 self.selected = index;
-                self.ensure_cursor_visible();
+                if self.selected == 0 {
+                    self.scroll = 0;
+                }
                 return true;
             }
         }
 
         false
-    }
-
-    pub fn ensure_scroll_for_height(&mut self, height: usize) {
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        }
-        if height == 0 {
-            return;
-        }
-        while self.selected.saturating_sub(self.scroll) >= height {
-            self.scroll += 1;
-        }
-    }
-
-    fn ensure_cursor_visible(&mut self) {
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        }
     }
 }
 
@@ -276,7 +265,7 @@ impl NavigationStack {
             if view.items.len() != before {
                 view.layout_cache.clear();
                 view.selected = view.selected.min(view.items.len().saturating_sub(1));
-                view.scroll = view.scroll.min(view.selected);
+                view.scroll = 0;
             }
         }
     }

@@ -7,13 +7,13 @@ tags:
   - ui
   - navigation
   - scrolling
-kanban_status: in-progress
+kanban_status: completed
 depends_on:
   - AI-IMP-003-4
 parent_epic: [[AI-EPIC-003-trustworthy-runtime-interaction-foundation]]
 confidence_score: 0.94
 date_created: 2026-08-19
-date_completed:
+date_completed: 2026-08-19
 ---
 
 # AI-IMP-003-8-unified-view-buffer
@@ -37,14 +37,14 @@ Keep post selection and pagination indexed by `ViewItem`. Change `ViewState.scro
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Treat `ViewState.scroll` as a rendered-line offset while keeping `selected` item-based.
-- [ ] Render the profile summary as leading buffer content instead of pinned content.
-- [ ] Render persistent view errors inside the same leading buffer.
-- [ ] Scroll wrapped profile lines off incrementally as selection moves down.
-- [ ] Restore leading content when navigation returns to the top.
-- [ ] Preserve thread selection, search, pagination, stack restoration, and pending-item behavior.
-- [ ] Add tests for profile scrolling, top restoration, narrow wrapped headers, and error placement.
-- [ ] Run the full validation gate.
+- [x] Treat `ViewState.scroll` as a rendered-line offset while keeping `selected` item-based.
+- [x] Render the profile summary as leading buffer content instead of pinned content.
+- [x] Render persistent view errors inside the same leading buffer.
+- [x] Scroll wrapped profile lines off incrementally as selection moves down.
+- [x] Restore leading content when navigation returns to the top.
+- [x] Preserve thread selection, search, pagination, stack restoration, and pending-item behavior.
+- [x] Add tests for profile scrolling, top restoration, narrow wrapped headers, and error placement.
+- [x] Run the full validation gate.
 
 ### Acceptance Criteria
 **Scenario:** A profile contains enough posts to exceed the viewport.
@@ -69,3 +69,17 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
+`ViewState.scroll` now represents a rendered-line offset. Selection remains an
+item index, so post actions and pagination keep their existing identity model.
+The renderer walks cached line slices and clones only visible lines; it does
+not rebuild the complete document on each frame.
+
+The full gate passed with 146 library tests, one CLI integration test,
+formatting clean, Clippy warnings denied, an optimized release build, and no
+whitespace errors. A saved-account PTY smoke test opened a live profile,
+confirmed that moving from the first to the second post scrolled the profile
+summary off, confirmed that moving back restored the summary, and exited
+cleanly.
+
+`src/app.rs` required no edit. Its only scroll-dependent top check already
+treats offset zero as the top of the timeline under the new line semantics.

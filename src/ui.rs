@@ -44,21 +44,8 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let block = rounded_block().title(title);
     let inner_width = area.width.saturating_sub(4).max(12) as usize;
     let available_lines = area.height.saturating_sub(2) as usize;
-    let profile_lines = view
-        .profile
-        .as_ref()
-        .map(|profile| render_profile_header_lines(profile, inner_width, &active_did))
-        .unwrap_or_default();
-    let list_available = available_lines.saturating_sub(profile_lines.len());
-    let mut lines = profile_lines;
-    lines.extend(visible_feed_lines(view, inner_width, list_available));
-
-    if let Some(error) = &view.error {
-        lines.push(Line::from(vec![Span::styled(
-            format!("Error: {error}"),
-            Style::default().fg(Color::Red),
-        )]));
-    }
+    let leading_lines = render_view_leading_lines(view, inner_width, &active_did);
+    let lines = visible_feed_lines(view, inner_width, available_lines, &leading_lines);
 
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -67,35 +54,54 @@ fn visible_feed_lines(
     view: &mut ViewState,
     width: usize,
     available_lines: usize,
+    leading_lines: &[Line<'static>],
 ) -> Vec<Line<'static>> {
     ensure_layout_cache(view, width);
-    ensure_selected_rendered(view, width, available_lines);
-
-    if view.items.is_empty() {
-        return vec![Line::from(empty_view_text(&view.kind))];
-    }
+    ensure_selected_rendered(view, available_lines, leading_lines.len());
 
     let mut lines = Vec::new();
-    let mut used = 0usize;
-    for index in view.scroll..view.items.len() {
-        if used >= available_lines {
+    let mut top_offset = view.scroll;
+    let mut remaining = available_lines;
+    append_visible_lines(&mut lines, leading_lines, &mut top_offset, &mut remaining);
+
+    if view.items.is_empty() {
+        let empty = [Line::from(empty_view_text(&view.kind))];
+        append_visible_lines(&mut lines, &empty, &mut top_offset, &mut remaining);
+        return lines;
+    }
+
+    for index in 0..view.items.len() {
+        if remaining == 0 {
             break;
         }
 
         let selected = index == view.selected;
         let item_lines = cached_item_lines(view, index, selected);
-
-        if used + item_lines.len() > available_lines {
-            let remaining = available_lines.saturating_sub(used);
-            lines.extend(item_lines.into_iter().take(remaining));
-            break;
-        }
-
-        used += item_lines.len();
-        lines.extend(item_lines);
+        append_visible_lines(&mut lines, item_lines, &mut top_offset, &mut remaining);
     }
 
     lines
+}
+
+fn append_visible_lines(
+    output: &mut Vec<Line<'static>>,
+    source: &[Line<'static>],
+    top_offset: &mut usize,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 {
+        return;
+    }
+    if *top_offset >= source.len() {
+        *top_offset -= source.len();
+        return;
+    }
+
+    let start = *top_offset;
+    *top_offset = 0;
+    let count = source.len().saturating_sub(start).min(*remaining);
+    output.extend(source[start..start + count].iter().cloned());
+    *remaining -= count;
 }
 
 fn ensure_layout_cache(view: &mut ViewState, width: usize) {
@@ -117,18 +123,18 @@ fn ensure_layout_cache(view: &mut ViewState, width: usize) {
     view.layout_cache.builds += 1;
 }
 
-fn cached_item_lines(view: &ViewState, index: usize, selected: bool) -> Vec<Line<'static>> {
+fn cached_item_lines(view: &ViewState, index: usize, selected: bool) -> &[Line<'static>] {
     let Some(item) = view.layout_cache.items.get(index) else {
-        return Vec::new();
+        return &[];
     };
     if selected {
-        item.selected.clone()
+        &item.selected
     } else {
-        item.unselected.clone()
+        &item.unselected
     }
 }
 
-fn ensure_selected_rendered(view: &mut ViewState, width: usize, available_lines: usize) {
+fn ensure_selected_rendered(view: &mut ViewState, available_lines: usize, leading_height: usize) {
     if view.items.is_empty() {
         view.selected = 0;
         view.scroll = 0;
@@ -137,36 +143,58 @@ fn ensure_selected_rendered(view: &mut ViewState, width: usize, available_lines:
 
     let last_index = view.items.len() - 1;
     view.selected = view.selected.min(last_index);
-    view.scroll = view.scroll.min(last_index);
-
-    if view.selected < view.scroll {
-        view.scroll = view.selected;
-        return;
-    }
 
     if available_lines == 0 {
         return;
     }
 
-    while view.scroll < view.selected
-        && rendered_height(view, view.scroll, view.selected, width) > available_lines
-    {
-        view.scroll += 1;
+    // A newly opened profile starts at the beginning of its document even when
+    // the leading summary leaves only part of the first post visible.
+    if view.selected == 0 && view.scroll == 0 && leading_height > 0 {
+        return;
+    }
+
+    let selected_start = leading_height
+        + view.layout_cache.items[..view.selected]
+            .iter()
+            .map(|item| item.unselected.len())
+            .sum::<usize>();
+    let selected_height = view.layout_cache.items[view.selected].selected.len();
+    let selected_end = selected_start + selected_height;
+
+    if selected_start < view.scroll {
+        view.scroll = if view.selected == 0 {
+            0
+        } else {
+            selected_start
+        };
+    } else if selected_end > view.scroll.saturating_add(available_lines) {
+        view.scroll = if selected_height > available_lines {
+            selected_start
+        } else {
+            selected_end.saturating_sub(available_lines)
+        };
     }
 }
 
-fn rendered_height(view: &ViewState, start: usize, end: usize, width: usize) -> usize {
-    if view.layout_cache.width != Some(width) {
-        return view.items[start..=end]
-            .iter()
-            .map(|item| render_view_item_lines(item, false, width).len())
-            .sum();
+fn render_view_leading_lines(
+    view: &ViewState,
+    width: usize,
+    active_did: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = view
+        .profile
+        .as_ref()
+        .map(|profile| render_profile_header_lines(profile, width, active_did))
+        .unwrap_or_default();
+    if let Some(error) = &view.error {
+        lines.push(Line::from(vec![Span::styled(
+            format!("Error: {error}"),
+            Style::default().fg(Color::Red),
+        )]));
+        lines.push(Line::from(""));
     }
-
-    view.layout_cache.items[start..=end]
-        .iter()
-        .map(|item| item.unselected.len())
-        .sum()
+    lines
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1053,6 +1081,34 @@ mod tests {
         }
     }
 
+    fn profile_with_description(description: Option<&str>) -> ProfileSummary {
+        ProfileSummary {
+            did: "did:plc:alice".into(),
+            handle: "alice.test".into(),
+            display_name: "Alice".into(),
+            description: description.map(str::to_owned),
+            avatar_url: None,
+            banner_url: None,
+            viewer_following: None,
+            followers_count: 1,
+            follows_count: 2,
+            posts_count: 3,
+        }
+    }
+
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn renders_unicode_engagement_summary() {
         assert_eq!(engagement_summary(&item()), "↩ 2  ⟳ 3  ♡ 5  ❞ 7");
@@ -1296,10 +1352,16 @@ mod tests {
         );
         view.selected = 3;
         view.scroll = 0;
+        ensure_layout_cache(&mut view, 80);
+        let selected_end = view.layout_cache.items[..=view.selected]
+            .iter()
+            .map(|item| item.unselected.len())
+            .sum::<usize>();
 
-        ensure_selected_rendered(&mut view, 80, 12);
+        ensure_selected_rendered(&mut view, 12, 0);
 
-        assert_eq!(view.scroll, 2);
+        assert!(view.scroll > 0);
+        assert!(selected_end <= view.scroll + 12);
     }
 
     #[test]
@@ -1314,10 +1376,12 @@ mod tests {
         );
         view.selected = 1;
         view.scroll = 0;
+        ensure_layout_cache(&mut view, 80);
+        let selected_start = view.layout_cache.items[0].unselected.len();
 
-        ensure_selected_rendered(&mut view, 80, 8);
+        ensure_selected_rendered(&mut view, 8, 0);
 
-        assert_eq!(view.scroll, 1);
+        assert_eq!(view.scroll, selected_start);
     }
 
     #[test]
@@ -1333,11 +1397,13 @@ mod tests {
             ],
         );
         view.selected = 1;
-        view.scroll = 3;
+        view.scroll = usize::MAX;
+        ensure_layout_cache(&mut view, 80);
+        let selected_start = view.layout_cache.items[0].unselected.len();
 
-        ensure_selected_rendered(&mut view, 80, 12);
+        ensure_selected_rendered(&mut view, 12, 0);
 
-        assert_eq!(view.scroll, 1);
+        assert_eq!(view.scroll, selected_start);
     }
 
     #[test]
@@ -1351,7 +1417,7 @@ mod tests {
             ],
         );
 
-        let lines = visible_feed_lines(&mut view, 80, 6);
+        let lines = visible_feed_lines(&mut view, 80, 6, &[]);
 
         assert_eq!(lines.len(), 6);
     }
@@ -1364,14 +1430,74 @@ mod tests {
             vec![item_with_text("one"), item_with_text("two")],
         );
 
-        let _ = visible_feed_lines(&mut view, 80, 10);
+        let _ = visible_feed_lines(&mut view, 80, 10, &[]);
         let first_builds = view.layout_cache.builds;
-        let _ = visible_feed_lines(&mut view, 80, 10);
+        let _ = visible_feed_lines(&mut view, 80, 10, &[]);
 
         assert_eq!(first_builds, 1);
         assert_eq!(view.layout_cache.builds, first_builds);
 
-        let _ = visible_feed_lines(&mut view, 40, 10);
+        let _ = visible_feed_lines(&mut view, 40, 10, &[]);
         assert_eq!(view.layout_cache.builds, first_builds + 1);
+    }
+
+    #[test]
+    fn profile_leading_lines_scroll_incrementally_and_return_at_top() {
+        let mut view = ViewState::new(
+            "Profile @alice.test",
+            ViewKind::Profile {
+                actor: "did:plc:alice".into(),
+            },
+            vec![
+                item_with_text("one"),
+                item_with_text("two"),
+                item_with_text("three"),
+            ],
+        );
+        view.set_profile(profile_with_description(Some(
+            "a profile description that wraps across several narrow lines",
+        )));
+        let leading = render_view_leading_lines(&view, 24, "did:plc:viewer");
+        assert!(leading.len() > 4, "narrow profile text should wrap");
+
+        ensure_layout_cache(&mut view, 24);
+        view.selected = 2;
+        let selected_end = leading.len()
+            + view.layout_cache.items[..view.selected]
+                .iter()
+                .map(|item| item.unselected.len())
+                .sum::<usize>()
+            + view.layout_cache.items[view.selected].selected.len();
+        let available = selected_end - 1;
+        let lines = visible_feed_lines(&mut view, 24, available, &leading);
+
+        assert_eq!(view.scroll, 1);
+        let text = lines_text(&lines);
+        assert_ne!(lines_text(&lines[..1]), "Alice @alice.test");
+        assert!(text.contains("followers"));
+
+        view.move_by(-10);
+        let lines = visible_feed_lines(&mut view, 24, available, &leading);
+        assert_eq!(view.scroll, 0);
+        assert!(lines_text(&lines).contains("Alice @alice.test"));
+    }
+
+    #[test]
+    fn persistent_error_is_leading_buffer_content_and_scrolls_away() {
+        let mut view = ViewState::new(
+            "Timeline",
+            ViewKind::Timeline,
+            vec![item_with_text("one"), item_with_text("two")],
+        );
+        view.error = Some("network unavailable".into());
+        let leading = render_view_leading_lines(&view, 40, "did:plc:viewer");
+
+        let lines = visible_feed_lines(&mut view, 40, 6, &leading);
+        assert!(lines_text(&lines).starts_with("Error: network unavailable"));
+
+        view.selected = 1;
+        let lines = visible_feed_lines(&mut view, 40, 4, &leading);
+        assert!(view.scroll >= leading.len());
+        assert!(!lines_text(&lines).contains("Error: network unavailable"));
     }
 }

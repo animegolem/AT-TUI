@@ -6,11 +6,11 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 1 | 3 |
+| In Progress | 1 | 2 |
 | Planned | 0 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 2 | 14 |
+| Completed | 2 | 15 |
 | **Total** | **3** | **18** |
 
 ## In Progress
@@ -26,7 +26,7 @@
 - [[AI-IMP-003-5-prioritized-media-scheduler|IMP-003-5]] Speculative media work is unbounded and cannot yield to visible work — in-progress
 - [[AI-IMP-003-6-progressive-video-events|IMP-003-6]] Frame extraction is not real video playback — in-progress
 - [[AI-IMP-003-7-runtime-diagnostics|IMP-003-7]] Runtime failures are visible only as transient symptoms — planned
-- [[AI-IMP-003-8-unified-view-buffer|IMP-003-8]] Profile content is pinned outside the scroll buffer — in-progress
+- [[AI-IMP-003-8-unified-view-buffer|IMP-003-8]] Profile content is pinned outside the scroll buffer — completed
 
 ---
 
@@ -39,7 +39,7 @@ Generated from tracked files; binary assets excluded.
 - Cargo.lock (4146 LOC)
 - src/app.rs (4002 LOC)
 - src/model.rs (1976 LOC)
-- src/ui.rs (1377 LOC)
+- src/ui.rs (1503 LOC)
 - src/api.rs (1228 LOC)
 - src/media.rs (1009 LOC)
 - src/keymap.rs (932 LOC)
@@ -48,14 +48,14 @@ Generated from tracked files; binary assets excluded.
 ### > 300 LOC
 
 - RAG/scripts/generate-index.sh (575 LOC)
-- src/navigation.rs (503 LOC)
+- src/navigation.rs (492 LOC)
 - src/media_scheduler.rs (417 LOC)
 
 ---
 
 ## Completed
 <details>
-<summary>2 EPICs, 14 IMPs completed</summary>
+<summary>2 EPICs, 15 IMPs completed</summary>
 
 - [[AI-EPIC-001-at-tui-public-readiness-polish|EPIC-001]] At tui public readiness polish — 2026-08-19
   - [[AI-IMP-001-1-cosmetic-polish|IMP-001-1]] Compact Statusline And Timeline Readability — completed
