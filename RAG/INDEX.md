@@ -6,12 +6,12 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 1 | 2 |
+| In Progress | 2 | 3 |
 | Planned | 0 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
 | Completed | 2 | 15 |
-| **Total** | **3** | **18** |
+| **Total** | **4** | **19** |
 
 ## In Progress
 
@@ -27,6 +27,14 @@
 - [[AI-IMP-003-6-progressive-video-events|IMP-003-6]] Frame extraction is not real video playback — in-progress
 - [[AI-IMP-003-7-runtime-diagnostics|IMP-003-7]] Runtime failures are visible only as transient symptoms — planned
 - [[AI-IMP-003-8-unified-view-buffer|IMP-003-8]] Profile content is pinned outside the scroll buffer — completed
+
+---
+
+### [[AI-EPIC-004-tagged-1-0-release-readiness|EPIC-004: Tagged 1 0 release readiness]]
+> AT-TUI is approaching a stable public release, but its quality gates run only
+
+**IMPs:**
+- [[AI-IMP-004-1-ci-baseline|IMP-004-1]] Repository changes have no automated quality gate — in-progress
 
 ---
 
