@@ -52,15 +52,15 @@ Before marking an item complete on the checklist MUST **stop** and **think**. Ha
 </CRITICAL_RULE>
 
 - [ ] Trigger CI for pull requests and pushes to `main`.
-- [ ] Restrict the workflow token to read-only repository contents.
-- [ ] Cancel superseded runs for the same workflow and Git reference.
-- [ ] Install the locally proven Rust `1.90.0` toolchain explicitly.
-- [ ] Run formatting and Clippy with warnings denied on Ubuntu.
-- [ ] Build documentation and verify Cargo package assembly on Ubuntu.
+- [x] Restrict the workflow token to read-only repository contents.
+- [x] Cancel superseded runs for the same workflow and Git reference.
+- [x] Install the locally proven Rust `1.90.0` toolchain explicitly.
+- [x] Run formatting and Clippy with warnings denied on Ubuntu.
+- [x] Build documentation and verify Cargo package assembly on Ubuntu.
 - [ ] Run all test targets with locked dependencies on Ubuntu and macOS.
 - [ ] Build the optimized binary with locked dependencies on Ubuntu and macOS.
-- [ ] Run the full workflow command set locally where the host permits it.
-- [ ] Regenerate the RAG index and record environmental limits accurately.
+- [x] Run the full workflow command set locally where the host permits it.
+- [x] Regenerate the RAG index and record environmental limits accurately.
 
 ### Acceptance Criteria
 **Scenario:** A contributor opens or updates a pull request.
@@ -85,4 +85,15 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
-Implementation is in progress.
+The workflow passed `actionlint` 1.7.12. On the local macOS host, Rust 1.90.0
+passed formatting, Clippy with warnings denied, documentation with rustdoc
+warnings denied, all 146 library tests, the CLI integration test, the
+optimized build, and `git diff --check`.
+
+`cargo package --locked` assembled and verified 54 files, including the public
+`RAG/` records. Cargo emitted the known warning that package metadata is not
+yet defined; metadata policy remains intentionally deferred to the next epic
+phase and does not fail package verification.
+
+No GitHub event or Ubuntu runner has evaluated the workflow yet. The ticket
+remains in progress until the branch is pushed and both hosted matrix jobs pass.
