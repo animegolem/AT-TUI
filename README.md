@@ -4,6 +4,12 @@ AT-TUI is a keyboard-first Bluesky client for the terminal. It provides a
 single-column interface for reading feeds, browsing threads and profiles, and
 interacting with posts.
 
+## Project status
+
+AT-TUI is in beta and is working toward a tagged `1.0.0` release. Core
+workflows are implemented, but long-running session and terminal media
+validation remain in progress.
+
 ## Features
 
 - Read and paginate the home timeline, saved feeds, author feeds, profiles,
