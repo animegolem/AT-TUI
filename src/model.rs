@@ -335,19 +335,6 @@ impl HomeFeedPrefs {
             .unwrap_or_default()
     }
 
-    pub fn status_label(&self) -> String {
-        let replies = if self.hide_replies {
-            "off"
-        } else if self.hide_replies_by_unfollowed || self.hide_replies_by_like_count.is_some() {
-            "filtered"
-        } else {
-            "on"
-        };
-        let reposts = if self.hide_reposts { "off" } else { "on" };
-        let quotes = if self.hide_quote_posts { "off" } else { "on" };
-        format!("Following · replies:{replies} reposts:{reposts} quotes:{quotes}")
-    }
-
     fn from_feed_view_pref(pref: &Value) -> Self {
         Self {
             hide_replies: bool_field(pref, "hideReplies").unwrap_or(false),

@@ -37,10 +37,6 @@ impl MpvPlayer {
             .status()
             .with_context(|| format!("could not start {}", self.executable.display()))
     }
-
-    pub fn executable(&self) -> &std::path::Path {
-        &self.executable
-    }
 }
 
 fn find_mpv_on_path() -> Option<PathBuf> {

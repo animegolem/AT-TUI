@@ -65,15 +65,6 @@ pub enum PreviewMedia {
     Video(PreviewVideo),
 }
 
-impl PreviewMedia {
-    pub fn source_label(&self) -> &'static str {
-        match self {
-            Self::Image(image) => image.source.label(),
-            Self::Video(video) => video.source.label(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewImageSource {
     Post,
@@ -213,22 +204,6 @@ impl MediaCache {
             Some(ProtocolType::Halfblocks) => "halfblocks",
             None => "off",
         }
-    }
-
-    pub fn should_load(&self, image: &PreviewImage) -> bool {
-        self.should_load_url(&image.url)
-    }
-
-    pub fn mark_loading(&mut self, image: &PreviewImage) {
-        self.mark_loading_url(&image.url);
-    }
-
-    pub fn load_job(&self, image: &PreviewImage) -> Option<ImageLoadJob> {
-        self.load_job_url(&image.url)
-    }
-
-    pub fn should_load_url(&self, url: &str) -> bool {
-        self.enabled && !self.images.contains_key(url) && !self.loading_images.contains(url)
     }
 
     pub fn prepare_image_load(&mut self, url: &str, retry_failed: bool) -> bool {
@@ -396,16 +371,6 @@ impl MediaCache {
 }
 
 impl ImageLoadJob {
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    pub async fn run(self) -> (String, std::result::Result<DynamicImage, String>) {
-        let url = self.url.clone();
-        let result = self.load().await.map_err(|error| error.to_string());
-        (url, result)
-    }
-
     pub async fn run_limited(
         self,
         limits: MediaExecutionLimits,
@@ -439,32 +404,9 @@ impl ImageLoadJob {
                 .await
                 .with_context(|| format!("could not read image bytes for {}", self.url))?
         };
-        self.disk_cache.publish(path, bytes.to_vec()).await;
+        self.disk_cache.publish(path, bytes.clone()).await;
         let _decode = limits.decode_permit().await;
-        decode_image_bytes(bytes.to_vec(), self.url).await
-    }
-
-    async fn load(self) -> Result<DynamicImage> {
-        let path = self.cache_dir.join(cache_key(&self.url));
-        if let Some(image) = read_cached_image(&path).await {
-            return Ok(image);
-        }
-
-        let bytes = self
-            .http
-            .get(&self.url)
-            .send()
-            .await
-            .with_context(|| format!("could not download {}", self.url))?
-            .error_for_status()
-            .with_context(|| format!("image request failed for {}", self.url))?
-            .bytes()
-            .await
-            .with_context(|| format!("could not read image bytes for {}", self.url))?;
-
-        // Best effort: a failed cache write should not fail the render.
-        self.disk_cache.publish(path, bytes.to_vec()).await;
-        decode_image_bytes(bytes.to_vec(), self.url).await
+        decode_image_bytes(bytes, self.url).await
     }
 }
 
@@ -486,9 +428,12 @@ async fn read_cached_image(path: &Path) -> Option<DynamicImage> {
     .flatten()
 }
 
-async fn decode_image_bytes(bytes: Vec<u8>, url: String) -> Result<DynamicImage> {
+async fn decode_image_bytes(
+    bytes: impl AsRef<[u8]> + Send + 'static,
+    url: String,
+) -> Result<DynamicImage> {
     tokio::task::spawn_blocking(move || {
-        image::load_from_memory(&bytes)
+        image::load_from_memory(bytes.as_ref())
             .with_context(|| format!("could not decode image from {url}"))
     })
     .await?
@@ -522,12 +467,12 @@ impl DiskCache {
         })
     }
 
-    async fn publish(self: &Arc<Self>, path: PathBuf, bytes: Vec<u8>) {
+    async fn publish(self: &Arc<Self>, path: PathBuf, bytes: impl AsRef<[u8]> + Send + 'static) {
         let cache = self.clone();
         // Await only the bounded job's publication, never directory maintenance.
         // Byte ownership makes concurrent eviction harmless to image decoding.
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = publish_cache_bytes(&cache.directory, &path, &bytes);
+            let _ = publish_cache_bytes(&cache.directory, &path, bytes.as_ref());
             // Even a failed write may leave cleanup work, so request a pass.
             cache.request_maintenance();
         })
@@ -962,7 +907,8 @@ mod tests {
             ),
         };
 
-        let (returned_url, result) = job.run().await;
+        let limits = crate::media_scheduler::MediaScheduler::default().execution_limits();
+        let (returned_url, result) = job.run_limited(limits).await;
         assert_eq!(returned_url, url);
         assert!(result.is_ok());
     }
@@ -1390,7 +1336,7 @@ mod tests {
 
         assert_eq!(cache.state_name(&image.url), "missing");
         cache.enabled = true;
-        cache.mark_loading(&image);
+        cache.mark_loading_url(&image.url);
         assert_eq!(cache.state_name(&image.url), "loading");
         cache.finish_load(image.url.clone(), Err("network failed".into()));
         assert_eq!(cache.state_name(&image.url), "failed");

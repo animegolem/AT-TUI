@@ -135,17 +135,6 @@ impl BskyClient {
         }
     }
 
-    pub async fn login(
-        service: &str,
-        identifier: &str,
-        app_password: &str,
-        store: &SessionStore,
-    ) -> Result<Session> {
-        let session = Self::login_session(service, identifier, app_password).await?;
-        store.save(&session)?;
-        Ok(session)
-    }
-
     pub async fn login_session(
         service: &str,
         identifier: &str,

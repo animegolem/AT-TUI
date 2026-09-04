@@ -309,14 +309,6 @@ impl NavigationStack {
         self.views.len()
     }
 
-    pub fn breadcrumb(&self) -> String {
-        self.views
-            .iter()
-            .map(|view| view.title.as_str())
-            .collect::<Vec<_>>()
-            .join(" / ")
-    }
-
     pub fn retain_items(&mut self, mut keep: impl FnMut(&ViewItem) -> bool) {
         for view in &mut self.views {
             let before = view.items.len();
