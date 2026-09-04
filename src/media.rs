@@ -1,8 +1,12 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -89,6 +93,10 @@ const IMAGE_CACHE_CAP: usize = 48;
 const DISK_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DISK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CACHE_MAINTENANCE_DELAY: Duration = Duration::from_millis(50);
+const STAGING_PREFIX: &str = ".at-tui-stage-";
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_STAGING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 pub struct MediaCache {
     enabled: bool,
@@ -97,7 +105,7 @@ pub struct MediaCache {
     picker: Option<Picker>,
     images: HashMap<String, ImageState>,
     loading_images: HashSet<String>,
-    session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
+    disk_cache: Arc<DiskCache>,
     // Access-ordered keys backing the LRU bound; disk cache makes re-loads cheap.
     image_order: VecDeque<String>,
 }
@@ -112,23 +120,26 @@ pub struct ImageLoadJob {
     url: String,
     cache_dir: PathBuf,
     http: Client,
-    session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>,
+    disk_cache: Arc<DiskCache>,
 }
 
 impl MediaCache {
     pub fn new(enabled: bool, requested: RequestedImageProtocol) -> Result<Self> {
         let dirs = ProjectDirs::from("dev", "haiti-plan", "at-tui")
             .context("could not resolve cache directory")?;
-        let cache_dir = dirs.cache_dir().join("images");
-        fs::create_dir_all(&cache_dir)
-            .with_context(|| format!("could not create {}", cache_dir.display()))?;
-        cleanup_cache_dir(
-            &cache_dir,
-            DISK_CACHE_MAX_AGE,
-            DISK_CACHE_MAX_BYTES,
-            &HashSet::new(),
-            SystemTime::now(),
-        );
+        Self::with_cache_dir(enabled, requested, dirs.cache_dir().join("images"))
+    }
+
+    fn with_cache_dir(
+        enabled: bool,
+        requested: RequestedImageProtocol,
+        cache_dir: PathBuf,
+    ) -> Result<Self> {
+        let disk_cache =
+            DiskCache::new(cache_dir.clone(), DISK_CACHE_MAX_AGE, DISK_CACHE_MAX_BYTES);
+        // Construction is synchronous and is also usable without a Tokio
+        // runtime. Missing/unwritable cache directories never disable display.
+        disk_cache.request_maintenance();
         let http = Client::builder()
             .timeout(MEDIA_REQUEST_TIMEOUT)
             .build()
@@ -160,7 +171,7 @@ impl MediaCache {
             picker,
             images: HashMap::new(),
             loading_images: HashSet::new(),
-            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
+            disk_cache,
             image_order: VecDeque::new(),
         })
     }
@@ -173,13 +184,15 @@ impl MediaCache {
             picker: None,
             images: HashMap::new(),
             loading_images: HashSet::new(),
-            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
+            disk_cache: DiskCache::new(PathBuf::new(), DISK_CACHE_MAX_AGE, DISK_CACHE_MAX_BYTES),
             image_order: VecDeque::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn test_enabled(cache_dir: PathBuf) -> Self {
+        let disk_cache =
+            DiskCache::new(cache_dir.clone(), DISK_CACHE_MAX_AGE, DISK_CACHE_MAX_BYTES);
         Self {
             enabled: true,
             cache_dir,
@@ -187,7 +200,7 @@ impl MediaCache {
             picker: Some(Picker::halfblocks()),
             images: HashMap::new(),
             loading_images: HashSet::new(),
-            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
+            disk_cache,
             image_order: VecDeque::new(),
         }
     }
@@ -247,7 +260,7 @@ impl MediaCache {
             url: url.to_owned(),
             cache_dir: self.cache_dir.clone(),
             http: self.http.clone(),
-            session_disk_entries: self.session_disk_entries.clone(),
+            disk_cache: self.disk_cache.clone(),
         })
     }
 
@@ -410,7 +423,6 @@ impl ImageLoadJob {
         {
             let _decode = limits.decode_permit().await;
             if let Some(image) = read_cached_image(&path).await {
-                remember_session_paths(&self.session_disk_entries, [path]);
                 return Ok(image);
             }
         }
@@ -427,10 +439,7 @@ impl ImageLoadJob {
                 .await
                 .with_context(|| format!("could not read image bytes for {}", self.url))?
         };
-        if fs::write(&path, &bytes).is_ok() {
-            remember_session_paths(&self.session_disk_entries, [path]);
-            clean_disk_cache(self.cache_dir.clone(), self.session_disk_entries.clone()).await;
-        }
+        self.disk_cache.publish(path, bytes.to_vec()).await;
         let _decode = limits.decode_permit().await;
         decode_image_bytes(bytes.to_vec(), self.url).await
     }
@@ -438,7 +447,6 @@ impl ImageLoadJob {
     async fn load(self) -> Result<DynamicImage> {
         let path = self.cache_dir.join(cache_key(&self.url));
         if let Some(image) = read_cached_image(&path).await {
-            remember_session_paths(&self.session_disk_entries, [path]);
             return Ok(image);
         }
 
@@ -455,10 +463,7 @@ impl ImageLoadJob {
             .with_context(|| format!("could not read image bytes for {}", self.url))?;
 
         // Best effort: a failed cache write should not fail the render.
-        if fs::write(&path, &bytes).is_ok() {
-            remember_session_paths(&self.session_disk_entries, [path]);
-            clean_disk_cache(self.cache_dir.clone(), self.session_disk_entries.clone()).await;
-        }
+        self.disk_cache.publish(path, bytes.to_vec()).await;
         decode_image_bytes(bytes.to_vec(), self.url).await
     }
 }
@@ -489,30 +494,204 @@ async fn decode_image_bytes(bytes: Vec<u8>, url: String) -> Result<DynamicImage>
     .await?
 }
 
-fn remember_session_paths(
-    entries: &Arc<Mutex<HashSet<PathBuf>>>,
-    paths: impl IntoIterator<Item = PathBuf>,
-) {
-    if let Ok(mut entries) = entries.lock() {
-        entries.extend(paths);
+#[derive(Debug, Default)]
+struct MaintenanceState {
+    requested: u64,
+    running: bool,
+}
+
+#[derive(Debug)]
+struct DiskCache {
+    directory: PathBuf,
+    max_age: Duration,
+    max_bytes: u64,
+    maintenance: Mutex<MaintenanceState>,
+    #[cfg(test)]
+    probe: MaintenanceProbe,
+}
+
+impl DiskCache {
+    fn new(directory: PathBuf, max_age: Duration, max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            directory,
+            max_age,
+            max_bytes,
+            maintenance: Mutex::new(MaintenanceState::default()),
+            #[cfg(test)]
+            probe: MaintenanceProbe::default(),
+        })
+    }
+
+    async fn publish(self: &Arc<Self>, path: PathBuf, bytes: Vec<u8>) {
+        let cache = self.clone();
+        // Await only the bounded job's publication, never directory maintenance.
+        // Byte ownership makes concurrent eviction harmless to image decoding.
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = publish_cache_bytes(&cache.directory, &path, &bytes);
+            // Even a failed write may leave cleanup work, so request a pass.
+            cache.request_maintenance();
+        })
+        .await;
+    }
+
+    fn request_maintenance(self: &Arc<Self>) {
+        let mut state = self.maintenance.lock().unwrap_or_else(|e| e.into_inner());
+        state.requested = state.requested.saturating_add(1);
+        if state.running {
+            return;
+        }
+        state.running = true;
+        drop(state);
+
+        let cache = self.clone();
+        if std::thread::Builder::new()
+            .name("at-tui-cache-maintenance".into())
+            .spawn(move || cache.run_maintenance())
+            .is_err()
+        {
+            // Best effort: the next publication/startup request can retry.
+            self.maintenance
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running = false;
+            #[cfg(test)]
+            self.probe.idle.notify_all();
+        }
+    }
+
+    fn run_maintenance(self: Arc<Self>) {
+        loop {
+            // Coalesce publications from a burst, including requests received
+            // during the previous scan. The worker exits when quiescent.
+            std::thread::sleep(CACHE_MAINTENANCE_DELAY);
+            let generation = self
+                .maintenance
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .requested;
+            #[cfg(test)]
+            self.probe.before_scan();
+            cleanup_cache_dir(
+                &self.directory,
+                self.max_age,
+                self.max_bytes,
+                SystemTime::now(),
+            );
+            let mut state = self.maintenance.lock().unwrap_or_else(|e| e.into_inner());
+            if state.requested == generation {
+                // The comparison and idle transition share the request lock:
+                // a publication can neither miss this pass nor lose the next.
+                state.running = false;
+                #[cfg(test)]
+                self.probe.idle.notify_all();
+                return;
+            }
+            // Failed scans do not spin: absent another request we also retire.
+        }
     }
 }
 
-async fn clean_disk_cache(cache_dir: PathBuf, session_disk_entries: Arc<Mutex<HashSet<PathBuf>>>) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let preserved = session_disk_entries
-            .lock()
-            .map(|entries| entries.clone())
-            .unwrap_or_default();
-        cleanup_cache_dir(
-            &cache_dir,
-            DISK_CACHE_MAX_AGE,
-            DISK_CACHE_MAX_BYTES,
-            &preserved,
-            SystemTime::now(),
-        );
-    })
-    .await;
+fn active_staging() -> &'static Mutex<HashSet<PathBuf>> {
+    ACTIVE_STAGING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct StagingFile {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl StagingFile {
+    fn create(directory: &Path) -> io::Result<Self> {
+        fs::create_dir_all(directory)?;
+        // Canonical paths share protection across separately constructed caches
+        // that refer to the same directory through different aliases.
+        let directory = fs::canonicalize(directory)?;
+        loop {
+            let sequence = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                "{STAGING_PREFIX}{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            let mut active = active_staging().lock().unwrap_or_else(|e| e.into_inner());
+            active.insert(path.clone());
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) => {
+                    active.remove(&path);
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn publish(self, destination: &Path) -> io::Result<()> {
+        fs::rename(&self.path, destination)
+    }
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        // Keep protection until the partial file is gone. If removal fails,
+        // releasing registration lets a later maintenance pass reclaim it.
+        let mut active = active_staging().lock().unwrap_or_else(|e| e.into_inner());
+        let _ = fs::remove_file(&self.path);
+        active.remove(&self.path);
+    }
+}
+
+fn publish_cache_bytes(directory: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut staging = StagingFile::create(directory)?;
+    staging.file.write_all(bytes)?;
+    staging.publish(path)
+}
+
+fn is_staging_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(STAGING_PREFIX))
+}
+
+fn remove_cache_file(path: &Path) -> bool {
+    if is_staging_path(path) {
+        // Registration precedes creation; deletion checks while holding the
+        // same lock, so a concurrent scan cannot unlink a live partial write.
+        let active = active_staging().lock().unwrap_or_else(|e| e.into_inner());
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        if active.contains(&canonical) {
+            return false;
+        }
+        // Unknown staging (including crash leftovers) has no grace exemption.
+        // Another process may lose a best-effort cache publication, while its
+        // owned download bytes remain available for image display.
+        return fs::remove_file(path).is_ok();
+    }
+    fs::remove_file(path).is_ok()
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MaintenanceProbe {
+    scans: Mutex<(usize, bool)>,
+    changed: std::sync::Condvar,
+    idle: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl MaintenanceProbe {
+    fn before_scan(&self) {
+        let mut state = self.scans.lock().unwrap();
+        state.0 += 1;
+        self.changed.notify_all();
+        while state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -523,13 +702,7 @@ struct CacheFile {
     removed: bool,
 }
 
-fn cleanup_cache_dir(
-    cache_dir: &Path,
-    max_age: Duration,
-    max_bytes: u64,
-    preserved: &HashSet<PathBuf>,
-    now: SystemTime,
-) {
+fn cleanup_cache_dir(cache_dir: &Path, max_age: Duration, max_bytes: u64, now: SystemTime) {
     let mut paths = Vec::new();
     collect_cache_files(cache_dir, &mut paths);
     let mut total_bytes = 0_u64;
@@ -540,21 +713,20 @@ fn cleanup_cache_dir(
         };
         let size = metadata.len();
         total_bytes = total_bytes.saturating_add(size);
-        if !preserved.contains(&path) {
-            candidates.push(CacheFile {
-                path,
-                size,
-                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                removed: false,
-            });
-        }
+        candidates.push(CacheFile {
+            path,
+            size,
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            removed: false,
+        });
     }
 
     for candidate in &mut candidates {
-        if now
-            .duration_since(candidate.modified)
-            .is_ok_and(|age| age > max_age)
-            && fs::remove_file(&candidate.path).is_ok()
+        if (is_staging_path(&candidate.path)
+            || now
+                .duration_since(candidate.modified)
+                .is_ok_and(|age| age > max_age))
+            && remove_cache_file(&candidate.path)
         {
             candidate.removed = true;
             total_bytes = total_bytes.saturating_sub(candidate.size);
@@ -570,7 +742,7 @@ fn cleanup_cache_dir(
         if total_bytes <= max_bytes {
             break;
         }
-        if !candidate.removed && fs::remove_file(&candidate.path).is_ok() {
+        if !candidate.removed && remove_cache_file(&candidate.path) {
             total_bytes = total_bytes.saturating_sub(candidate.size);
         }
     }
@@ -783,7 +955,11 @@ mod tests {
             url: url.into(),
             cache_dir: dir.path().to_owned(),
             http: Client::new(),
-            session_disk_entries: Arc::new(Mutex::new(HashSet::new())),
+            disk_cache: DiskCache::new(
+                dir.path().to_owned(),
+                DISK_CACHE_MAX_AGE,
+                DISK_CACHE_MAX_BYTES,
+            ),
         };
 
         let (returned_url, result) = job.run().await;
@@ -824,25 +1000,23 @@ mod tests {
     }
 
     #[test]
-    fn disk_cleanup_enforces_size_while_preserving_session_entries() {
+    fn disk_cleanup_enforces_size_for_current_session_entries() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("a");
         let second = dir.path().join("b");
-        let preserved_path = dir.path().join("current");
+        let current_path = dir.path().join("current");
         fs::write(&first, [0_u8; 5]).unwrap();
         fs::write(&second, [0_u8; 5]).unwrap();
-        fs::write(&preserved_path, [0_u8; 5]).unwrap();
+        fs::write(&current_path, [0_u8; 5]).unwrap();
 
         cleanup_cache_dir(
             dir.path(),
             Duration::from_secs(365 * 24 * 60 * 60),
             8,
-            &HashSet::from([preserved_path.clone()]),
             SystemTime::now(),
         );
 
-        assert!(preserved_path.exists());
-        let remaining_bytes = [first, second, preserved_path]
+        let remaining_bytes = [first, second, current_path]
             .into_iter()
             .filter_map(|path| fs::metadata(path).ok())
             .map(|metadata| metadata.len())
@@ -851,23 +1025,289 @@ mod tests {
     }
 
     #[test]
-    fn disk_cleanup_removes_expired_entries_but_keeps_session_entry() {
+    fn disk_cleanup_removes_expired_current_session_entries() {
         let dir = tempfile::tempdir().unwrap();
         let expired = dir.path().join("expired");
-        let preserved_path = dir.path().join("current");
+        let current_path = dir.path().join("current");
         fs::write(&expired, b"old").unwrap();
-        fs::write(&preserved_path, b"current").unwrap();
+        fs::write(&current_path, b"current").unwrap();
 
         cleanup_cache_dir(
             dir.path(),
             Duration::from_secs(30 * 24 * 60 * 60),
             u64::MAX,
-            &HashSet::from([preserved_path.clone()]),
             SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60),
         );
 
         assert!(!expired.exists());
-        assert!(preserved_path.exists());
+        assert!(!current_path.exists());
+    }
+
+    fn wait_for_maintenance(cache: &DiskCache) {
+        let state = cache.maintenance.lock().unwrap();
+        let (state, timeout) = cache
+            .probe
+            .idle
+            .wait_timeout_while(state, Duration::from_secs(5), |state| state.running)
+            .unwrap();
+        assert!(
+            !timeout.timed_out() && !state.running,
+            "maintenance did not become idle"
+        );
+    }
+
+    fn pause_maintenance(cache: &Arc<DiskCache>) {
+        cache.probe.scans.lock().unwrap().1 = true;
+        cache.request_maintenance();
+        let state = cache.probe.scans.lock().unwrap();
+        let (state, timeout) = cache
+            .probe
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| state.0 == 0)
+            .unwrap();
+        assert!(!timeout.timed_out() && state.0 == 1, "scan did not start");
+    }
+
+    fn resume_maintenance(cache: &DiskCache) {
+        cache.probe.scans.lock().unwrap().1 = false;
+        cache.probe.changed.notify_all();
+    }
+
+    fn disk_bytes(directory: &Path) -> u64 {
+        let mut paths = Vec::new();
+        collect_cache_files(directory, &mut paths);
+        paths
+            .into_iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum()
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        tiny_image()
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn local_image_server(bytes: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/image.png", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        (url, worker)
+    }
+
+    fn limited_job(url: String, cache: Arc<DiskCache>) -> ImageLoadJob {
+        ImageLoadJob {
+            url,
+            cache_dir: cache.directory.clone(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            disk_cache: cache,
+        }
+    }
+
+    #[test]
+    fn synchronous_cache_construction_schedules_startup_cleanup_without_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join(format!("{STAGING_PREFIX}orphan.tmp"));
+        fs::write(&orphan, b"abandoned").unwrap();
+        let cache = MediaCache::with_cache_dir(
+            true,
+            RequestedImageProtocol::Halfblocks,
+            dir.path().to_owned(),
+        )
+        .unwrap();
+        wait_for_maintenance(&cache.disk_cache);
+        assert!(!orphan.exists());
+        assert_eq!(cache.protocol_name(), "halfblocks");
+        assert_eq!(cache.disk_cache.probe.scans.lock().unwrap().0, 1);
+    }
+
+    #[test]
+    fn oversized_entries_and_abandoned_staging_are_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("oversized.img"), [1; 12]).unwrap();
+        fs::write(
+            dir.path().join(format!("{STAGING_PREFIX}crashed.tmp")),
+            [1; 12],
+        )
+        .unwrap();
+        cleanup_cache_dir(dir.path(), DISK_CACHE_MAX_AGE, 8, SystemTime::now());
+        assert_eq!(disk_bytes(dir.path()), 0);
+    }
+
+    #[test]
+    fn atomic_publication_protects_live_staging_and_exposes_only_complete_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("image.img");
+        fs::write(&destination, b"old").unwrap();
+        let mut staging = StagingFile::create(dir.path()).unwrap();
+        staging.file.write_all(b"new").unwrap();
+        let staged_path = staging.path.clone();
+        // A separately constructed cache uses the same process-wide registry.
+        let other_cache = DiskCache::new(dir.path().join("."), DISK_CACHE_MAX_AGE, u64::MAX);
+        other_cache.request_maintenance();
+        wait_for_maintenance(&other_cache);
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        assert_eq!(fs::read(&staged_path).unwrap(), b"new");
+        staging.file.write_all(b" image").unwrap();
+        staging.publish(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new image");
+        assert!(!staged_path.exists());
+        assert!(!active_staging().lock().unwrap().contains(&staged_path));
+        cleanup_cache_dir(dir.path(), DISK_CACHE_MAX_AGE, 0, SystemTime::now());
+        assert_eq!(disk_bytes(dir.path()), 0);
+    }
+
+    #[test]
+    fn live_staging_is_the_only_temporary_budget_exception() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut staging = StagingFile::create(dir.path()).unwrap();
+        staging.file.write_all(&[1; 12]).unwrap();
+        let destination = dir.path().join("published.img");
+        cleanup_cache_dir(
+            dir.path(),
+            Duration::ZERO,
+            8,
+            SystemTime::now() + Duration::from_secs(1),
+        );
+        assert_eq!(disk_bytes(dir.path()), 12);
+        staging.publish(&destination).unwrap();
+        cleanup_cache_dir(dir.path(), DISK_CACHE_MAX_AGE, 8, SystemTime::now());
+        assert_eq!(disk_bytes(dir.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn burst_publications_coalesce_and_run_a_final_bounded_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_owned(), DISK_CACHE_MAX_AGE, 8);
+        pause_maintenance(&cache);
+        let mut tasks = Vec::new();
+        for index in 0..12 {
+            let cache = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .publish(cache.directory.join(format!("{index}.img")), vec![1; 6])
+                    .await;
+            }));
+        }
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(disk_bytes(dir.path()), 72);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 1);
+        resume_maintenance(&cache);
+        wait_for_maintenance(&cache);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 2);
+        assert_eq!(disk_bytes(dir.path()), 6);
+
+        // A publication after the idle transition starts another worker/pass.
+        cache.publish(dir.path().join("last.img"), vec![1; 6]).await;
+        wait_for_maintenance(&cache);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 3);
+        assert_eq!(disk_bytes(dir.path()), 6);
+    }
+
+    #[tokio::test]
+    async fn production_image_result_does_not_wait_for_a_slow_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_owned(), DISK_CACHE_MAX_AGE, 0);
+        pause_maintenance(&cache);
+        let (url, server) = local_image_server(png_bytes());
+        let job = limited_job(url, cache.clone());
+        let limits = crate::media_scheduler::MediaScheduler::default().execution_limits();
+        let (_, result) = tokio::time::timeout(Duration::from_secs(5), job.run_limited(limits))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let image = result.unwrap();
+        assert_eq!((image.width(), image.height()), (2, 2));
+        assert!(disk_bytes(dir.path()) > 0);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 1);
+        resume_maintenance(&cache);
+        wait_for_maintenance(&cache);
+        assert_eq!(disk_bytes(dir.path()), 0);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 2);
+    }
+
+    #[tokio::test]
+    async fn production_loader_replaces_corrupt_cache_from_local_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_owned(), DISK_CACHE_MAX_AGE, u64::MAX);
+        let (url, server) = local_image_server(png_bytes());
+        let path = dir.path().join(cache_key(&url));
+        fs::write(&path, b"not an image").unwrap();
+        let limits = crate::media_scheduler::MediaScheduler::default().execution_limits();
+        let (_, result) = limited_job(url, cache.clone()).run_limited(limits).await;
+        server.join().unwrap();
+        assert!(result.is_ok());
+        wait_for_maintenance(&cache);
+        assert!(image::load_from_memory(&fs::read(path).unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cache_publication_and_maintenance_failures_do_not_fail_image_display() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where a cache directory belongs makes both writing and
+        // directory scanning fail deterministically, even as an admin user.
+        let directory = dir.path().join("not-a-directory");
+        fs::write(&directory, b"occupied").unwrap();
+        let cache = DiskCache::new(directory.clone(), DISK_CACHE_MAX_AGE, 0);
+        let (url, server) = local_image_server(png_bytes());
+        let limits = crate::media_scheduler::MediaScheduler::default().execution_limits();
+        let (_, result) = limited_job(url, cache.clone()).run_limited(limits).await;
+        server.join().unwrap();
+        assert!(result.is_ok());
+        wait_for_maintenance(&cache);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 1);
+        // A later publication retries maintenance after the underlying failure
+        // is repaired; failures never leave running=true or cause a hot loop.
+        fs::remove_file(&directory).unwrap();
+        cache
+            .publish(directory.join("recovered.img"), vec![1; 12])
+            .await;
+        wait_for_maintenance(&cache);
+        assert_eq!(cache.probe.scans.lock().unwrap().0, 2);
+        assert_eq!(disk_bytes(&directory), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_rename_discards_partial_file_without_failing_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_owned(), DISK_CACHE_MAX_AGE, u64::MAX);
+        let (url, server) = local_image_server(png_bytes());
+        fs::create_dir(dir.path().join(cache_key(&url))).unwrap();
+        let limits = crate::media_scheduler::MediaScheduler::default().execution_limits();
+        let (_, result) = limited_job(url, cache.clone()).run_limited(limits).await;
+        server.join().unwrap();
+        assert!(result.is_ok());
+        wait_for_maintenance(&cache);
+        assert_eq!(disk_bytes(dir.path()), 0);
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .all(|entry| !is_staging_path(&entry.unwrap().path()))
+        );
     }
 
     #[test]
