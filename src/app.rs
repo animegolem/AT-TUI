@@ -33,7 +33,7 @@ use crate::{
         feed_sources_for_account, item_links, notification_items, profile_summary, thread_items,
         timeline_items,
     },
-    navigation::{NavigationStack, ViewKind, ViewState},
+    navigation::{NavigationStack, ViewId, ViewKind, ViewState},
     ui,
     video_player::MpvPlayer,
 };
@@ -229,6 +229,7 @@ enum TaskScope {
     Global,
     Account,
     View,
+    Root,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +237,7 @@ struct TaskContext {
     request_id: RequestId,
     account_did: String,
     view_generation: u64,
+    view_id: ViewId,
     scope: TaskScope,
 }
 
@@ -540,6 +542,11 @@ impl App {
             request_id: self.next_request_id(),
             account_did: self.client.session().did,
             view_generation: self.view_generation,
+            view_id: if scope == TaskScope::Root {
+                self.nav.root().id()
+            } else {
+                self.nav.current().id()
+            },
             scope,
         }
     }
@@ -547,6 +554,14 @@ impl App {
     fn advance_view_generation(&mut self) {
         self.view_generation = self.view_generation.saturating_add(1);
         self.set_media_anchor(None);
+    }
+
+    fn pop_view(&mut self) -> bool {
+        if !self.nav.pop() {
+            return false;
+        }
+        self.advance_view_generation();
+        true
     }
 
     fn set_media_anchor(&mut self, anchor: Option<(u64, usize)>) {
@@ -581,6 +596,11 @@ impl App {
             TaskScope::View => {
                 context.account_did == self.client.session().did
                     && context.view_generation == self.view_generation
+                    && context.view_id == self.nav.current().id()
+            }
+            TaskScope::Root => {
+                context.account_did == self.client.session().did
+                    && context.view_id == self.nav.root().id()
             }
         }
     }
@@ -622,18 +642,21 @@ impl App {
 
     fn apply_task_event(&mut self, event: TaskEvent) -> Result<()> {
         if !self.task_context_is_current(&event.context) {
-            self.clear_pending_for_stale_event(&event.event, event.context.request_id);
+            self.clear_pending_for_stale_event(&event.event, &event.context);
             return Ok(());
         }
-        self.apply_event(event.event)
+        self.apply_event(event.context.view_id, event.event)
     }
 
-    fn clear_pending_for_stale_event(&mut self, event: &AppEvent, request_id: RequestId) {
+    fn clear_pending_for_stale_event(&mut self, event: &AppEvent, context: &TaskContext) {
+        let request_id = context.request_id;
         match event {
             AppEvent::FeedLoaded { request_id: id, .. } if *id == request_id => {
                 if self.pending_feed == Some(*id) {
                     self.pending_feed = None;
-                    self.nav.root_mut().loading = false;
+                    if let Some(owner) = self.nav.get_mut(context.view_id) {
+                        owner.loading = false;
+                    }
                 }
             }
             AppEvent::FeedRefreshLoaded { request_id: id, .. } if *id == request_id => {
@@ -694,7 +717,7 @@ impl App {
         }
     }
 
-    fn apply_event(&mut self, event: AppEvent) -> Result<()> {
+    fn apply_event(&mut self, owner: ViewId, event: AppEvent) -> Result<()> {
         match event {
             AppEvent::ImageLoaded { job, result } => {
                 let succeeded = result.is_ok();
@@ -774,7 +797,7 @@ impl App {
             } => {
                 if self.pending_thread == Some(request_id) {
                     self.pending_thread = None;
-                    self.apply_thread_loaded(action, result);
+                    self.apply_thread_loaded(owner, action, result);
                 }
             }
             AppEvent::ProfileLoaded {
@@ -1086,7 +1109,7 @@ impl App {
         match action {
             KeyAction::Quit => self.should_quit = true,
             KeyAction::BackOrQuit => {
-                if self.nav.pop() {
+                if self.pop_view() {
                     self.set_status("Back");
                 } else {
                     self.should_quit = true;
@@ -1133,14 +1156,14 @@ impl App {
                 }
             }
             KeyAction::Back => {
-                if self.nav.pop() {
+                if self.pop_view() {
                     self.set_status("Back");
                 } else {
                     self.set_status("Already at timeline");
                 }
             }
             KeyAction::Escape => {
-                if self.nav.pop() {
+                if self.pop_view() {
                     self.set_status("Back");
                 } else {
                     self.overlay = Some(Overlay::Menu(MenuState::settings()));
@@ -1343,7 +1366,7 @@ impl App {
 
     fn queue_feed_load(&mut self, source: FeedSource, status: String) {
         self.advance_view_generation();
-        let context = self.task_context(TaskScope::View);
+        let context = self.task_context(TaskScope::Root);
         let id = context.request_id;
         self.pending_feed = Some(id);
         // Feed loads always target the root timeline, wherever the user is.
@@ -1744,7 +1767,15 @@ impl App {
         });
     }
 
-    fn apply_thread_loaded(&mut self, action: ThreadAction, result: AppTaskResult<Vec<FeedItem>>) {
+    fn apply_thread_loaded(
+        &mut self,
+        owner: ViewId,
+        action: ThreadAction,
+        result: AppTaskResult<Vec<FeedItem>>,
+    ) {
+        if self.nav.current().id() != owner {
+            return;
+        }
         match action {
             ThreadAction::OpenThread {
                 selected_uri,
@@ -1821,7 +1852,7 @@ impl App {
                     ViewKind::Profile { actor } if actor == &view_actor
                 );
                 if replaces_current {
-                    *self.nav.current_mut() = view;
+                    self.nav.replace_current(view);
                 } else {
                     self.nav.push(view);
                 }
@@ -1842,7 +1873,7 @@ impl App {
                 let mut view = ViewState::from_rows("Notifications", ViewKind::Notifications, rows);
                 view.cursor = data.cursor;
                 if matches!(self.nav.current().kind, ViewKind::Notifications) {
-                    *self.nav.current_mut() = view;
+                    self.nav.replace_current(view);
                 } else {
                     self.nav.push(view);
                 }
@@ -2016,6 +2047,7 @@ impl App {
         };
 
         if quote.uri.is_empty() {
+            self.advance_view_generation();
             let item = feed_item_from_quote(quote, 0);
             self.nav.push(ViewState::new(
                 "Quoted post",
@@ -2903,16 +2935,266 @@ mod tests {
         assert_eq!(app.drain_events().unwrap(), 1);
     }
 
+    fn pending_foreground_event(app: &mut App, operation: &str, fail: bool) -> TaskEvent {
+        app.advance_view_generation();
+        let context = app.task_context(TaskScope::View);
+        let request_id = context.request_id;
+        let posts = if fail {
+            Err("late failure".into())
+        } else {
+            Ok(vec![item("late", "late")])
+        };
+        let event = match operation {
+            "reload" | "thread" | "quote" => {
+                app.pending_thread = Some(request_id);
+                let action = match operation {
+                    "reload" => ThreadAction::Reload {
+                        root_uri: "post".into(),
+                        selected_uri: Some("post".into()),
+                    },
+                    "thread" => ThreadAction::OpenThread {
+                        selected_uri: "late".into(),
+                        title: "Late thread".into(),
+                        kind: ViewKind::Thread {
+                            root_uri: "late".into(),
+                        },
+                    },
+                    _ => ThreadAction::OpenQuote {
+                        quote: Box::new(QuotePost {
+                            uri: "late".into(),
+                            cid: None,
+                            author_name: "Alice".into(),
+                            author_handle: "alice.test".into(),
+                            text: "quote".into(),
+                            indexed_at: None,
+                            images: vec![],
+                            videos: vec![],
+                            external: None,
+                            links: vec![],
+                            nested_quote: None,
+                        }),
+                    },
+                };
+                AppEvent::ThreadLoaded {
+                    request_id,
+                    action,
+                    result: posts,
+                }
+            }
+            "profile" => {
+                app.pending_profile = Some(request_id);
+                AppEvent::ProfileLoaded {
+                    request_id,
+                    actor: "did:plc:bob".into(),
+                    result: posts.map(|items| ProfileLoadData {
+                        profile: profile_summary(
+                            &serde_json::json!({"did":"did:plc:bob", "handle":"bob.test"}),
+                        ),
+                        items,
+                        cursor: None,
+                    }),
+                }
+            }
+            _ => {
+                app.pending_notifications = Some(request_id);
+                AppEvent::NotificationsLoaded {
+                    request_id,
+                    account_did: context.account_did.clone(),
+                    result: posts.map(|_| NotificationsLoadData {
+                        items: vec![notification(NotificationTarget::None)],
+                        cursor: None,
+                        seen_updated: true,
+                        seen_error: None,
+                    }),
+                }
+            }
+        };
+        TaskEvent { context, event }
+    }
+
+    #[tokio::test]
+    async fn late_foreground_results_after_all_back_aliases_leave_timeline_untouched() {
+        for key in [
+            KeyCode::Char('q'),
+            KeyCode::Char('h'),
+            KeyCode::Left,
+            KeyCode::Esc,
+        ] {
+            for operation in ["reload", "thread", "quote", "profile", "notifications"] {
+                for fail in [false, true] {
+                    let mut app =
+                        app_with_items(vec![item("first", "first"), item("post", "post")]);
+                    app.nav.current_mut().selected = 1;
+                    app.nav.current_mut().scroll = 7;
+                    app.unread_notifications = 4;
+                    let root = app.nav.current().clone();
+                    app.nav.push(ViewState::new(
+                        "Thread",
+                        ViewKind::Thread {
+                            root_uri: "post".into(),
+                        },
+                        vec![item("post", "post")],
+                    ));
+                    let event = pending_foreground_event(&mut app, operation, fail);
+                    app.handle_normal_key(KeyEvent::new(key, KeyModifiers::NONE))
+                        .await
+                        .unwrap();
+                    let generation = app.view_generation;
+                    let status = app.status.clone();
+                    app.apply_task_event(event).unwrap();
+                    assert_eq!(app.nav.depth(), 1, "{key:?} {operation} {fail}");
+                    assert_eq!(app.nav.current().id(), root.id());
+                    assert_eq!(app.nav.current().items, root.items);
+                    assert_eq!(app.nav.current().selected, root.selected);
+                    assert_eq!(app.nav.current().scroll, root.scroll);
+                    assert_eq!(app.nav.current().kind, root.kind);
+                    assert_eq!(app.unread_notifications, 4);
+                    assert_eq!(app.status, status);
+                    assert_eq!(app.view_generation, generation);
+                    assert!(!app.should_quit);
+                    assert!(!app.has_pending_tasks());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_kind_replacement_or_reopened_origin_rejects_old_foreground_result() {
+        for operation in ["reload", "thread", "profile", "notifications"] {
+            for pop in [false, true] {
+                let mut app = app_with_items(vec![item("post", "post")]);
+                app.nav.push(ViewState::new(
+                    "Thread",
+                    ViewKind::Thread {
+                        root_uri: "post".into(),
+                    },
+                    vec![item("post", "post")],
+                ));
+                let event = pending_foreground_event(&mut app, operation, false);
+                let replacement = app.nav.current().clone();
+                if pop {
+                    // Even an internal pop/reinsert that does not advance app intent
+                    // must not let the same-kind replacement inherit old work.
+                    assert!(app.nav.pop());
+                    app.nav.push(replacement);
+                } else {
+                    app.nav.replace_current(replacement);
+                }
+                let owner = app.nav.current().id();
+                app.apply_task_event(event).unwrap();
+                assert_eq!(app.nav.current().id(), owner);
+                assert_eq!(app.nav.current().items[0].uri(), "post");
+                assert_eq!(app.nav.depth(), 2);
+                assert!(!app.has_pending_tasks());
+            }
+        }
+    }
+
+    #[test]
+    fn older_foreground_completion_cannot_release_newer_request() {
+        let mut app = app_with_items(vec![item("post", "post")]);
+        let old = pending_foreground_event(&mut app, "thread", false);
+        let new = pending_foreground_event(&mut app, "thread", false);
+        app.apply_task_event(old).unwrap();
+        assert_eq!(app.pending_thread, Some(new.context.request_id));
+        app.apply_task_event(new).unwrap();
+        assert_eq!(app.nav.depth(), 2);
+        assert_eq!(app.pending_thread, None);
+    }
+
+    #[tokio::test]
+    async fn root_completion_survives_nested_navigation_and_back() {
+        for back in [false, true] {
+            let mut app = app_with_items(vec![item("old", "old")]);
+            let context = app.task_context(TaskScope::Root);
+            app.pending_feed = Some(context.request_id);
+            app.nav.root_mut().loading = true;
+            let nested = pending_foreground_event(&mut app, "thread", false);
+            app.apply_task_event(nested).unwrap();
+            if back {
+                app.handle_normal_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            } else {
+                app.nav.current_mut().scroll = 9;
+            }
+            let foreground = app.nav.current().clone();
+            app.apply_task_event(TaskEvent {
+                event: AppEvent::FeedLoaded {
+                    request_id: context.request_id,
+                    source: FeedSource::home(),
+                    result: Ok((vec![item("new", "new")], Some("cursor".into()))),
+                },
+                context,
+            })
+            .unwrap();
+            assert_eq!(app.nav.root().items[0].uri(), "new");
+            assert!(!app.nav.root().loading);
+            assert_eq!(app.nav.depth(), if back { 1 } else { 2 });
+            if !back {
+                assert_eq!(app.nav.current().id(), foreground.id());
+                assert_eq!(app.nav.current().scroll, foreground.scroll);
+                assert_eq!(app.nav.current().items, foreground.items);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_root_cleanup_preserves_replacement_and_newer_loading() {
+        for replace in [false, true] {
+            for fail in [false, true] {
+                let mut app = app_with_items(vec![item("old", "old")]);
+                let context = app.task_context(TaskScope::Root);
+                app.pending_feed = Some(context.request_id);
+                if replace {
+                    app.nav.replace_root(ViewState::new(
+                        "New root",
+                        ViewKind::Timeline,
+                        vec![item("new", "new")],
+                    ));
+                }
+                app.nav.root_mut().loading = true;
+                let newer_id = app.next_request_id();
+                if !replace {
+                    app.pending_feed = Some(newer_id);
+                }
+                let owner = app.nav.root().id();
+                app.apply_task_event(TaskEvent {
+                    event: AppEvent::FeedLoaded {
+                        request_id: context.request_id,
+                        source: FeedSource::home(),
+                        result: if fail {
+                            Err("old failure".into())
+                        } else {
+                            Ok((vec![item("stale", "stale")], None))
+                        },
+                    },
+                    context,
+                })
+                .unwrap();
+                assert_eq!(app.nav.root().id(), owner);
+                assert!(app.nav.root().loading);
+                assert!(app.nav.root().error.is_none());
+                if !replace {
+                    assert_eq!(app.pending_feed, Some(newer_id));
+                }
+            }
+        }
+    }
+
     #[test]
     fn stale_pagination_event_is_ignored() {
         let mut app = app_with_items(vec![item("original", "hello")]);
         app.pending_pagination = Some(2);
 
-        app.apply_event(AppEvent::PageLoaded {
-            request_id: 1,
-            source: FeedSource::home(),
-            result: Ok((vec![item("stale", "stale")], None)),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::PageLoaded {
+                request_id: 1,
+                source: FeedSource::home(),
+                result: Ok((vec![item("stale", "stale")], None)),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.nav.current().items.len(), 1);
@@ -3010,11 +3292,14 @@ mod tests {
         app.nav.push(profile_view);
         app.pending_pagination = Some(9);
 
-        app.apply_event(AppEvent::ProfilePageLoaded {
-            request_id: 9,
-            actor: "did:plc:bob".into(),
-            result: Ok((vec![item("bob-2", "two")], Some("page-3".into()))),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::ProfilePageLoaded {
+                request_id: 9,
+                actor: "did:plc:bob".into(),
+                result: Ok((vec![item("bob-2", "two")], Some("page-3".into()))),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.nav.current().items.len(), 2);
@@ -3035,14 +3320,17 @@ mod tests {
         app.nav.push(view);
         app.pending_pagination = Some(9);
 
-        app.apply_event(AppEvent::NotificationsPageLoaded {
-            request_id: 9,
-            account_did: "did:plc:alice".into(),
-            result: Ok((
-                vec![notification(NotificationTarget::None)],
-                Some("page-3".into()),
-            )),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::NotificationsPageLoaded {
+                request_id: 9,
+                account_did: "did:plc:alice".into(),
+                result: Ok((
+                    vec![notification(NotificationTarget::None)],
+                    Some("page-3".into()),
+                )),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.nav.current().items.len(), 2);
@@ -3061,11 +3349,14 @@ mod tests {
         ));
         app.pending_feed = Some(5);
 
-        app.apply_event(AppEvent::FeedLoaded {
-            request_id: 5,
-            source: FeedSource::home(),
-            result: Ok((vec![item("new", "new")], None)),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::FeedLoaded {
+                request_id: 5,
+                source: FeedSource::home(),
+                result: Ok((vec![item("new", "new")], None)),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.nav.depth(), 2);
@@ -3363,11 +3654,14 @@ mod tests {
 
         for request_id in [2, 3] {
             app.pending_notification_count = Some(request_id);
-            app.apply_event(AppEvent::NotificationCountLoaded {
-                request_id,
-                account_did: "did:plc:alice".into(),
-                result: Err("network".into()),
-            })
+            app.apply_event(
+                app.nav.current().id(),
+                AppEvent::NotificationCountLoaded {
+                    request_id,
+                    account_did: "did:plc:alice".into(),
+                    result: Err("network".into()),
+                },
+            )
             .unwrap();
         }
 
@@ -3377,11 +3671,14 @@ mod tests {
         assert!(line.contains("offline"));
 
         app.pending_notification_count = Some(4);
-        app.apply_event(AppEvent::NotificationCountLoaded {
-            request_id: 4,
-            account_did: "did:plc:alice".into(),
-            result: Ok(6),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::NotificationCountLoaded {
+                request_id: 4,
+                account_did: "did:plc:alice".into(),
+                result: Ok(6),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.unread_notifications, 6);
@@ -3393,11 +3690,14 @@ mod tests {
         let mut app = app_with_items(vec![item("post", "hello")]);
         app.pending_refresh = Some(1);
 
-        app.apply_event(AppEvent::FeedRefreshLoaded {
-            request_id: 1,
-            source: FeedSource::home(),
-            result: Err("network".into()),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::FeedRefreshLoaded {
+                request_id: 1,
+                source: FeedSource::home(),
+                result: Err("network".into()),
+            },
+        )
         .unwrap();
 
         assert!(!app.is_offline());
@@ -3409,31 +3709,40 @@ mod tests {
         let mut app = app_with_items(vec![item("post", "hello")]);
         app.pending_notification_count = Some(2);
 
-        app.apply_event(AppEvent::NotificationCountLoaded {
-            request_id: 1,
-            account_did: "did:plc:alice".into(),
-            result: Ok(5),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::NotificationCountLoaded {
+                request_id: 1,
+                account_did: "did:plc:alice".into(),
+                result: Ok(5),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.unread_notifications, 0);
         assert_eq!(app.pending_notification_count, Some(2));
 
-        app.apply_event(AppEvent::NotificationCountLoaded {
-            request_id: 2,
-            account_did: "did:plc:other".into(),
-            result: Ok(5),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::NotificationCountLoaded {
+                request_id: 2,
+                account_did: "did:plc:other".into(),
+                result: Ok(5),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.unread_notifications, 0);
 
         app.pending_notification_count = Some(3);
-        app.apply_event(AppEvent::NotificationCountLoaded {
-            request_id: 3,
-            account_did: "did:plc:alice".into(),
-            result: Ok(7),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::NotificationCountLoaded {
+                request_id: 3,
+                account_did: "did:plc:alice".into(),
+                result: Ok(7),
+            },
+        )
         .unwrap();
 
         assert_eq!(app.unread_notifications, 7);
@@ -3916,10 +4225,13 @@ mod tests {
         assert_eq!(app.media_scheduler.active(), 1);
         assert_eq!(app.media_scheduler.queued(), 0);
         assert!(app.media_scheduler.take_next().is_none());
-        app.apply_event(AppEvent::ImageLoaded {
-            job,
-            result: Ok(image::DynamicImage::new_rgb8(2, 2)),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::ImageLoaded {
+                job,
+                result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+            },
+        )
         .unwrap();
         assert_eq!(app.media.state_name(url), "ready");
         assert_eq!(app.media_scheduler.active(), 0);
@@ -3938,10 +4250,13 @@ mod tests {
 
         app.submit_image_load(url.into(), MediaPriority::VisibleMedia, true);
         app.set_media_anchor(Some((0, 1)));
-        app.apply_event(AppEvent::ImageLoaded {
-            job,
-            result: Ok(image::DynamicImage::new_rgb8(2, 2)),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::ImageLoaded {
+                job,
+                result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+            },
+        )
         .unwrap();
         assert_eq!(app.media.state_name(url), "ready");
         assert_eq!(app.media_scheduler.active(), 0);
@@ -3959,10 +4274,13 @@ mod tests {
         app.media.mark_loading_url(url);
 
         app.set_media_anchor(Some((0, 1)));
-        app.apply_event(AppEvent::ImageLoaded {
-            job,
-            result: Ok(image::DynamicImage::new_rgb8(2, 2)),
-        })
+        app.apply_event(
+            app.nav.current().id(),
+            AppEvent::ImageLoaded {
+                job,
+                result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+            },
+        )
         .unwrap();
         assert_eq!(app.media.state_name(url), "missing");
         assert_eq!(app.media_scheduler.active(), 0);

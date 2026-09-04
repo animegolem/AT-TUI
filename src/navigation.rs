@@ -1,4 +1,21 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ratatui::text::Line;
+
+/// Identity of one view instance, independent of its kind or stack position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ViewId(u64);
+
+impl ViewId {
+    fn fresh() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(
+            NEXT_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("view identity space exhausted"),
+        )
+    }
+}
 
 use crate::model::{FeedItem, NotificationItem, ProfileSummary, ViewItem};
 
@@ -13,6 +30,7 @@ pub enum ViewKind {
 
 #[derive(Debug, Clone)]
 pub struct ViewState {
+    id: ViewId,
     pub title: String,
     pub kind: ViewKind,
     pub items: Vec<ViewItem>,
@@ -54,6 +72,7 @@ impl ViewState {
 
     pub fn from_rows(title: impl Into<String>, kind: ViewKind, items: Vec<ViewItem>) -> Self {
         Self {
+            id: ViewId::fresh(),
             title: title.into(),
             kind,
             items,
@@ -66,6 +85,10 @@ impl ViewState {
             search_query: None,
             layout_cache: LayoutCache::default(),
         }
+    }
+
+    pub fn id(&self) -> ViewId {
+        self.id
     }
 
     pub fn selected_item(&self) -> Option<&FeedItem> {
@@ -200,13 +223,24 @@ impl ViewState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NavigationStack {
     views: Vec<ViewState>,
 }
 
+impl Clone for NavigationStack {
+    fn clone(&self) -> Self {
+        let mut views = self.views.clone();
+        for view in &mut views {
+            view.id = ViewId::fresh();
+        }
+        Self { views }
+    }
+}
+
 impl NavigationStack {
-    pub fn new(root: ViewState) -> Self {
+    pub fn new(mut root: ViewState) -> Self {
+        root.id = ViewId::fresh();
         Self { views: vec![root] }
     }
 
@@ -222,14 +256,29 @@ impl NavigationStack {
             .expect("navigation stack always has a root view")
     }
 
-    pub fn push(&mut self, view: ViewState) {
+    pub fn push(&mut self, mut view: ViewState) {
+        view.id = ViewId::fresh();
         self.views.push(view);
     }
 
     /// Swap out the root view (the timeline) without touching anything the
     /// user has pushed on top of it.
-    pub fn replace_root(&mut self, view: ViewState) {
+    pub fn replace_root(&mut self, mut view: ViewState) {
+        view.id = ViewId::fresh();
         self.views[0] = view;
+    }
+
+    pub fn replace_current(&mut self, mut view: ViewState) {
+        view.id = ViewId::fresh();
+        *self.current_mut() = view;
+    }
+
+    pub fn root(&self) -> &ViewState {
+        &self.views[0]
+    }
+
+    pub fn get_mut(&mut self, id: ViewId) -> Option<&mut ViewState> {
+        self.views.iter_mut().find(|view| view.id == id)
     }
 
     pub fn root_mut(&mut self) -> &mut ViewState {
@@ -338,6 +387,24 @@ mod tests {
             embed_status: None,
             depth: 0,
         }
+    }
+
+    #[test]
+    fn view_identity_is_fresh_after_replacement_reinsertion_and_stack_reset() {
+        let root = ViewState::new("Timeline", ViewKind::Timeline, vec![]);
+        let mut stack = NavigationStack::new(root.clone());
+        let first = stack.current().id();
+        stack.push(stack.current().clone());
+        let pushed = stack.current().id();
+        assert_ne!(first, pushed);
+        assert!(stack.pop());
+        assert_eq!(stack.current().id(), first);
+        stack.replace_current(stack.current().clone());
+        let replaced = stack.current().id();
+        assert_ne!(first, replaced);
+        assert!(stack.get_mut(first).is_none());
+        assert_ne!(stack.clone().current().id(), replaced);
+        assert_ne!(NavigationStack::new(root).current().id(), replaced);
     }
 
     #[test]
