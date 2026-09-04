@@ -6,7 +6,7 @@ tags:
   - at-tui
   - reliability
   - performance
-kanban_status: planned
+kanban_status: in-progress
 depends_on:
   - AI-IMP-003-5
 parent_epic: [[AI-EPIC-005-runtime-correctness-and-efficiency]]

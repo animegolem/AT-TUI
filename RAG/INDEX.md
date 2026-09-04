@@ -6,8 +6,8 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 3 | 3 |
-| Planned | 0 | 7 |
+| In Progress | 3 | 9 |
+| Planned | 0 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
 | Completed | 2 | 15 |
@@ -42,12 +42,12 @@
 > The September 4 review found three reproducible interaction bugs: late thread refresh can overwrite the timeline after Back, stale pagination can s...
 
 **IMPs:**
-- [[AI-IMP-005-1-navigation-completion-ownership|IMP-005-1]] Back navigation rejects late view completions — planned
-- [[AI-IMP-005-2-pagination-owner-cleanup|IMP-005-2]] Pagination releases the view that owns the request — planned
-- [[AI-IMP-005-3-visible-media-revival|IMP-005-3]] Visible requests revive cancelled image prefetch — planned
-- [[AI-IMP-005-4-bounded-asynchronous-disk-cache|IMP-005-4]] Bound session disk use and remove cleanup from image latency — planned
-- [[AI-IMP-005-5-remove-obsolete-helper-paths|IMP-005-5]] Remove unused helpers and test the production media loader — planned
-- [[AI-IMP-005-6-incremental-layout-and-redraws|IMP-005-6]] Avoid redundant redraws and rebuild only appended row layouts — planned
+- [[AI-IMP-005-1-navigation-completion-ownership|IMP-005-1]] Back navigation rejects late view completions — in-progress
+- [[AI-IMP-005-2-pagination-owner-cleanup|IMP-005-2]] Pagination releases the view that owns the request — in-progress
+- [[AI-IMP-005-3-visible-media-revival|IMP-005-3]] Visible requests revive cancelled image prefetch — in-progress
+- [[AI-IMP-005-4-bounded-asynchronous-disk-cache|IMP-005-4]] Bound session disk use and remove cleanup from image latency — in-progress
+- [[AI-IMP-005-5-remove-obsolete-helper-paths|IMP-005-5]] Remove unused helpers and test the production media loader — in-progress
+- [[AI-IMP-005-6-incremental-layout-and-redraws|IMP-005-6]] Avoid redundant redraws and rebuild only appended row layouts — in-progress
 
 ---
 

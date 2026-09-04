@@ -60,3 +60,39 @@ Planning: created six source-backed tickets and regenerated the index. Prior
 review reproductions, outside the checkout, confirmed the three interaction
 failures and lifetime cache-pin size-target violation. Existing baseline passed
 146 unit tests, one CLI integration test, formatting, and Clippy.
+
+## Round 1 verdict — accepted for implementation
+
+2026-09-04. Reviewed the navigation, media, and cleanup/layout reports against
+current source. Implement 005-1 through 005-6 within the ticket fences.
+
+- Navigation: use nonreused view-instance identities, foreground intent and
+  account checks, distinct surviving-root targeting, and one Back/pop path.
+  Do not use kind, actor, or URI alone as identity. Preserve legitimate root
+  loads beneath pushed views. Pagination is owned per view/request and old
+  completions cannot release a newer page or full-load token. Background page
+  errors belong to the background view, not the foreground statusline.
+- Media: allow scheduler admission for already-loading demand; promote normal
+  in-flight speculation as well as reviving cancelled work. Refresh generation
+  for renewed demand without duplicating physical jobs or resetting attempts.
+- Cache: remove lifetime final-file pins. Await atomic publication on the
+  blocking pool within existing bounded media jobs, then request asynchronous
+  coalesced maintenance. Do not create an unbounded detached write queue. Owned
+  bytes permit eviction without blocking decode. Maintenance requested during
+  a pass must produce a final pass. Temporary publication files must also have
+  a cleanup story after failure/restart; do not ignore orphan staging files
+  forever. Background startup maintenance must not introduce a hidden panic
+  requirement on a synchronous constructor without a Tokio runtime.
+- Cleanup: the verified symbols are candidates, not a license to remove all
+  public/test helpers. Route the disk-hit test through run_limited and preserve
+  README keymap generation, preview_images, and source label methods with users.
+- Layout: preserve ordinary cached-timestamp behavior; removing incidental
+  timestamp refresh on append is accepted without adding a new timer. Full
+  notification-mutation invalidation is allowed. Represent or explicitly test
+  selected/unselected height equivalence before relying on prefix offsets.
+  Record actual work counts and buffer equivalence rather than a speed claim.
+
+Independent baseline validation: the root's localhost mock-server PTY fixture
+reproduced the timeline remaining `Following [loading]` after pagination finished
+under a pushed thread. The fixture uses an isolated account file and synthetic
+responses only. Formatting/structure checks passed for the epic and six tickets.

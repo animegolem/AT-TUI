@@ -6,7 +6,7 @@ tags:
   - at-tui
   - reliability
   - performance
-kanban_status: planned
+kanban_status: in-progress
 depends_on:
   - AI-IMP-005-2
   - AI-IMP-005-4
