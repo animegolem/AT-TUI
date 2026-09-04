@@ -70,7 +70,9 @@ fn visible_feed_lines(
         return lines;
     }
 
-    for index in 0..view.items.len() {
+    let first = first_visible_item(view, top_offset);
+    top_offset = top_offset.saturating_sub(item_line_offset(view, first));
+    for index in first..view.items.len() {
         if remaining == 0 {
             break;
         }
@@ -105,22 +107,57 @@ fn append_visible_lines(
 }
 
 fn ensure_layout_cache(view: &mut ViewState, width: usize) {
-    let needs_rebuild =
-        view.layout_cache.width != Some(width) || view.layout_cache.items.len() != view.items.len();
-    if !needs_rebuild {
+    let cache = &mut view.layout_cache;
+    if cache.width != Some(width) || cache.items.len() > view.items.len() {
+        cache.clear();
+        cache.width = Some(width);
+    }
+    if cache.line_offsets.is_empty() {
+        cache.line_offsets.push(0);
+    }
+    let cached_len = cache.items.len();
+    if cached_len == view.items.len() {
         return;
     }
 
-    view.layout_cache.width = Some(width);
-    view.layout_cache.items = view
-        .items
-        .iter()
-        .map(|item| CachedItemLines {
+    for item in &view.items[cached_len..] {
+        let lines = CachedItemLines {
             selected: render_view_item_lines(item, true, width),
             unselected: render_view_item_lines(item, false, width),
-        })
-        .collect();
-    view.layout_cache.builds += 1;
+        };
+        cache
+            .line_offsets
+            .push(cache.line_offsets.last().copied().unwrap_or(0) + lines.unselected.len());
+        cache.items.push(lines);
+    }
+    cache.builds += 1;
+    cache.rows_built += view.items.len() - cached_len;
+}
+
+fn item_line_offset(view: &ViewState, index: usize) -> usize {
+    let offset = view.layout_cache.line_offsets[index];
+    if index > view.selected {
+        let selected = &view.layout_cache.items[view.selected];
+        // Offsets use unselected heights. Account for the one selected row even
+        // if a renderer gives it a different height in the future.
+        offset + selected.selected.len() - selected.unselected.len()
+    } else {
+        offset
+    }
+}
+
+fn first_visible_item(view: &ViewState, offset: usize) -> usize {
+    let mut low = 0;
+    let mut high = view.layout_cache.items.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if item_line_offset(view, middle + 1) <= offset {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
 }
 
 fn cached_item_lines(view: &ViewState, index: usize, selected: bool) -> &[Line<'static>] {
@@ -154,11 +191,7 @@ fn ensure_selected_rendered(view: &mut ViewState, available_lines: usize, leadin
         return;
     }
 
-    let selected_start = leading_height
-        + view.layout_cache.items[..view.selected]
-            .iter()
-            .map(|item| item.unselected.len())
-            .sum::<usize>();
+    let selected_start = leading_height + view.layout_cache.line_offsets[view.selected];
     let selected_height = view.layout_cache.items[view.selected].selected.len();
     let selected_end = selected_start + selected_height;
 
@@ -1420,6 +1453,246 @@ mod tests {
         let lines = visible_feed_lines(&mut view, 80, 6, &[]);
 
         assert_eq!(lines.len(), 6);
+    }
+
+    // A fresh, linear render is the output oracle for the incremental cache.
+    fn fresh_visible_lines(
+        view: &mut ViewState,
+        width: usize,
+        available: usize,
+        leading: &[Line<'static>],
+    ) -> Vec<Line<'static>> {
+        view.selected = view.selected.min(view.items.len().saturating_sub(1));
+        let rows = view
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| render_view_item_lines(item, index == view.selected, width))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            view.scroll = 0;
+        } else if available > 0 && !(view.selected == 0 && view.scroll == 0 && !leading.is_empty())
+        {
+            let start = leading.len() + rows[..view.selected].iter().map(Vec::len).sum::<usize>();
+            let height = rows[view.selected].len();
+            let end = start + height;
+            if start < view.scroll {
+                view.scroll = if view.selected == 0 { 0 } else { start };
+            } else if end > view.scroll.saturating_add(available) {
+                view.scroll = if height > available {
+                    start
+                } else {
+                    end.saturating_sub(available)
+                };
+            }
+        }
+        let mut lines = leading.to_vec();
+        if rows.is_empty() {
+            lines.push(Line::from(empty_view_text(&view.kind)));
+        } else {
+            lines.extend(rows.into_iter().flatten());
+        }
+        lines
+            .into_iter()
+            .skip(view.scroll)
+            .take(available)
+            .collect()
+    }
+
+    fn assert_fresh_render(view: &mut ViewState, width: usize, available: usize) {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+        let leading = render_view_leading_lines(view, width, "did:plc:viewer");
+        let mut fresh = view.clone();
+        let expected = fresh_visible_lines(&mut fresh, width, available, &leading);
+        let actual = visible_feed_lines(view, width, available, &leading);
+        assert_eq!(view.selected, fresh.selected);
+        assert_eq!(view.scroll, fresh.scroll);
+        assert_eq!(actual, expected, "styled visible lines at width {width}");
+        let area = Rect::new(0, 0, (width + 4) as u16, (available + 2) as u16);
+        let render = |lines: Vec<Line<'static>>| {
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(Text::from(lines))
+                .block(rounded_block().title(view.title.clone()))
+                .render(area, &mut buffer);
+            buffer
+        };
+        assert_eq!(render(actual), render(expected), "full terminal buffer");
+    }
+
+    fn numbered_posts(start: usize, count: usize) -> Vec<FeedItem> {
+        (start..start + count)
+            .map(|index| {
+                let mut item = item_with_text(&format!(
+                    "post {index}: words that wrap at a narrow terminal width\n{}",
+                    "another line\n".repeat(index % 4)
+                ));
+                item.uri = format!("post-{index}");
+                item
+            })
+            .collect()
+    }
+
+    #[test]
+    fn append_reuses_old_rows_and_matches_fresh_render_through_navigation_and_resize() {
+        let mut nav = crate::navigation::NavigationStack::new(ViewState::new(
+            "Timeline",
+            ViewKind::Timeline,
+            numbered_posts(0, 2000),
+        ));
+        let view = nav.current_mut();
+        view.selected = 1995;
+        assert_fresh_render(view, 40, 12);
+        assert_eq!(view.layout_cache.rows_built, 2000);
+        let old_lines = view.layout_cache.items[0].selected.clone();
+        let scroll = view.scroll;
+        let mut added = numbered_posts(2000, 50);
+        view.append_posts(&mut added);
+        assert_fresh_render(view, 40, 12);
+        assert_eq!(view.scroll, scroll);
+        assert_eq!(view.selected, 1995);
+        assert_eq!(view.layout_cache.rows_built, 2050);
+        assert_eq!(view.layout_cache.items[0].selected, old_lines);
+        view.move_by(25);
+        assert_fresh_render(view, 40, 12);
+        view.move_by(-35);
+        assert_fresh_render(view, 40, 12);
+        assert_eq!(view.layout_cache.rows_built, 2050);
+
+        nav.for_each_item_mut(|post| {
+            if post.uri == "post-1985" {
+                post.text = "changed post text\nwith another line".into();
+                post.like_count = 20;
+                post.viewer_like = Some("like-record".into());
+            }
+        });
+        let view = nav.current_mut();
+        assert_fresh_render(view, 40, 12);
+        assert_eq!(view.layout_cache.rows_built, 4100);
+        assert_fresh_render(view, 12, 5);
+        assert_eq!(view.layout_cache.rows_built, 6150);
+        assert_fresh_render(view, 80, 20);
+        assert_eq!(view.layout_cache.rows_built, 8200);
+        eprintln!(
+            "layout work: append rendered 50 row pairs instead of 2050; selection movement rendered 0"
+        );
+    }
+
+    fn notification_row() -> ViewItem {
+        ViewItem::Notification(Box::new(NotificationItem {
+            uri: "notification".into(),
+            cid: "cid".into(),
+            author_did: None,
+            author_name: "Bob".into(),
+            author_handle: "bob.test".into(),
+            author_following_uri: None,
+            reason: crate::model::NotificationReason::Reply,
+            reason_subject: Some("post-0".into()),
+            text: "notification text that wraps across narrow rows".into(),
+            indexed_at: "invalid timestamp".into(),
+            is_read: false,
+            target: NotificationTarget::None,
+        }))
+    }
+
+    #[test]
+    fn incremental_render_matches_profile_error_notification_and_empty_views() {
+        let mut profile = ViewState::new(
+            "Profile",
+            ViewKind::Profile {
+                actor: "alice.test".into(),
+            },
+            numbered_posts(0, 8),
+        );
+        profile.set_profile(profile_with_description(Some(
+            "profile description that spans narrow rows",
+        )));
+        profile.error = Some("network unavailable".into());
+        for width in [12, 24, 80] {
+            profile.jump_top();
+            assert_fresh_render(&mut profile, width, 6);
+            profile.move_by(6);
+            assert_fresh_render(&mut profile, width, 6);
+            profile.jump_top();
+            assert_fresh_render(&mut profile, width, 6);
+        }
+        let mut nav = crate::navigation::NavigationStack::new(ViewState::from_rows(
+            "Notifications",
+            ViewKind::Notifications,
+            vec![notification_row()],
+        ));
+        assert_fresh_render(nav.current_mut(), 12, 5);
+        nav.current_mut().append_rows(vec![notification_row()]);
+        assert_fresh_render(nav.current_mut(), 12, 5);
+        assert_eq!(nav.current().layout_cache.rows_built, 2);
+        nav.for_each_notification_mut(|notification| notification.is_read = true);
+        assert_fresh_render(nav.current_mut(), 12, 5);
+        assert_eq!(nav.current().layout_cache.rows_built, 4);
+        nav.current_mut().move_down();
+        assert_fresh_render(nav.current_mut(), 24, 5);
+        for kind in [ViewKind::Timeline, ViewKind::Notifications] {
+            let mut empty = ViewState::new("Empty", kind, vec![]);
+            empty.error = Some("empty error".into());
+            for available in [0, 1, 5] {
+                assert_fresh_render(&mut empty, 12, available);
+            }
+        }
+    }
+
+    #[test]
+    fn prepend_replace_and_removal_invalidate_offsets_and_rows() {
+        let mut nav = crate::navigation::NavigationStack::new(ViewState::new(
+            "Timeline",
+            ViewKind::Timeline,
+            numbered_posts(0, 5),
+        ));
+        assert_fresh_render(nav.current_mut(), 24, 8);
+        nav.current_mut().prepend_posts(numbered_posts(5, 2));
+        assert_fresh_render(nav.current_mut(), 24, 8);
+        assert_eq!(nav.current().layout_cache.rows_built, 12);
+        nav.retain_items(|row| row.uri() != "post-5");
+        assert_fresh_render(nav.current_mut(), 24, 8);
+        assert_eq!(nav.current().layout_cache.rows_built, 18);
+        nav.current_mut().replace_items_preserving_uri(
+            numbered_posts(10, 3),
+            Some("post-11"),
+            None,
+        );
+        assert_fresh_render(nav.current_mut(), 24, 8);
+        assert_eq!(nav.current().layout_cache.rows_built, 21);
+    }
+
+    #[test]
+    fn viewport_binary_lookup_accounts_for_different_selected_row_heights() {
+        for selected_height in [1, 5] {
+            let mut view = ViewState::new("Timeline", ViewKind::Timeline, numbered_posts(0, 4));
+            view.selected = 1;
+            view.layout_cache.items = (0..4)
+                .map(|index| CachedItemLines {
+                    selected: vec![
+                        Line::from("selected");
+                        if index == 1 { selected_height } else { 2 }
+                    ],
+                    unselected: vec![Line::from("unselected"); 2],
+                })
+                .collect();
+            view.layout_cache.line_offsets = vec![0, 2, 4, 6, 8];
+            let heights = [2, selected_height, 2, 2];
+            for offset in 0..=heights.iter().sum::<usize>() + 1 {
+                let mut remaining = offset;
+                let expected = heights
+                    .iter()
+                    .position(|height| {
+                        if remaining < *height {
+                            true
+                        } else {
+                            remaining -= *height;
+                            false
+                        }
+                    })
+                    .unwrap_or(heights.len());
+                assert_eq!(first_visible_item(&view, offset), expected);
+            }
+        }
     }
 
     #[test]

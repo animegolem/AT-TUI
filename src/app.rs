@@ -2723,6 +2723,31 @@ async fn load_feed_page(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TimedUiState {
+    pending_label: Option<&'static str>,
+    status_visible: bool,
+}
+
+impl TimedUiState {
+    fn capture(app: &App) -> Self {
+        Self {
+            pending_label: app.pending_task_label(),
+            status_visible: app.visible_status().is_some(),
+        }
+    }
+
+    fn update(&mut self, app: &App) -> bool {
+        let current = Self::capture(app);
+        if *self == current {
+            false
+        } else {
+            *self = current;
+            true
+        }
+    }
+}
+
 pub async fn run_tui(
     client: BskyClient,
     requested_protocol: RequestedImageProtocol,
@@ -2744,7 +2769,7 @@ pub async fn run_tui(
 
     let mut app = App::bootstrap(client, media).await?;
     let mut dirty = true;
-    let mut status_was_visible = app.visible_status().is_some();
+    let mut timed_ui = TimedUiState::capture(&app);
 
     loop {
         if app.drain_events()? > 0 {
@@ -2766,13 +2791,9 @@ pub async fn run_tui(
         if app.advance_spinner() {
             dirty = true;
         }
-        let status_visible = app.visible_status().is_some();
-        if status_visible != status_was_visible {
-            status_was_visible = status_visible;
-            dirty = true;
-        }
-        if app.has_pending_tasks() {
-            // Keep progress indicators animating while work is in flight.
+        if timed_ui.update(&app) {
+            // Timer-triggered tasks must show their start even between spinner
+            // ticks; otherwise pending work alone does not require a redraw.
             dirty = true;
         }
         if dirty {
@@ -4102,6 +4123,41 @@ mod tests {
         app.expire_status_for_test();
 
         assert_eq!(app.visible_status(), None);
+    }
+
+    #[test]
+    fn timed_ui_redraws_on_transitions_but_not_between_spinner_ticks() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        let mut state = TimedUiState::capture(&app);
+        assert!(!state.update(&app));
+
+        // A background timer can start this without an input/completion event.
+        app.pending_notification_count = Some(1);
+        assert!(state.update(&app));
+        app.last_spinner_tick = Instant::now() + Duration::from_secs(60);
+        for _ in 0..20 {
+            assert!(!app.advance_spinner());
+            assert!(!state.update(&app));
+        }
+        app.pending_feed = Some(2);
+        assert!(
+            state.update(&app),
+            "pending label changed while work remains"
+        );
+        app.pending_feed = None;
+        assert!(state.update(&app));
+
+        app.last_spinner_tick = Instant::now() - Duration::from_millis(200);
+        assert!(app.advance_spinner(), "timed spinner frame must redraw");
+        assert!(!state.update(&app));
+        app.set_status("Checking");
+        assert!(state.update(&app));
+        app.expire_status_for_test();
+        assert!(state.update(&app), "status expiry must redraw");
+        app.pending_notification_count = None;
+        assert!(state.update(&app), "completion removes pending indicator");
+        assert!(!app.advance_spinner());
+        assert!(!state.update(&app));
     }
 
     #[test]

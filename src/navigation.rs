@@ -49,13 +49,17 @@ pub struct ViewState {
 pub struct LayoutCache {
     pub width: Option<usize>,
     pub items: Vec<CachedItemLines>,
+    /// Unselected row starts, followed by the end offset of the last row.
+    pub line_offsets: Vec<usize>,
     pub builds: usize,
+    pub rows_built: usize,
 }
 
 impl LayoutCache {
     pub fn clear(&mut self) {
         self.width = None;
         self.items.clear();
+        self.line_offsets.clear();
     }
 }
 
@@ -114,12 +118,10 @@ impl ViewState {
 
     pub fn append_posts(&mut self, posts: &mut Vec<FeedItem>) {
         self.items.extend(posts.drain(..).map(ViewItem::from));
-        self.layout_cache.clear();
     }
 
     pub fn append_rows(&mut self, rows: Vec<ViewItem>) {
         self.items.extend(rows);
-        self.layout_cache.clear();
     }
 
     pub fn prepend_posts(&mut self, posts: Vec<FeedItem>) {
@@ -339,6 +341,7 @@ impl NavigationStack {
                     f(item);
                 }
             }
+            view.layout_cache.clear();
         }
     }
 
