@@ -112,3 +112,44 @@ byte/age budget immediately, without a one-hour exemption. Protect only known
 active in-process staging. Losing another process's cache publication is an
 acceptable best-effort miss because owned bytes still decode; it must not fail
 image display. This avoids PID-liveness machinery and unbounded crash leftovers.
+
+## Final integration verdict — accepted
+
+2026-09-04. Root reviewed all six atomic source commits and independently ran
+the final gate at 4314ef1. Its source matches implementation lead 3d74093.
+All six tickets meet the scoped acceptance criteria and are closed.
+
+| Ticket | Lead commit | Accepted root commit |
+| --- | --- | --- |
+| 005-1 | b94db28 | 1e31c16 |
+| 005-2 | 062310f | 599f170 |
+| 005-3 | 91715b1 | 267206e |
+| 005-4 | 4031932 | eeb6098 |
+| 005-5 | 1ae51b9 | 13a872a |
+| 005-6 | 3d74093 | 4314ef1 |
+
+Review resolved the profile/notification Reload follow-up race by suppressing
+outgoing-cursor pagination with a request-scoped reload token. It also verified
+cache worker idle/final-pass locking, bounded blocking publication, protected
+active staging, production-loader coverage, and selected/unselected layout
+height differences. Source changes stayed inside the assigned fences; dependency,
+auth/config, keymap, README, and CI/release changes were unnecessary.
+
+Independent gate: formatting, 182 library + one CLI test, Clippy with warnings
+denied, docs with warnings denied, release build, cargo package including its
+verification build, and whitespace all passed. The final release-binary localhost
+PTY smoke passed at 80x28 and 42x18: pagination resumes after a background page,
+Back rejects a delayed thread reload, narrow profile scrolling restores the
+header, idle output is zero, and exit is clean. The baseline failed the same
+pagination fixture. No real account or Bluesky writes were used.
+
+Cache evidence: 12 publications/72 bytes completed with scanning blocked;
+coalesced maintenance used two passes and left 6 bytes under an 8-byte budget.
+Rendering evidence: 50 appended posts require 50 new row pairs instead of 2,050,
+with fresh-buffer equivalence and zero row builds for selection movement.
+These are deterministic operation counts, not elapsed-time benchmarks.
+
+The complete evidence is in
+[[2026-09-04-LOG-AI-runtime-cleanup-epic-005-complete]]. Root closes documentation
+and fast-forwards the accepted integration series to local codex/ci-baseline.
+Existing live idle/Ghostty and hosted CI/release acceptance remain separate.

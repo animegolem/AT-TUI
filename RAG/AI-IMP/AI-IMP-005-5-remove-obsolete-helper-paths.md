@@ -6,14 +6,14 @@ tags:
   - at-tui
   - reliability
   - performance
-kanban_status: in-progress
+kanban_status: completed
 depends_on:
   - AI-IMP-005-2
   - AI-IMP-005-4
 parent_epic: [[AI-EPIC-005-runtime-correctness-and-efficiency]]
 confidence_score: 0.90
 date_created: 2026-09-04
-date_completed:
+date_completed: 2026-09-04
 ---
 
 # AI-IMP-005-5-remove-obsolete-helper-paths
@@ -35,10 +35,10 @@ src/api.rs; src/media.rs; src/navigation.rs; src/model.rs; src/video_player.rs; 
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Verify callers and distinguish obsolete runtime paths from meaningful test/documentation helpers.
-- [ ] Remove verified unused helpers and consolidate the duplicate image-loading path.
-- [ ] Route disk-hit/no-network coverage through the production limited loader.
-- [ ] Record symbol removals and run the full test/Clippy/documentation gate.
+- [x] Verify callers and distinguish obsolete runtime paths from meaningful test/documentation helpers.
+- [x] Remove verified unused helpers and consolidate the duplicate image-loading path.
+- [x] Route disk-hit/no-network coverage through the production limited loader.
+- [x] Record symbol removals and run the full test/Clippy/documentation gate.
 
 ### Acceptance Criteria
 **GIVEN** the obsolete helper path is removed, **WHEN** the full app/CLI/test/doc gates run, **THEN** the supported behavior remains intact and the disk-hit test executes the production image loader.
@@ -50,4 +50,6 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
-Awaiting implementation review. The lead records acceptance and final evidence after reproducing validation.
+Accepted by the root reviewer at source commit 13a872a. Repository callers and documentation were checked before removing 12 obsolete helpers: BskyClient::login; NavigationStack::breadcrumb; PreviewMedia::source_label; HomeFeedPrefs::status_label; MpvPlayer::executable; MediaCache::{should_load, mark_loading, load_job, should_load_url}; ImageLoadJob::{url, run, load}.
+
+The disk-hit/no-network test now uses production run_limited with scheduler execution limits. Purposeful keymap/README helpers, preview_images, and source label methods with real callers remain. Owned byte buffers also remove two full download-buffer copies from publication/decode. No dependencies changed. Full test, Clippy, documentation, release, and package gates passed at 4314ef1. No unresolved ticket-scoped issue. See [[2026-09-04-LOG-AI-runtime-cleanup-epic-005-complete]].

@@ -6,11 +6,11 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 3 | 9 |
+| In Progress | 2 | 3 |
 | Planned | 0 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 2 | 15 |
+| Completed | 3 | 21 |
 | **Total** | **5** | **25** |
 
 ## In Progress
@@ -38,45 +38,32 @@
 
 ---
 
-### [[AI-EPIC-005-runtime-correctness-and-efficiency|EPIC-005: Runtime correctness and efficiency]]
-> The September 4 review found three reproducible interaction bugs: late thread refresh can overwrite the timeline after Back, stale pagination can s...
-
-**IMPs:**
-- [[AI-IMP-005-1-navigation-completion-ownership|IMP-005-1]] Back navigation rejects late view completions — in-progress
-- [[AI-IMP-005-2-pagination-owner-cleanup|IMP-005-2]] Pagination releases the view that owns the request — in-progress
-- [[AI-IMP-005-3-visible-media-revival|IMP-005-3]] Visible requests revive cancelled image prefetch — in-progress
-- [[AI-IMP-005-4-bounded-asynchronous-disk-cache|IMP-005-4]] Bound session disk use and remove cleanup from image latency — in-progress
-- [[AI-IMP-005-5-remove-obsolete-helper-paths|IMP-005-5]] Remove unused helpers and test the production media loader — in-progress
-- [[AI-IMP-005-6-incremental-layout-and-redraws|IMP-005-6]] Avoid redundant redraws and rebuild only appended row layouts — in-progress
-
----
-
 ## Size Watch
 
 Generated from tracked files; binary assets excluded.
 
 ### > 600 LOC
 
+- src/app.rs (4953 LOC)
 - Cargo.lock (4146 LOC)
-- src/app.rs (4090 LOC)
-- src/model.rs (1976 LOC)
-- src/ui.rs (1503 LOC)
-- src/api.rs (1228 LOC)
-- src/media.rs (1011 LOC)
+- src/model.rs (1963 LOC)
+- src/ui.rs (1776 LOC)
+- src/media.rs (1397 LOC)
+- src/api.rs (1217 LOC)
 - src/keymap.rs (932 LOC)
 - src/config.rs (761 LOC)
 
 ### > 300 LOC
 
+- src/navigation.rs (581 LOC)
 - RAG/scripts/generate-index.sh (575 LOC)
-- src/navigation.rs (492 LOC)
 - src/media_scheduler.rs (463 LOC)
 
 ---
 
 ## Completed
 <details>
-<summary>2 EPICs, 15 IMPs completed</summary>
+<summary>3 EPICs, 21 IMPs completed</summary>
 
 - [[AI-EPIC-001-at-tui-public-readiness-polish|EPIC-001]] At tui public readiness polish — 2026-08-19
   - [[AI-IMP-001-1-cosmetic-polish|IMP-001-1]] Compact Statusline And Timeline Readability — completed
@@ -90,5 +77,12 @@ Generated from tracked files; binary assets excluded.
   - [[AI-IMP-002-5-image-cache-prefetch|IMP-002-5]] 5 image cache prefetch — completed
   - [[AI-IMP-002-6-posting-correctness|IMP-002-6]] 6 posting correctness — completed
   - [[AI-IMP-002-7-visual-quick-wins|IMP-002-7]] 7 visual quick wins — completed
+- [[AI-EPIC-005-runtime-correctness-and-efficiency|EPIC-005]] Runtime correctness and efficiency — 2026-09-04
+  - [[AI-IMP-005-1-navigation-completion-ownership|IMP-005-1]] Back navigation rejects late view completions — completed
+  - [[AI-IMP-005-2-pagination-owner-cleanup|IMP-005-2]] Pagination releases the view that owns the request — completed
+  - [[AI-IMP-005-3-visible-media-revival|IMP-005-3]] Visible requests revive cancelled image prefetch — completed
+  - [[AI-IMP-005-4-bounded-asynchronous-disk-cache|IMP-005-4]] Bound session disk use and remove cleanup from image latency — completed
+  - [[AI-IMP-005-5-remove-obsolete-helper-paths|IMP-005-5]] Remove unused helpers and test the production media loader — completed
+  - [[AI-IMP-005-6-incremental-layout-and-redraws|IMP-005-6]] Avoid redundant redraws and rebuild only appended row layouts — completed
 
 </details>

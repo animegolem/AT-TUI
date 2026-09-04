@@ -6,13 +6,13 @@ tags:
   - at-tui
   - reliability
   - performance
-kanban_status: in-progress
+kanban_status: completed
 depends_on:
   - AI-IMP-003-5
 parent_epic: [[AI-EPIC-005-runtime-correctness-and-efficiency]]
 confidence_score: 0.90
 date_created: 2026-09-04
-date_completed:
+date_completed: 2026-09-04
 ---
 
 # AI-IMP-005-3-visible-media-revival
@@ -34,10 +34,10 @@ src/app.rs media submission/completion section; src/media.rs cache admission; sr
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Revive cancelled in-flight work when the same URL becomes visible.
-- [ ] Promote queued/in-flight speculation while maintaining deduplication and concurrency limits.
-- [ ] Retain discard behavior for obsolete unrequested work and bounded retry behavior.
-- [ ] Add integrated App/cache/scheduler regressions and run focused checks.
+- [x] Revive cancelled in-flight work when the same URL becomes visible.
+- [x] Promote queued/in-flight speculation while maintaining deduplication and concurrency limits.
+- [x] Retain discard behavior for obsolete unrequested work and bounded retry behavior.
+- [x] Add integrated App/cache/scheduler regressions and run focused checks.
 
 ### Acceptance Criteria
 **GIVEN** an in-flight thumbnail was cancelled on selection movement, **WHEN** that URL becomes visible before completion, **THEN** the existing successful result becomes ready with one request.
@@ -51,4 +51,6 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
-Awaiting implementation review. The lead records acceptance and final evidence after reproducing validation.
+Accepted by the root reviewer at source commit 267206e. Cache admission now forwards renewed demand for loading URLs. The scheduler promotes queued and ordinary in-flight speculation, revives cancelled in-flight work, and renews generation without duplicating workers or resetting retry attempts.
+
+Integrated App/cache/scheduler regressions cover promotion, revival, deduplication, obsolete-result discard, and bounded retries. Root independently reproduced the focused media checks and the final full gate at 4314ef1. No unresolved ticket-scoped issue. See [[2026-09-04-LOG-AI-runtime-cleanup-epic-005-complete]].

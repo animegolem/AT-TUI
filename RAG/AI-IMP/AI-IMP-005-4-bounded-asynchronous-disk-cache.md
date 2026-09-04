@@ -6,13 +6,13 @@ tags:
   - at-tui
   - reliability
   - performance
-kanban_status: in-progress
+kanban_status: completed
 depends_on:
   - AI-IMP-005-3
 parent_epic: [[AI-EPIC-005-runtime-correctness-and-efficiency]]
 confidence_score: 0.90
 date_created: 2026-09-04
-date_completed:
+date_completed: 2026-09-04
 ---
 
 # AI-IMP-005-4-bounded-asynchronous-disk-cache
@@ -34,11 +34,11 @@ src/media.rs; src/media_scheduler.rs only if needed for lifecycle integration; f
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Enforce byte and age bounds after maintenance even when all entries were touched this session.
-- [ ] Handle oversized files, concurrent readers/writers, corrupt entries, and maintenance failure without failing image display.
-- [ ] Move blocking writes off async workers and remove scan waits from the image result path.
-- [ ] Coalesce scans under bursts without losing the final cleanup; test maintenance lifecycle.
-- [ ] Record boundedness and scan-count evidence with deterministic temporary-directory tests.
+- [x] Enforce byte and age bounds after maintenance even when all entries were touched this session.
+- [x] Handle oversized files, concurrent readers/writers, corrupt entries, and maintenance failure without failing image display.
+- [x] Move blocking writes off async workers and remove scan waits from the image result path.
+- [x] Coalesce scans under bursts without losing the final cleanup; test maintenance lifecycle.
+- [x] Record boundedness and scan-count evidence with deterministic temporary-directory tests.
 
 ### Acceptance Criteria
 **GIVEN** a session downloads more than the configured cache budget, **WHEN** writes and successful scheduled maintenance finish, **THEN** retained cache bytes are within budget without restarting.
@@ -52,4 +52,8 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
-Awaiting implementation review. The lead records acceptance and final evidence after reproducing validation.
+Accepted by the root reviewer at source commit eeb6098. Atomic publication runs on the blocking pool within bounded media jobs; a coalesced maintenance worker handles scans independently. Generation tracking under the worker-state lock ensures another pass after requests arrive during a scan. The synchronous cache constructor does not require a Tokio runtime.
+
+Lifetime final-file pins are removed. Only active in-process staging is protected; unknown/inactive staging is eligible for immediate cleanup. A second process may therefore lose a best-effort cache publication, but display still decodes owned bytes. Bounds apply after successful quiescent maintenance; I/O failure remains nonfatal and a later publication can request maintenance again.
+
+Deterministic barrier tests completed 12 publications totaling 72 bytes while scanning was paused; two passes left 6 bytes under an 8-byte budget. A publication after idle caused a third pass. The real production loader completed while maintenance was blocked. Tests also cover oversize/age policy, corrupt entries, staging, failed publication/maintenance, startup, and concurrent I/O. Full gate passed at 4314ef1; no unresolved ticket-scoped issue. See [[2026-09-04-LOG-AI-runtime-cleanup-epic-005-complete]].

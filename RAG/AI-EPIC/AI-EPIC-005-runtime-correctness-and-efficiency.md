@@ -7,8 +7,8 @@ tags:
   - reliability
   - performance
 date_created: 2026-09-04
-date_completed:
-kanban_status: in-progress
+date_completed: 2026-09-04
+kanban_status: completed
 AI_IMP_spawned:
   - AI-IMP-005-1
   - AI-IMP-005-2
@@ -46,22 +46,28 @@ Before this epic closes, focused regression tests must prove all three interacti
 ## Requirements
 
 ### Functional Requirements
-- [ ] FR-1: Back and other navigation changes reject or correctly route late view completions.
-- [ ] FR-2: Pagination releases its actual owner and cannot clear a newer request.
-- [ ] FR-3: Visible image requests revive/promote existing work without duplicate downloads.
-- [ ] FR-4: Cache maintenance bounds current-session disk use and leaves image completion independent of full scans.
-- [ ] FR-5: Obsolete helpers are removed and production media loading receives relevant test coverage.
-- [ ] FR-6: Redraws follow visible changes and appended rows reuse existing layouts.
+- [x] FR-1: Back and other navigation changes reject or correctly route late view completions.
+- [x] FR-2: Pagination releases its actual owner and cannot clear a newer request.
+- [x] FR-3: Visible image requests revive/promote existing work without duplicate downloads.
+- [x] FR-4: Cache maintenance bounds current-session disk use and leaves image completion independent of full scans.
+- [x] FR-5: Obsolete helpers are removed and production media loading receives relevant test coverage.
+- [x] FR-6: Redraws follow visible changes and appended rows reuse existing layouts.
 
 ### Non-Functional Requirements
 Use deterministic tests and local mock/synthetic data for race validation. Do not send Bluesky writes or rotate saved account state for testing. Keep source changes within assigned fences. Review report assertions against actual code and reproduce counts. Completion means reviewed implementation and passing ticket-scoped acceptance, not dispatch or an agent's self-report.
 
 ## Implementation Breakdown
-- [ ] [[AI-IMP-005-1-navigation-completion-ownership]]: Back navigation rejects late view completions.
-- [ ] [[AI-IMP-005-2-pagination-owner-cleanup]]: Pagination releases the view that owns the request.
-- [ ] [[AI-IMP-005-3-visible-media-revival]]: Visible requests revive cancelled image prefetch.
-- [ ] [[AI-IMP-005-4-bounded-asynchronous-disk-cache]]: Bound session disk use and remove cleanup from image latency.
-- [ ] [[AI-IMP-005-5-remove-obsolete-helper-paths]]: Remove unused helpers and test the production media loader.
-- [ ] [[AI-IMP-005-6-incremental-layout-and-redraws]]: Avoid redundant redraws and rebuild only appended row layouts.
+- [x] [[AI-IMP-005-1-navigation-completion-ownership]]: Back navigation rejects late view completions.
+- [x] [[AI-IMP-005-2-pagination-owner-cleanup]]: Pagination releases the view that owns the request.
+- [x] [[AI-IMP-005-3-visible-media-revival]]: Visible requests revive cancelled image prefetch.
+- [x] [[AI-IMP-005-4-bounded-asynchronous-disk-cache]]: Bound session disk use and remove cleanup from image latency.
+- [x] [[AI-IMP-005-5-remove-obsolete-helper-paths]]: Remove unused helpers and test the production media loader.
+- [x] [[AI-IMP-005-6-incremental-layout-and-redraws]]: Avoid redundant redraws and rebuild only appended row layouts.
 
 Dependency waves: 005-1 → 005-2 and 005-3 → 005-4 can run independently; 005-5 follows both; 005-6 follows 005-5. Ticket IDs 005-1 through 005-6 are reserved. Integration begins from 6be2bc3 on codex/ci-baseline and returns to that branch after review; publication/release is outside this sitting.
+
+## Completion Evidence
+
+All six ticket implementations were delegated, reviewed against source, and accepted by the root reviewer at integration source 4314ef1. The root independently passed 182 library tests and one CLI integration test (36 more library tests than baseline), formatting, Clippy with warnings denied, documentation with warnings denied, release build, package verification, and whitespace checks. A synthetic localhost PTY smoke passed the navigation/pagination races, narrow-profile resize and scroll restoration, zero idle terminal writes, and clean exit.
+
+Deterministic cache and rendering tests prove quiescent bounds, maintenance independent of image results, and 50 new row layouts for a 50-post append to 2,000 cached posts instead of rebuilding 2,050. Twelve verified obsolete helpers were removed. See [[2026-09-04-LOG-AI-runtime-cleanup-epic-005-complete]] for commits, review rulings, commands, and validation limits. Documentation closure follows the tested source tip; the accepted series returns to the existing local codex/ci-baseline branch.

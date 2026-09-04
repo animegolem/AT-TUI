@@ -6,14 +6,14 @@ tags:
   - at-tui
   - reliability
   - performance
-kanban_status: in-progress
+kanban_status: completed
 depends_on:
   - AI-IMP-005-2
   - AI-IMP-005-5
 parent_epic: [[AI-EPIC-005-runtime-correctness-and-efficiency]]
 confidence_score: 0.90
 date_created: 2026-09-04
-date_completed:
+date_completed: 2026-09-04
 ---
 
 # AI-IMP-005-6-incremental-layout-and-redraws
@@ -35,11 +35,11 @@ src/app.rs event-loop dirty handling; src/navigation.rs layout cache lifecycle; 
 Before marking an item complete on the checklist MUST **stop** and **think**. Have you validated all aspects are **implemented** and **tested**?
 </CRITICAL_RULE>
 
-- [ ] Remove unconditional pending-task redraws while showing starts, completions, spinners, and status expiry.
-- [ ] Reuse unchanged row layouts on append; invalidate correctly for replacements, mutation, width, and removals.
-- [ ] Avoid linear scans of preceding cached rows for deep-view positioning.
-- [ ] Add render-buffer equivalence and cache-work regressions, including narrow/profile/error views.
-- [ ] Record measured work reduction and run full tests/Clippy/build plus a synthetic terminal rendering smoke.
+- [x] Remove unconditional pending-task redraws while showing starts, completions, spinners, and status expiry.
+- [x] Reuse unchanged row layouts on append; invalidate correctly for replacements, mutation, width, and removals.
+- [x] Avoid linear scans of preceding cached rows for deep-view positioning.
+- [x] Add render-buffer equivalence and cache-work regressions, including narrow/profile/error views.
+- [x] Record measured work reduction and run full tests/Clippy/build plus a synthetic terminal rendering smoke.
 
 ### Acceptance Criteria
 **GIVEN** a long rendered view receives one page at the same width, **WHEN** it draws, **THEN** only new rows require layout and existing row output/selection/viewport remain stable.
@@ -53,4 +53,8 @@ This section is filled out post work as you fill out the checklists.
 You SHOULD document any issues encountered and resolved during the sprint.
 You MUST document any failed implementations, blockers or missing tests.
 -->
-Awaiting implementation review. The lead records acceptance and final evidence after reproducing validation.
+Accepted by the root reviewer at source commit 4314ef1. Timed visible-state snapshots replace unconditional pending-task redraws. Prefix line offsets and incremental row caching reuse unchanged layouts and locate the viewport without scanning every preceding row; selection-dependent height differences are accounted for.
+
+Deterministic work counts: appending 50 posts to 2,000 cached posts builds 50 row pairs instead of 2,050; selection changes build zero. Twenty unchanged pending-state checks between spinner ticks request zero redraws, with transitions/ticks/expiry still covered. This is operation-count evidence, not a measured end-user timing claim.
+
+Styled lines and complete Ratatui buffers match an independent fresh/linear rendering oracle through append, selection, mutation, 12/80-column resize, profile/error/notification/empty views, prepend, replace, and removal. Notification mutation now explicitly invalidates the layout. The existing timestamp-cache policy remains; removing incidental refresh on append was reviewed and accepted without adding a timer. Full gate and final 80x28/42x18 release-binary PTY smoke passed, including narrow-profile scroll restoration and zero idle terminal writes. No unresolved ticket-scoped issue. See [[2026-09-04-LOG-AI-runtime-cleanup-epic-005-complete]].
