@@ -96,3 +96,19 @@ Independent baseline validation: the root's localhost mock-server PTY fixture
 reproduced the timeline remaining `Following [loading]` after pagination finished
 under a pushed thread. The fixture uses an isolated account file and synthetic
 responses only. Formatting/structure checks passed for the epic and six tickets.
+
+## Integration review — media admission
+
+005-3: accepted into the integration branch as 267206e (implementation lead
+91715b1). Boundary review found only the assigned media source and focused
+regressions. The cache now forwards running demand to the scheduler, which
+renews generation/promotes priority while retaining physical slot and retry
+ownership. The root independently reproduced 25 media-filter tests passing,
+127 unit tests and one CLI test filtered, plus clean formatting/whitespace.
+Final ticket closure still awaits the full integrated gate.
+
+Cache staging ruling: unknown/inactive staging files count toward the normal
+byte/age budget immediately, without a one-hour exemption. Protect only known
+active in-process staging. Losing another process's cache publication is an
+acceptable best-effort miss because owned bytes still decode; it must not fail
+image display. This avoids PID-liveness machinery and unbounded crash leftovers.

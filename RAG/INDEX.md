@@ -58,11 +58,11 @@ Generated from tracked files; binary assets excluded.
 ### > 600 LOC
 
 - Cargo.lock (4146 LOC)
-- src/app.rs (4002 LOC)
+- src/app.rs (4090 LOC)
 - src/model.rs (1976 LOC)
 - src/ui.rs (1503 LOC)
 - src/api.rs (1228 LOC)
-- src/media.rs (1009 LOC)
+- src/media.rs (1011 LOC)
 - src/keymap.rs (932 LOC)
 - src/config.rs (761 LOC)
 
@@ -70,7 +70,7 @@ Generated from tracked files; binary assets excluded.
 
 - RAG/scripts/generate-index.sh (575 LOC)
 - src/navigation.rs (492 LOC)
-- src/media_scheduler.rs (417 LOC)
+- src/media_scheduler.rs (463 LOC)
 
 ---
 
