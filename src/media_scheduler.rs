@@ -171,12 +171,17 @@ impl MediaScheduler {
                 record.generation = generation;
                 return SubmitResult::Reprioritized;
             }
-            if record.state == JobState::Queued && priority > record.priority {
+            // Repeated demand renews ownership even when priority is unchanged.
+            // Running work also needs promotion, or selection movement could
+            // cancel a speculative job whose result is now visibly requested.
+            record.generation = record.generation.max(generation);
+            if priority > record.priority {
                 record.priority = priority;
-                record.generation = generation;
-                record.revision = record.revision.saturating_add(1);
-                let revision = record.revision;
-                self.push(id, priority, revision);
+                if record.state == JobState::Queued {
+                    record.revision = record.revision.saturating_add(1);
+                    let revision = record.revision;
+                    self.push(id, priority, revision);
+                }
                 return SubmitResult::Reprioritized;
             }
             return SubmitResult::Deduplicated;
@@ -405,6 +410,47 @@ mod tests {
             scheduler.complete(&permanent, false, false),
             CompletionResult::Accepted
         );
+    }
+
+    #[test]
+    fn repeated_demand_renews_queued_and_running_generation() {
+        let mut scheduler = MediaScheduler::new(1, 1, 2);
+        let id = MediaJobId::image("renewed");
+        scheduler.submit(id.clone(), MediaPriority::NearbyThumbnail, 1);
+        scheduler.submit(id.clone(), MediaPriority::NearbyThumbnail, 2);
+        assert!(scheduler.cancel_speculation_before(2).is_empty());
+        let job = scheduler.take_next().unwrap();
+        assert_eq!(job.generation, 2);
+        scheduler.submit(id, MediaPriority::NearbyThumbnail, 3);
+        scheduler.cancel_speculation_before(3);
+        assert_eq!(
+            scheduler.complete(&job, true, false),
+            CompletionResult::Accepted
+        );
+    }
+
+    #[test]
+    fn revival_does_not_reset_retry_budget_or_allocate_another_slot() {
+        let mut scheduler = MediaScheduler::new(1, 1, 2);
+        let id = MediaJobId::image("retry");
+        scheduler.submit(id.clone(), MediaPriority::NearbyThumbnail, 1);
+        let first = scheduler.take_next().unwrap();
+        assert_eq!(
+            scheduler.complete(&first, false, true),
+            CompletionResult::Retrying
+        );
+        let second = scheduler.take_next().unwrap();
+        assert_eq!(second.attempt(), 2);
+        scheduler.cancel_speculation_before(2);
+        scheduler.submit(id, MediaPriority::VisibleMedia, 2);
+        assert_eq!(scheduler.active(), 1);
+        assert_eq!(scheduler.queued(), 0);
+        assert_eq!(
+            scheduler.complete(&second, false, true),
+            CompletionResult::Accepted
+        );
+        assert_eq!(scheduler.active(), 0);
+        assert_eq!(scheduler.queued(), 0);
     }
 
     #[test]

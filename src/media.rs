@@ -179,7 +179,7 @@ impl MediaCache {
     }
 
     #[cfg(test)]
-    fn test_enabled(cache_dir: PathBuf) -> Self {
+    pub(crate) fn test_enabled(cache_dir: PathBuf) -> Self {
         Self {
             enabled: true,
             cache_dir,
@@ -219,7 +219,9 @@ impl MediaCache {
     }
 
     pub fn prepare_image_load(&mut self, url: &str, retry_failed: bool) -> bool {
-        if !self.enabled || self.loading_images.contains(url) {
+        // The scheduler owns deduplication: loading work must still receive
+        // demand updates so visible requests can promote or revive it.
+        if !self.enabled {
             return false;
         }
         match self.images.get(url) {

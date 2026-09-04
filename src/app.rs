@@ -3899,6 +3899,94 @@ mod tests {
         assert!(app.pending_thread.is_some());
     }
 
+    #[test]
+    fn visible_media_revives_cancelled_prefetch_at_app_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_items(Vec::new());
+        app.media = MediaCache::test_enabled(dir.path().to_owned());
+        app.set_media_anchor(Some((0, 0)));
+        let url = "https://example.test/revived.png";
+        app.submit_image_load(url.into(), MediaPriority::NearbyThumbnail, false);
+        let job = app.media_scheduler.take_next().unwrap();
+        app.media.mark_loading_url(url);
+
+        app.set_media_anchor(Some((0, 1)));
+        app.submit_image_load(url.into(), MediaPriority::VisibleMedia, true);
+        app.submit_image_load(url.into(), MediaPriority::VisibleMedia, true);
+        assert_eq!(app.media_scheduler.active(), 1);
+        assert_eq!(app.media_scheduler.queued(), 0);
+        assert!(app.media_scheduler.take_next().is_none());
+        app.apply_event(AppEvent::ImageLoaded {
+            job,
+            result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+        })
+        .unwrap();
+        assert_eq!(app.media.state_name(url), "ready");
+        assert_eq!(app.media_scheduler.active(), 0);
+    }
+
+    #[test]
+    fn visible_media_promotes_running_prefetch_before_anchor_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_items(Vec::new());
+        app.media = MediaCache::test_enabled(dir.path().to_owned());
+        app.set_media_anchor(Some((0, 0)));
+        let url = "https://example.test/promoted.png";
+        app.submit_image_load(url.into(), MediaPriority::NearbyThumbnail, false);
+        let job = app.media_scheduler.take_next().unwrap();
+        app.media.mark_loading_url(url);
+
+        app.submit_image_load(url.into(), MediaPriority::VisibleMedia, true);
+        app.set_media_anchor(Some((0, 1)));
+        app.apply_event(AppEvent::ImageLoaded {
+            job,
+            result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+        })
+        .unwrap();
+        assert_eq!(app.media.state_name(url), "ready");
+        assert_eq!(app.media_scheduler.active(), 0);
+    }
+
+    #[test]
+    fn obsolete_media_completion_discards_result_and_releases_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_items(Vec::new());
+        app.media = MediaCache::test_enabled(dir.path().to_owned());
+        app.set_media_anchor(Some((0, 0)));
+        let url = "https://example.test/obsolete.png";
+        app.submit_image_load(url.into(), MediaPriority::NearbyThumbnail, false);
+        let job = app.media_scheduler.take_next().unwrap();
+        app.media.mark_loading_url(url);
+
+        app.set_media_anchor(Some((0, 1)));
+        app.apply_event(AppEvent::ImageLoaded {
+            job,
+            result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+        })
+        .unwrap();
+        assert_eq!(app.media.state_name(url), "missing");
+        assert_eq!(app.media_scheduler.active(), 0);
+    }
+
+    #[test]
+    fn queued_media_promotes_and_sticky_failures_require_explicit_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_items(Vec::new());
+        app.media = MediaCache::test_enabled(dir.path().to_owned());
+        let url = "https://example.test/queued.png";
+        app.media
+            .finish_load(url.into(), Err("invalid image".into()));
+        app.submit_image_load(url.into(), MediaPriority::NearbyThumbnail, false);
+        assert_eq!(app.media_scheduler.queued(), 0);
+
+        app.submit_image_load(url.into(), MediaPriority::SelectedThumbnail, true);
+        app.submit_image_load(url.into(), MediaPriority::VisibleMedia, true);
+        assert_eq!(app.media_scheduler.queued(), 1);
+        let job = app.media_scheduler.take_next().unwrap();
+        assert_eq!(job.priority, MediaPriority::VisibleMedia);
+        assert!(app.media_scheduler.take_next().is_none());
+    }
+
     fn app_with_items(items: Vec<FeedItem>) -> App {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::from_path(dir.path().join("accounts.json"));
