@@ -87,6 +87,12 @@ impl ViewState {
         }
     }
 
+    fn renew_identity(&mut self) {
+        self.id = ViewId::fresh();
+        // Inserted copies do not inherit requests owned by the old instance.
+        self.loading = false;
+    }
+
     pub fn id(&self) -> ViewId {
         self.id
     }
@@ -232,7 +238,7 @@ impl Clone for NavigationStack {
     fn clone(&self) -> Self {
         let mut views = self.views.clone();
         for view in &mut views {
-            view.id = ViewId::fresh();
+            view.renew_identity();
         }
         Self { views }
     }
@@ -240,7 +246,7 @@ impl Clone for NavigationStack {
 
 impl NavigationStack {
     pub fn new(mut root: ViewState) -> Self {
-        root.id = ViewId::fresh();
+        root.renew_identity();
         Self { views: vec![root] }
     }
 
@@ -257,24 +263,28 @@ impl NavigationStack {
     }
 
     pub fn push(&mut self, mut view: ViewState) {
-        view.id = ViewId::fresh();
+        view.renew_identity();
         self.views.push(view);
     }
 
     /// Swap out the root view (the timeline) without touching anything the
     /// user has pushed on top of it.
     pub fn replace_root(&mut self, mut view: ViewState) {
-        view.id = ViewId::fresh();
+        view.renew_identity();
         self.views[0] = view;
     }
 
     pub fn replace_current(&mut self, mut view: ViewState) {
-        view.id = ViewId::fresh();
+        view.renew_identity();
         *self.current_mut() = view;
     }
 
     pub fn root(&self) -> &ViewState {
         &self.views[0]
+    }
+
+    pub fn get(&self, id: ViewId) -> Option<&ViewState> {
+        self.views.iter().find(|view| view.id == id)
     }
 
     pub fn get_mut(&mut self, id: ViewId) -> Option<&mut ViewState> {
@@ -387,6 +397,23 @@ mod tests {
             embed_status: None,
             depth: 0,
         }
+    }
+
+    #[test]
+    fn inserted_copies_do_not_inherit_in_flight_loading() {
+        let mut root = ViewState::new("Timeline", ViewKind::Timeline, vec![]);
+        root.loading = true;
+        let mut stack = NavigationStack::new(root.clone());
+        assert!(!stack.current().loading);
+        stack.current_mut().loading = true;
+        assert!(!stack.clone().current().loading);
+        assert!(stack.current().loading);
+        stack.push(root.clone());
+        assert!(!stack.current().loading);
+        stack.replace_current(root.clone());
+        assert!(!stack.current().loading);
+        stack.replace_root(root);
+        assert!(!stack.root().loading);
     }
 
     #[test]
