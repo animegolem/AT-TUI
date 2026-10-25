@@ -98,13 +98,6 @@ pub enum MenuSection {
     Settings,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MenuTabAction {
-    MoveSection(isize),
-    SwitchAccount(isize),
-    SwitchFeed(isize),
-}
-
 impl MenuSection {
     pub fn label(self) -> &'static str {
         match self {
@@ -131,15 +124,6 @@ impl MenuSection {
             Self::Feeds => Self::Accounts,
             Self::Settings => Self::Feeds,
         }
-    }
-}
-
-fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
-    let delta = if reverse { -1 } else { 1 };
-    match section {
-        MenuSection::Accounts => MenuTabAction::SwitchAccount(delta),
-        MenuSection::Feeds => MenuTabAction::SwitchFeed(delta),
-        MenuSection::Keys | MenuSection::Settings => MenuTabAction::MoveSection(delta),
     }
 }
 
@@ -971,11 +955,10 @@ impl App {
         enum Action {
             None,
             Close,
-            SwitchAccount(isize),
-            SwitchFeed(isize),
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
             CloseComposer(ComposerState),
+            OpenSwitcher,
             SwitchTo(usize),
             PlayVideo(Option<PreviewVideo>),
             SubmitComposer(Option<ComposerState>),
@@ -984,26 +967,13 @@ impl App {
 
         let mut action = Action::None;
         match self.overlay.as_mut() {
-            Some(Overlay::Menu(state)) => match key.code {
+            // The help card is read-only: no hidden section cursor that
+            // could switch accounts without a visible cue.
+            Some(Overlay::Menu(_)) => match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
                     action = Action::Close;
                 }
-                KeyCode::Char('j') | KeyCode::Down => state.next(),
-                KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                KeyCode::Tab | KeyCode::BackTab => {
-                    match menu_tab_action(state.section, matches!(key.code, KeyCode::BackTab)) {
-                        MenuTabAction::MoveSection(delta) if delta > 0 => state.next(),
-                        MenuTabAction::MoveSection(_) => state.previous(),
-                        MenuTabAction::SwitchAccount(delta) => {
-                            action = Action::SwitchAccount(delta);
-                        }
-                        MenuTabAction::SwitchFeed(delta) => {
-                            action = Action::SwitchFeed(delta);
-                        }
-                    }
-                }
-                KeyCode::Char('[') => action = Action::SwitchFeed(-1),
-                KeyCode::Char(']') => action = Action::SwitchFeed(1),
+                KeyCode::Tab => action = Action::OpenSwitcher,
                 _ => {}
             },
             Some(Overlay::Media(state)) => match key.code {
@@ -1106,7 +1076,11 @@ impl App {
                     self.set_status("Draft kept; reopen the composer to continue");
                 }
             }
-            Action::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
+            Action::OpenSwitcher => {
+                self.overlay = Some(Overlay::Switcher(SwitcherState {
+                    selected: self.active_feed,
+                }));
+            }
             Action::SwitchTo(index) => {
                 self.overlay = None;
                 if index < self.feeds.len() {
@@ -1120,7 +1094,6 @@ impl App {
                     self.queue_account_switch(account);
                 }
             }
-            Action::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
             Action::OpenLink(link) => {
                 if let Some(link) = link {
                     self.open_link(link);
@@ -1397,25 +1370,6 @@ impl App {
             self.feeds[next].clone(),
             format!("Loading {}", self.feeds[next].label),
         );
-        Ok(())
-    }
-
-    async fn switch_account_delta(&mut self, delta: isize) -> Result<()> {
-        if self.accounts.len() <= 1 {
-            self.set_status("No other accounts saved");
-            return Ok(());
-        }
-
-        let current_did = self.client.session().did.clone();
-        let current = self
-            .accounts
-            .iter()
-            .position(|account| account.session.did == current_did)
-            .unwrap_or(0);
-        let len = self.accounts.len() as isize;
-        let next = (current as isize + delta).rem_euclid(len) as usize;
-        let account = self.accounts[next].clone();
-        self.queue_account_switch(account);
         Ok(())
     }
 
@@ -2973,26 +2927,6 @@ mod tests {
         assert_eq!(state.section, MenuSection::Accounts);
     }
 
-    #[test]
-    fn menu_tab_maps_to_section_account_and_feed_actions() {
-        assert_eq!(
-            menu_tab_action(MenuSection::Keys, false),
-            MenuTabAction::MoveSection(1)
-        );
-        assert_eq!(
-            menu_tab_action(MenuSection::Settings, true),
-            MenuTabAction::MoveSection(-1)
-        );
-        assert_eq!(
-            menu_tab_action(MenuSection::Accounts, false),
-            MenuTabAction::SwitchAccount(1)
-        );
-        assert_eq!(
-            menu_tab_action(MenuSection::Feeds, true),
-            MenuTabAction::SwitchFeed(-1)
-        );
-    }
-
     #[tokio::test]
     async fn image_overlay_opens_before_image_load_finishes() {
         let mut item = item("post", "hello");
@@ -3281,6 +3215,34 @@ mod tests {
         assert_eq!(buffer, "hello brave  new ");
         delete_last_word(&mut buffer);
         assert_eq!(buffer, "hello brave  ");
+    }
+
+    #[tokio::test]
+    async fn help_card_keys_never_switch_feed_or_account() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.feeds.push(FeedSource {
+            label: "News".into(),
+            kind: FeedSourceKind::Generator {
+                uri: "at://did:plc:x/app.bsky.feed.generator/news".into(),
+            },
+        });
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        for code in [
+            KeyCode::Char('?'),
+            KeyCode::Char('j'),
+            KeyCode::Char(']'),
+            KeyCode::BackTab,
+            KeyCode::Tab,
+        ] {
+            app.handle_key(press(code)).await.unwrap();
+        }
+
+        assert_eq!(app.active_feed, 0);
+        assert!(app.pending_feed.is_none());
+        assert!(app.pending_account.is_none());
+        // Tab from help opens the visible switcher, which still needs Enter.
+        assert!(matches!(app.overlay, Some(Overlay::Switcher(_))));
     }
 
     #[test]
