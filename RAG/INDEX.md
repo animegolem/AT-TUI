@@ -6,8 +6,8 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 1 | 0 |
-| Planned | 1 | 2 |
+| In Progress | 1 | 1 |
+| Planned | 1 | 1 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
 | Completed | 1 | 10 |
@@ -19,7 +19,7 @@
 
 **IMPs:**
 - [[AI-IMP-003-1-release-review-fixes|IMP-003-1]] 1 release review fixes — completed
-- [[AI-IMP-003-2-ui-refresh-proposals|IMP-003-2]] 2 ui refresh proposals — planned
+- [[AI-IMP-003-2-ui-refresh-proposals|IMP-003-2]] 2 ui refresh proposals — in-progress
 
 ---
 

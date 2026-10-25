@@ -5,7 +5,7 @@ tags:
   - Implementation
   - at-tui
   - ui
-kanban_status: planned
+kanban_status: in-progress
 depends_on:
   - AI-IMP-003-1
 parent_epic: [[AI-EPIC-003-at-tui-release-review]]
@@ -30,13 +30,15 @@ Prototype on `proposal/ui-refresh` (unmerged) covering proposals 1–15: full-he
 
 ### Implementation Checklist
 - [x] Prototype 1–15 with tests (138 passing, gate green) on `proposal/ui-refresh`.
-- [ ] Record the owner's decision per proposal.
-- [ ] Remove skipped items; implement approved 16–20.
-- [ ] Update README keys (Tab, ^E, ^W/^U) and help card together.
-- [ ] Rebase onto `review/release-fixes`, gate, merge.
+- [x] Record the owner's decision: 1–15 approved 2026-10-25 ("the examples look good to me, we can move ahead"). 16–20 and item 0 (reply-filter keep/revert) awaiting an explicit word.
+- [ ] Implement whichever of 16–20 are approved.
+- [x] Update README keys (Tab switcher, P/N, ^E, ^W/^U) together with the help card.
+- [x] Rebase onto `review/release-fixes`, gate, fast-forward `review/release-fixes`.
 
 ### Acceptance Criteria
 **GIVEN** the owner's decision list **WHEN** the branch merges **THEN** every approved item is present, every skipped item is absent, and the README, help card and keymap agree.
 
 ### Issues Encountered
+Owner review caught nothing; the advisor pass did: the prototype's help card replaced the render but kept the old menu key handler, so `?` `j` `Tab` could still switch accounts invisibly. Fixed with a regression test before presenting.
+
 `^E` was implemented in the prototype so its hint is truthful; a fake-editor run verified the suspend/resume round trip. Live terminal glyph fallback for `⟳ ❞ ◆` varies by font; all glyphs are non-Nerd-Font Unicode.

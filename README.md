@@ -85,17 +85,22 @@ cargo run -- --no-images
 - `/`: search within loaded posts in the current view
 - `n`: next search match
 - `R`: reload current view
-- `?`: menu with keys, account, feed, and image settings
+- `P`: open the selected author's profile
+- `N`: open notifications
+- Tab: switch feed or account
+- `?`: key reference
 - `Ctrl-C`: quit from anywhere
 
-Menu:
+Key reference (`?`):
 
-- `j` / Down: next section
-- `k` / Up: previous section
-- Tab: next account/feed when the Accounts or Feeds section is selected
-- Shift-Tab: previous account/feed when the Accounts or Feeds section is selected
-- `[` / `]`: previous/next feed
-- Esc / `?` / Enter / `q`: close menu
+- Esc / `?` / Enter / `q`: close
+- Tab: open the feed and account switcher
+
+Feed and account switcher (Tab):
+
+- `j` / Down, `k` / Up: move
+- Enter / `l`: switch to the selected feed or account
+- Esc / Tab / `q`: close without switching
 
 Media overlay:
 
@@ -109,6 +114,8 @@ Composer:
 
 - Type or paste normally; Enter inserts a newline
 - Ctrl-S: send (if sending fails, the draft is kept)
+- Ctrl-W: delete the previous word; Ctrl-U: clear the current line
+- Ctrl-E: edit the draft in `$VISUAL` / `$EDITOR` (vi if unset), then return to the composer
 - Esc: close; a non-empty draft is kept and returns when you reopen the composer for the same post
 
 Pasting only goes into the composer or the search prompt; a paste anywhere else is ignored.

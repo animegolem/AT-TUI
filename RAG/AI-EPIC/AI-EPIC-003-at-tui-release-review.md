@@ -44,7 +44,7 @@ Changing ratified EPIC-002 keymap behaviour (Esc at root, quit semantics, page m
 - [x] FR-7: Drafts survive Esc and failed sends.
 - [x] FR-8: Saved feeds show their display names; the home reply filter follows the official default and checks the right people; a failed feed switch reverts.
 - [x] FR-9: Relative timestamps stay current; account config writes are atomic; disk cache is bounded.
-- [ ] FR-10: Owner-approved UI proposals merged; skipped ones removed from the prototype.
+- [ ] FR-10: Owner-approved UI proposals merged (1–15 merged 2026-10-25; 16–20 pending a decision).
 
 ### Non-Functional Requirements
 - No new dependencies. Every behavioural fix lands with a test; the three headline fixes are also verified against the live service.
