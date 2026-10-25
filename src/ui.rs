@@ -37,7 +37,7 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let active_did = app.client.session().did.clone();
     let view = app.nav.current_mut();
-    let title = if view.loading {
+    let title = if view.loading || view.page_request.is_some() {
         format!("{} [loading]", view.title)
     } else {
         view.title.clone()
@@ -50,16 +50,20 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .as_ref()
         .map(|profile| render_profile_header_lines(profile, inner_width, &active_did))
         .unwrap_or_default();
-    let list_available = available_lines.saturating_sub(profile_lines.len());
+    // Reserve the error row before laying out the list; appended after a
+    // full page of posts it was clipped and never seen.
+    let error_line = view.error.as_ref().map(|error| {
+        Line::from(vec![Span::styled(
+            truncate(&format!("⚠ {}", single_line(error)), inner_width + 2),
+            Style::default().fg(Color::Red),
+        )])
+    });
+    let list_available = available_lines
+        .saturating_sub(profile_lines.len())
+        .saturating_sub(usize::from(error_line.is_some()));
     let mut lines = profile_lines;
     lines.extend(visible_feed_lines(view, inner_width, list_available));
-
-    if let Some(error) = &view.error {
-        lines.push(Line::from(vec![Span::styled(
-            format!("Error: {error}"),
-            Style::default().fg(Color::Red),
-        )]));
-    }
+    lines.extend(error_line);
 
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -600,6 +604,10 @@ fn truncate(value: &str, max: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
+}
+
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn rounded_block() -> Block<'static> {

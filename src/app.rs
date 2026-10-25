@@ -500,7 +500,6 @@ pub struct App {
     events_rx: UnboundedReceiver<AppEvent>,
     next_request_id: RequestId,
     pending_feed: Option<RequestId>,
-    pending_pagination: Option<RequestId>,
     pending_refresh: Option<RequestId>,
     pending_notification_count: Option<RequestId>,
     pending_notifications: Option<RequestId>,
@@ -518,6 +517,8 @@ pub struct App {
 }
 
 const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+const STATUS_TTL: Duration = Duration::from_secs(2);
+const ERROR_STATUS_TTL: Duration = Duration::from_secs(8);
 
 impl App {
     pub async fn bootstrap(mut client: BskyClient, media: MediaCache) -> Result<Self> {
@@ -571,7 +572,6 @@ impl App {
             events_rx,
             next_request_id: 1,
             pending_feed: None,
-            pending_pagination: None,
             pending_refresh: None,
             pending_notification_count: None,
             pending_notifications: None,
@@ -617,7 +617,14 @@ impl App {
 
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
-        self.status_expires_at = Some(Instant::now() + Duration::from_secs(2));
+        self.status_expires_at = Some(Instant::now() + STATUS_TTL);
+    }
+
+    /// Failures stay readable long enough to notice; a two-second flash is
+    /// easy to miss for a post that did not send.
+    pub fn set_error_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.status_expires_at = Some(Instant::now() + ERROR_STATUS_TTL);
     }
 
     pub fn visible_status(&self) -> Option<&str> {
@@ -654,7 +661,7 @@ impl App {
                 self.media.finish_video_load(playlist_url.clone(), result);
                 match self.media.video_state_name(&playlist_url) {
                     "ready" => self.set_status("Video frames ready"),
-                    "failed" => self.set_status("Video decode failed"),
+                    "failed" => self.set_error_status("Video decode failed"),
                     _ => {}
                 }
             }
@@ -682,32 +689,19 @@ impl App {
                 request_id,
                 source,
                 result,
-            } => {
-                if self.pending_pagination == Some(request_id) {
-                    self.pending_pagination = None;
-                    self.apply_page_loaded(source, result);
-                }
-            }
+            } => self.apply_page_loaded(request_id, source, result),
             AppEvent::ProfilePageLoaded {
                 request_id,
                 actor,
                 result,
-            } => {
-                if self.pending_pagination == Some(request_id) {
-                    self.pending_pagination = None;
-                    self.apply_profile_page_loaded(actor, result);
-                }
-            }
+            } => self.apply_profile_page_loaded(request_id, actor, result),
             AppEvent::NotificationsPageLoaded {
                 request_id,
                 account_did,
                 result,
             } => {
-                if self.pending_pagination == Some(request_id) {
-                    self.pending_pagination = None;
-                    if account_did == self.client.session().did {
-                        self.apply_notifications_page_loaded(result);
-                    }
+                if account_did == self.client.session().did {
+                    self.apply_notifications_page_loaded(request_id, result);
                 }
             }
             AppEvent::ThreadLoaded {
@@ -750,7 +744,7 @@ impl App {
             }
             AppEvent::LinkOpened { uri, result } => match result {
                 Ok(()) => self.set_status(format!("Opened {uri}")),
-                Err(error) => self.set_status(format!("Could not open link: {error}")),
+                Err(error) => self.set_error_status(format!("Could not open link: {error}")),
             },
             AppEvent::WriteCompleted { result } => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
@@ -1399,85 +1393,81 @@ impl App {
             }
             Err(error) => {
                 self.nav.root_mut().error = Some(error);
-                self.set_status("Feed load failed");
+                self.set_error_status("Feed load failed");
             }
         }
     }
 
     fn apply_profile_page_loaded(
         &mut self,
+        request_id: RequestId,
         actor: String,
         result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
     ) {
-        let current = self.nav.current_mut();
-        current.loading = false;
-        if !matches!(&current.kind, ViewKind::Profile { actor: current_actor } if current_actor == &actor)
-        {
+        let Some(view) = self.nav.view_with_page_request_mut(request_id) else {
+            return;
+        };
+        view.page_request = None;
+        if !matches!(&view.kind, ViewKind::Profile { actor: view_actor } if view_actor == &actor) {
             return;
         }
-
-        match result {
-            Ok((mut items, cursor)) => {
-                current.append_posts(&mut items);
-                current.cursor = cursor;
-                self.set_status("Loaded more posts");
-            }
-            Err(error) => {
-                current.error = Some(error);
-                self.set_status("Pagination failed");
-            }
-        }
+        let status = append_page(
+            view,
+            result.map(|(items, cursor)| (items.into_iter().map(ViewItem::from).collect(), cursor)),
+        );
+        self.set_page_status(status, "Loaded more posts");
     }
 
     fn apply_notifications_page_loaded(
         &mut self,
+        request_id: RequestId,
         result: AppTaskResult<(Vec<NotificationItem>, Option<String>)>,
     ) {
-        let current = self.nav.current_mut();
-        current.loading = false;
-        if !matches!(current.kind, ViewKind::Notifications) {
+        let Some(view) = self.nav.view_with_page_request_mut(request_id) else {
+            return;
+        };
+        view.page_request = None;
+        if !matches!(view.kind, ViewKind::Notifications) {
             return;
         }
-
-        match result {
-            Ok((items, cursor)) => {
+        let status = append_page(
+            view,
+            result.map(|(items, cursor)| {
                 let rows = items
                     .into_iter()
                     .map(|item| ViewItem::Notification(Box::new(item)))
-                    .collect::<Vec<_>>();
-                current.append_rows(rows);
-                current.cursor = cursor;
-                self.set_status("Loaded more notifications");
-            }
-            Err(error) => {
-                current.error = Some(error);
-                self.set_status("Pagination failed");
-            }
-        }
+                    .collect();
+                (rows, cursor)
+            }),
+        );
+        self.set_page_status(status, "Loaded more notifications");
     }
 
     fn apply_page_loaded(
         &mut self,
+        request_id: RequestId,
         source: FeedSource,
         result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
     ) {
-        let active_source = self.feeds.get(self.active_feed);
-        let current = self.nav.current_mut();
-        current.loading = false;
-        if active_source != Some(&source) || !matches!(current.kind, ViewKind::Timeline) {
+        let active_source = self.feeds.get(self.active_feed).cloned();
+        let Some(view) = self.nav.view_with_page_request_mut(request_id) else {
+            return;
+        };
+        view.page_request = None;
+        if active_source.as_ref() != Some(&source) || !matches!(view.kind, ViewKind::Timeline) {
             return;
         }
+        let status = append_page(
+            view,
+            result.map(|(items, cursor)| (items.into_iter().map(ViewItem::from).collect(), cursor)),
+        );
+        self.set_page_status(status, "Loaded more timeline posts");
+    }
 
+    fn set_page_status(&mut self, result: std::result::Result<(), ()>, success: &str) {
         match result {
-            Ok((mut items, cursor)) => {
-                current.append_posts(&mut items);
-                current.cursor = cursor;
-                self.set_status("Loaded more timeline posts");
-            }
-            Err(error) => {
-                current.error = Some(error);
-                self.set_status("Pagination failed");
-            }
+            Ok(()) => self.set_status(success),
+            Err(()) => self.set_error_status("Pagination failed"),
         }
     }
 
@@ -1598,7 +1588,7 @@ impl App {
                 self.nav.retain_items(|item| item.uri() != uri);
                 self.set_status("Post deleted");
             }
-            Err(error) => self.set_status(format!("Write failed: {error}")),
+            Err(error) => self.set_error_status(format!("Write failed: {error}")),
         }
     }
 
@@ -1651,7 +1641,7 @@ impl App {
                     self.nav.push(view);
                     self.set_status("Thread loaded");
                 }
-                Err(error) => self.set_status(format!("Thread load failed: {error}")),
+                Err(error) => self.set_error_status(format!("Thread load failed: {error}")),
             },
             ThreadAction::OpenQuote { quote } => match result {
                 Ok(mut items) => {
@@ -1693,7 +1683,7 @@ impl App {
                     );
                     self.set_status("View refreshed");
                 }
-                Err(error) => self.set_status(format!("Refresh failed: {error}")),
+                Err(error) => self.set_error_status(format!("Refresh failed: {error}")),
             },
         }
     }
@@ -1720,7 +1710,7 @@ impl App {
                 }
                 self.set_status("Profile loaded");
             }
-            Err(error) => self.set_status(format!("Profile load failed: {error}")),
+            Err(error) => self.set_error_status(format!("Profile load failed: {error}")),
         }
     }
 
@@ -1744,7 +1734,7 @@ impl App {
                     self.last_notification_poll = Instant::now();
                     self.set_status("Notifications loaded");
                 } else {
-                    self.set_status(format!(
+                    self.set_error_status(format!(
                         "Notifications loaded; seen update failed{}",
                         data.seen_error
                             .as_deref()
@@ -1753,7 +1743,7 @@ impl App {
                     ));
                 }
             }
-            Err(error) => self.set_status(format!("Notifications failed: {error}")),
+            Err(error) => self.set_error_status(format!("Notifications failed: {error}")),
         }
     }
 
@@ -1781,7 +1771,7 @@ impl App {
                 self.last_notification_poll = Instant::now() - self.notification_interval;
                 self.set_status(format!("Switched to @{}", self.client.session().handle));
             }
-            Err(error) => self.set_status(format!("Account switch failed: {error}")),
+            Err(error) => self.set_error_status(format!("Account switch failed: {error}")),
         }
         Ok(())
     }
@@ -2203,6 +2193,7 @@ impl App {
             let current = self.nav.current();
             current.cursor.is_some()
                 && !current.loading
+                && current.page_request.is_none()
                 && current.selected.saturating_add(5) >= current.items.len()
         };
 
@@ -2216,10 +2207,9 @@ impl App {
 
         match self.nav.current().kind.clone() {
             ViewKind::Timeline => {
-                self.nav.current_mut().loading = true;
                 let source = self.feeds[self.active_feed].clone();
                 let id = self.next_request_id();
-                self.pending_pagination = Some(id);
+                self.nav.current_mut().page_request = Some(id);
                 let mut client = self.client.clone();
                 let prefs = self.home_feed_prefs;
                 self.spawn_event(async move {
@@ -2234,9 +2224,8 @@ impl App {
                 });
             }
             ViewKind::Profile { actor } => {
-                self.nav.current_mut().loading = true;
                 let id = self.next_request_id();
-                self.pending_pagination = Some(id);
+                self.nav.current_mut().page_request = Some(id);
                 let mut client = self.client.clone();
                 self.spawn_event(async move {
                     let result = client
@@ -2252,9 +2241,8 @@ impl App {
                 });
             }
             ViewKind::Notifications => {
-                self.nav.current_mut().loading = true;
                 let id = self.next_request_id();
-                self.pending_pagination = Some(id);
+                self.nav.current_mut().page_request = Some(id);
                 let account_did = self.client.session().did.clone();
                 let mut client = self.client.clone();
                 self.spawn_event(async move {
@@ -2368,7 +2356,7 @@ impl App {
 
     pub fn has_pending_tasks(&self) -> bool {
         self.pending_feed.is_some()
-            || self.pending_pagination.is_some()
+            || self.nav.any_page_request()
             || self.pending_refresh.is_some()
             || self.pending_notification_count.is_some()
             || self.pending_notifications.is_some()
@@ -2389,7 +2377,7 @@ impl App {
             Some("Loading profile")
         } else if self.pending_notifications.is_some() {
             Some("Loading notifications")
-        } else if self.pending_pagination.is_some() {
+        } else if self.nav.any_page_request() {
             Some("Loading more")
         } else if self.pending_writes > 0 {
             Some("Writing")
@@ -2448,6 +2436,26 @@ impl App {
 
     pub fn spinner_char(&self) -> char {
         SPINNER_FRAMES[self.spinner_index % SPINNER_FRAMES.len()]
+    }
+}
+
+/// Applies one page of rows to the view that requested it; errors stay on
+/// the view (rendered inline) and a later good page clears them.
+fn append_page(
+    view: &mut ViewState,
+    result: AppTaskResult<(Vec<ViewItem>, Option<String>)>,
+) -> std::result::Result<(), ()> {
+    match result {
+        Ok((rows, cursor)) => {
+            view.append_rows(rows);
+            view.cursor = cursor;
+            view.error = None;
+            Ok(())
+        }
+        Err(error) => {
+            view.error = Some(error);
+            Err(())
+        }
     }
 }
 
@@ -2756,7 +2764,7 @@ mod tests {
     #[test]
     fn stale_pagination_event_is_ignored() {
         let mut app = app_with_items(vec![item("original", "hello")]);
-        app.pending_pagination = Some(2);
+        app.nav.current_mut().page_request = Some(2);
 
         app.apply_event(AppEvent::PageLoaded {
             request_id: 1,
@@ -2767,6 +2775,86 @@ mod tests {
 
         assert_eq!(app.nav.current().items.len(), 1);
         assert_eq!(app.nav.current().items[0].uri(), "original");
+        assert_eq!(app.nav.current().page_request, Some(2));
+    }
+
+    #[test]
+    fn timeline_page_lands_on_root_after_user_navigates_away() {
+        // Repro from a live session: G (page load starts), l (thread
+        // pushed), page lands, h. The root used to keep `loading = true`
+        // forever and never paginate again.
+        let mut app = app_with_items(vec![item("one", "one")]);
+        app.nav.current_mut().cursor = Some("page-2".into());
+        app.nav.current_mut().page_request = Some(7);
+        app.nav.push(ViewState::new(
+            "Thread @alice.test",
+            ViewKind::Thread {
+                root_uri: "one".into(),
+            },
+            vec![item("one", "one")],
+        ));
+
+        app.apply_event(AppEvent::PageLoaded {
+            request_id: 7,
+            source: FeedSource::home(),
+            result: Ok((vec![item("two", "two")], Some("page-3".into()))),
+        })
+        .unwrap();
+
+        assert!(!app.has_pending_tasks());
+        assert!(app.nav.pop());
+        let root = app.nav.current();
+        assert_eq!(root.items.len(), 2);
+        assert_eq!(root.cursor.as_deref(), Some("page-3"));
+        assert_eq!(root.page_request, None);
+        assert!(!root.loading);
+    }
+
+    fn render_to_text(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn view_error_stays_visible_when_list_fills_the_screen() {
+        let mut app = app_with_items((0..20).map(|i| item(&i.to_string(), "filler")).collect());
+        app.nav.current_mut().error = Some("Bluesky API returned 502:\n gateway".into());
+
+        let rows = render_to_text(&mut app, 60, 14);
+
+        // Last row is the statusline, the one above the bottom border; the
+        // error sits on the final content row.
+        assert!(
+            rows[11].contains("⚠ Bluesky API returned 502: gateway"),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn failed_page_shows_error_until_next_good_page() {
+        let mut app = app_with_items(vec![item("one", "one")]);
+        app.nav.current_mut().page_request = Some(3);
+        app.apply_event(AppEvent::PageLoaded {
+            request_id: 3,
+            source: FeedSource::home(),
+            result: Err("timed out".into()),
+        })
+        .unwrap();
+        assert_eq!(app.nav.current().error.as_deref(), Some("timed out"));
+
+        app.nav.current_mut().page_request = Some(4);
+        app.apply_event(AppEvent::PageLoaded {
+            request_id: 4,
+            source: FeedSource::home(),
+            result: Ok((vec![item("two", "two")], None)),
+        })
+        .unwrap();
+        assert_eq!(app.nav.current().error, None);
     }
 
     #[test]
@@ -2780,8 +2868,8 @@ mod tests {
             vec![item("bob-1", "one")],
         );
         profile_view.cursor = Some("page-2".into());
+        profile_view.page_request = Some(9);
         app.nav.push(profile_view);
-        app.pending_pagination = Some(9);
 
         app.apply_event(AppEvent::ProfilePageLoaded {
             request_id: 9,
@@ -2805,8 +2893,8 @@ mod tests {
             )))],
         );
         view.cursor = Some("page-2".into());
+        view.page_request = Some(9);
         app.nav.push(view);
-        app.pending_pagination = Some(9);
 
         app.apply_event(AppEvent::NotificationsPageLoaded {
             request_id: 9,
@@ -3593,7 +3681,6 @@ mod tests {
             events_rx,
             next_request_id: 1,
             pending_feed: None,
-            pending_pagination: None,
             pending_refresh: None,
             pending_notification_count: None,
             pending_notifications: None,
