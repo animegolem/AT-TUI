@@ -1,11 +1,11 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use at_tui::{
     api::BskyClient,
     app::run_tui,
     config::SessionStore,
-    media::{MediaCache, RequestedImageProtocol},
+    media::{RequestedImageProtocol, describe_image_support},
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -127,13 +127,16 @@ async fn main() -> Result<()> {
         Some(Command::Session) => {
             let account = store.active_account()?;
             let session = account.session;
-            let media = MediaCache::disabled();
             println!("Account: {}", account.label);
             println!("Handle: @{}", session.handle);
             println!("DID: {}", session.did);
             println!("Service: {}", session.service);
             println!("Accounts file: {}", store.path().display());
-            println!("Images: {}", media.protocol_name());
+            let on_terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+            println!(
+                "Images: {}",
+                describe_image_support(cli.no_images, cli.image_protocol.into(), on_terminal)
+            );
         }
         None => {
             let account = store
