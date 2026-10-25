@@ -153,6 +153,10 @@ post("welcome", "welcome", "wren", "Welcome aboard! N opens notifications, ? ope
      likes=2, reply_to="mine")
 post("tqt", "tqt", "tomas", "Another one for the terminal club.", 160, likes=3, embed=quote("mine"))
 post("hi", "hi", "juno", "Say hi to @demo.example, new to the terminal club.", 150, likes=4)
+post("clip", "clip", "sundial", "Ten seconds of the sundial turning. Enter plays it in mpv.", 200,
+     reposts=4, likes=57,
+     embed={"$type": "app.bsky.embed.video#view", "playlist": f"{BASE}/vid/clip.m3u8",
+            "thumbnail": f"{BASE}/img/sundial.png", "alt": "The sundial rings slowly rotating."})
 
 
 def entry(key, reason_by=None, reply=True, minutes=None):
@@ -171,7 +175,7 @@ def entry(key, reason_by=None, reply=True, minutes=None):
 
 TIMELINE = [entry("launch"), entry("kingfisher", reason_by="ines", minutes=14), entry("tree"),
             entry("protocol"), entry("printat"), entry("editor"), entry("sundial"),
-            entry("colors")]
+            entry("colors"), entry("clip")]
 FEEDS = {
     "at://did:plc:juno/app.bsky.feed.generator/birds": ("Birds", [entry("kingfisher"), entry("sundial")]),
     "at://did:plc:ines/app.bsky.feed.generator/retro": ("Retro Computing",

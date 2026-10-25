@@ -1,7 +1,15 @@
 [package]
 name = "at-tui"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.90"
+description = "A keyboard-first Bluesky client for the terminal"
+license = "MIT"
+repository = "https://github.com/animegolem/AT-TUI"
+readme = "README.md"
+keywords = ["bluesky", "atproto", "tui", "terminal", "ratatui"]
+categories = ["command-line-utilities"]
+exclude = ["demo/", ".github/"]
 
 [dependencies]
 anyhow = "1.0.98"

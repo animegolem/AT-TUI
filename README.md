@@ -1,146 +1,111 @@
 # at-tui
 
-A Bluesky terminal client prototype.
+A keyboard-first Bluesky client for the terminal: one column of posts, vim-style movement, and a stack of views you open and back out of, the way you'd read mail in mutt.
 
 ![at-tui: timeline, media viewer, thread tree, profile, grouped notifications, the menu, replying and liking](demo/at-tui-demo.gif)
 
 <sub>Recorded with [VHS](https://github.com/charmbracelet/vhs) against a local mock server with made-up accounts; re-record with `demo/record.sh`.</sub>
 
-## What Works
+## Features
 
-- App-password login against Bluesky's XRPC API.
-- Multi-account app-password sessions in the platform config directory, with startup refresh.
-- Authenticated Bluesky home timeline (`app.bsky.feed.getTimeline`) with cursor pagination.
-- Saved feed switching through `app.bsky.feed.getFeed`.
-- Your Posts feed through `app.bsky.feed.getAuthorFeed`.
-- Background refresh with pending-new-post counts.
-- Home feed preference reads for replies, reposts, and quote posts.
-- Repost and reply context rendering.
-- Stack-based navigation inspired by Ranger/Yazi.
-- Single-column timeline/thread/feed layout at every terminal width.
-- Background loading for pagination, threads, feeds, account switches, images, and link opening.
-- Vim-style movement with `j`/`k`.
-- Thread/reply navigation with `l`, right arrow, or Enter.
-- Back navigation with `h`, left arrow, or Esc.
-- Inline quote-post rendering, with `o` to open the quoted post as its own stack level.
-- Spacebar media preview overlay for post and quote-post images/videos.
-- Experimental terminal video frame decoding through `ffmpeg`.
-- Link extraction from external cards, rich-text facets, and plain URLs, with `u` to open in the default browser.
-- Like/unlike, repost/unrepost, text posts, replies, and quote posts.
-- Filled/outline heart state for liked posts and highlighted repost state.
-- Unread notification count polling in the statusline.
-- Image fetching and terminal image rendering through `ratatui-image`.
-- Image protocol selection with `--image-protocol auto|kitty|sixel|iterm2|halfblocks`.
-- `--no-images` fallback mode.
-- Unicode text-symbol counters: `↩`, `⟳`, `♥`, and `❞`.
+- Read and page through your Following timeline, saved feeds, your own posts, profiles, threads, and notifications.
+- Threads drawn as a tree. Notifications grouped per post ("Ana, Ben and 4 others liked your post"), with the text of the post they're about.
+- Like, repost, follow, post, reply, quote, and delete your own posts. Links and @mentions become rich text.
+- Compose in the built-in editor or hand the draft to `$VISUAL`/`$EDITOR`. Drafts survive Esc and failed sends.
+- Images in the terminal (Kitty, Sixel, iTerm2, or half-blocks). Video through mpv.
+- Several accounts; switch between them, and between saved feeds, from the menu.
+- Background refresh with a count of new posts and unread notifications. Expired sessions refresh themselves, so the app keeps working after the two-hour token lifetime.
 
-## Usage
+## Requirements
+
+- Rust 1.90 or newer (2024 edition).
+- A Bluesky account and an [app password](https://bsky.app/settings/app-passwords). OAuth isn't supported yet.
+- Any terminal. Images use the best protocol your terminal offers and fall back to half-block characters.
+- Optional: [mpv](https://mpv.io) for video. Terminals with Kitty graphics (kitty, Ghostty) play it in place; elsewhere it opens in an mpv window.
+
+## Install
 
 ```sh
-cargo run -- login
-cargo run --
+cargo install --git https://github.com/animegolem/AT-TUI --tag v1.0.0 --locked
 ```
 
-Manage accounts:
+Or from a checkout: `cargo install --path . --locked`. Either way you get an `at-tui` binary.
+
+## Quickstart
 
 ```sh
-cargo run -- login --account main
-cargo run -- accounts
-cargo run -- switch main
-cargo run -- logout main
+at-tui login     # prompts for your handle and app password
+at-tui           # start the client
 ```
 
-For Ghostty, auto-detection should normally select Kitty graphics. You can force it:
+Press `?` (or Esc at the timeline) for the menu: your feeds and accounts, every key, and the image setting.
+
+Managing accounts:
 
 ```sh
-cargo run -- --image-protocol kitty
-```
-
-Disable image rendering entirely:
-
-```sh
-cargo run -- --no-images
+at-tui login --account work      # add another account under a label
+at-tui accounts                  # list them; * marks the active one
+at-tui switch work
+at-tui logout work
+at-tui session                   # active account, and the image protocol in use
 ```
 
 ## Keys
 
-- `j` / Down: move down
-- `k` / Up: move up
-- `Ctrl-d` / `Ctrl-u`: half page down/up
-- PgDn / PgUp: page down/up
-- `g`: top
-- `G`: bottom
-- `l` / Right / Enter: open replies/thread for the selected post
-- `h` / Left / Esc: go back; Esc on the timeline opens the menu
-- `q`: go back; quits when already at the timeline root
-- `[` / `]`: previous/next saved feed
-- Space: open media overlay for selected post
-- Mouse wheel: move selection
-- `u`: merge pending new posts and jump to top
-- `f`: like/unlike selected post
-- `b`: repost/unrepost selected post
-- `F`: follow/unfollow selected post author, notification author, or active profile
-- `p`: compose a new text post
-- `r`: reply to selected post
-- `Q`: quote selected post
-- `d`: delete your own selected post (with confirmation)
-- `o`: open selected post's link, or show a picker when multiple links exist
-- `e`: open selected post's quoted post
-- `/`: search within loaded posts in the current view
-- `n`: next search match
-- `R`: reload current view
-- `P`: open the selected author's profile
-- `N`: open notifications
-- Tab: quick feed/account switcher
-- `?`: menu
-- `Ctrl-C`: quit from anywhere
+**Timeline, threads, profiles, notifications**
 
-Menu (`?`, or Esc on the timeline): your feeds and accounts at the top, the key reference below, and the image setting at the bottom.
+| Key | Action |
+| --- | --- |
+| `j` `k` / `↓` `↑` / mouse wheel | Move |
+| `Ctrl-d` `Ctrl-u` · `PgDn` `PgUp` | Half page · page |
+| `g` `G` | Top · bottom |
+| `l` / `Enter` / `→` | Open the thread (or what a notification is about) |
+| `h` / `←` | Back |
+| `Esc` | Back; at the timeline, open the menu |
+| `q` | Back; at the timeline, quit |
+| `P` · `N` · `e` | Author's profile · notifications · the quoted post |
+| `Space` · `o` | Media viewer · open a link (picks if there are several) |
+| `f` · `b` · `F` · `d` | Like · repost · follow the author · delete your post |
+| `p` · `r` · `Q` | New post · reply · quote |
+| `[` `]` · `Tab` | Previous/next feed · feed and account switcher |
+| `/` · `n` | Search loaded posts · next match |
+| `R` · `u` | Reload · show new posts |
+| `?` | Menu |
+| `Ctrl-C` | Quit, from anywhere |
 
-- `j` / Down, `k` / Up: move through feeds and accounts
-- Enter / `l`: switch to the highlighted feed or account (on the current feed, just closes)
-- Esc / `?` / `q`: close
+**Menu and switcher:** `j`/`k` move through feeds and accounts, `Enter` switches, `Esc` closes. Nothing switches until you press `Enter`.
 
-Feed and account switcher (Tab):
+**Media viewer:** `h`/`l` previous/next, `Enter` or `p` plays a video in mpv, `u` opens it in your browser, `Space`/`Esc` closes.
 
-- `j` / Down, `k` / Up: move
-- Enter / `l`: switch to the selected feed or account
-- Esc / Tab / `q`: close without switching
+**Composer:** type or paste; `Enter` is a newline. `Ctrl-S` sends, `Ctrl-W` deletes a word, `Ctrl-U` clears the line, `Ctrl-E` edits in `$VISUAL`/`$EDITOR`. `Esc` closes and keeps the draft for the same post.
 
-Media overlay:
+**Delete confirmation:** `y` deletes; any other key cancels.
 
-- `h` / Left: previous item
-- `l` / Right: next item
-- Enter / `p`: decode video frames when selected media is a video
-- `u`: open selected video externally
-- Space / Esc: close overlay
+Pastes go only into the composer or the search prompt; a paste anywhere else is ignored, so stray text can't trigger likes or follows. Links open in your browser only if they're `http(s)`.
 
-Composer:
+## Configuration
 
-- Type or paste normally; Enter inserts a newline
-- Ctrl-S: send (if sending fails, the draft is kept)
-- Ctrl-W: delete the previous word; Ctrl-U: clear the current line
-- Ctrl-E: edit the draft in `$VISUAL` / `$EDITOR` (vi if unset), then return to the composer
-- Esc: close; a non-empty draft is kept and returns when you reopen the composer for the same post
+| Option | Effect |
+| --- | --- |
+| `--image-protocol auto\|kitty\|sixel\|iterm2\|halfblocks` | Force an image protocol (default `auto`) |
+| `--no-images` | Text only |
+| `--service <url>` | Log in through another PDS or entryway (default `https://bsky.social`) |
+| `AT_TUI_MPV` | Path to mpv, if it isn't on `PATH` or in a standard Homebrew location |
+| `AT_TUI_ACCOUNTS_FILE` | Use a different accounts file |
+| `VISUAL` / `EDITOR` | Editor for `Ctrl-E` (default `vi`) |
 
-Pasting only goes into the composer or the search prompt; a paste anywhere else is ignored.
-Links open in the browser only if they are http(s).
+Accounts are stored in your platform's config directory (`~/Library/Application Support/dev.haiti-plan.at-tui/` on macOS, `~/.config/at-tui/` on Linux) with owner-only permissions. Images are cached in the platform cache directory, capped at 256 MiB and 30 days.
 
-Link picker:
+## How the timeline behaves
 
-- `j` / Down: next link
-- `k` / Up: previous link
-- Enter / `u`: open selected link in the default browser
-- Esc: close picker
+- **Following** follows your Bluesky feed preferences for replies, reposts, and quote posts. With no preference set, it shows replies only between people you follow, like the official app.
+- Saved feeds appear under their real names. A **Your Posts** feed is added for the active account.
+- New posts are merged in when you're at the top, and counted in the statusline otherwise. `u` merges them.
 
-## Timeline Semantics
+## Not yet supported
 
-The primary list uses Bluesky's authenticated home timeline endpoint. Reposts are shown as feed items with a compact `⟳ @handle reposted` context line when the API marks the item with a repost reason. Replies are shown with an inline parent preview when the API includes reply context.
+OAuth login, image and video upload, direct messages, mute/block and content-label controls, list feeds, and search beyond the posts already loaded. Accounts on a self-hosted PDS need `--service` at login.
 
-The app reads the `home` feed view preference from `app.bsky.actor.getPreferences` and applies reply, repost, and quote-post hiding locally as a safety net.
+## License
 
-Saved feeds are read from `savedFeedsPrefV2` and legacy `savedFeedsPref`. Feed-generator URIs are switchable with `[` and `]`; saved lists are ignored for now. The app also adds a local `Your Posts` feed for the active account.
-
-## Scope
-
-OAuth, image/video upload, notifications, DMs, moderation controls, list feeds, and article previews are not implemented yet. Terminal video playback is experimental and requires `ffmpeg`.
+MIT. See [LICENSE](LICENSE).
