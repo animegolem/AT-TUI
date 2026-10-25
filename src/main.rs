@@ -10,8 +10,8 @@ use at_tui::{
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(name = "at-tui")]
-#[command(about = "A Bluesky terminal client prototype")]
+#[command(name = "at-tui", version)]
+#[command(about = "A keyboard-first Bluesky client for the terminal")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
