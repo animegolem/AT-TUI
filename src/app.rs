@@ -8,8 +8,8 @@ use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -379,6 +379,10 @@ enum AppEvent {
     WriteCompleted {
         result: AppTaskResult<WriteResult>,
     },
+    PostCompleted {
+        draft: ComposerState,
+        result: AppTaskResult<String>,
+    },
     NotificationCountLoaded {
         request_id: RequestId,
         account_did: String,
@@ -494,6 +498,9 @@ pub struct App {
     pub overlay: Option<Overlay>,
     pub should_quit: bool,
     pub pending_new_items: Vec<FeedItem>,
+    /// Composer text kept across Esc and failed sends, restored when the
+    /// composer reopens for the same target.
+    saved_draft: Option<ComposerState>,
     pub unread_notifications: u64,
     consecutive_poll_failures: u32,
     events_tx: UnboundedSender<AppEvent>,
@@ -566,6 +573,7 @@ impl App {
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
+            saved_draft: None,
             unread_notifications: 0,
             consecutive_poll_failures: 0,
             events_tx,
@@ -750,6 +758,20 @@ impl App {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 self.apply_write_result(result);
             }
+            AppEvent::PostCompleted { draft, result } => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
+                match result {
+                    Ok(uri) => self.apply_write_result(Ok(WriteResult::Posted { uri })),
+                    Err(error) => {
+                        // The overlay closed on send; keep the text so a
+                        // failed post is one keypress from a retry.
+                        self.saved_draft = Some(draft);
+                        self.set_error_status(format!(
+                            "Post failed (draft kept, reopen to retry): {error}"
+                        ));
+                    }
+                }
+            }
             AppEvent::NotificationCountLoaded {
                 request_id,
                 account_did,
@@ -780,6 +802,12 @@ impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Kitty-protocol terminals and Windows also deliver Release/Repeat.
         if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+        // Documented as "quit from anywhere"; search and every overlay used
+        // to swallow it.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
             return Ok(());
         }
         if self.overlay.is_some() {
@@ -816,6 +844,24 @@ impl App {
         }
 
         self.after_input().await
+    }
+
+    /// Bracketed paste arrives as one event. Without it a paste into the
+    /// timeline replays every character as a command (f likes, b reposts,
+    /// F follows), so text only lands where text is expected.
+    pub fn handle_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(Overlay::Composer(state)) = self.overlay.as_mut() {
+            state.buffer.push_str(&text);
+            return;
+        }
+        if self.overlay.is_none()
+            && let InputMode::Search { buffer } = &mut self.input_mode
+        {
+            buffer.push_str(text.lines().next().unwrap_or_default());
+            return;
+        }
+        self.set_status("Paste ignored outside the composer and search");
     }
 
     pub async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
@@ -859,6 +905,7 @@ impl App {
             SwitchFeed(isize),
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
+            CloseComposer(ComposerState),
             PlayVideo(Option<PreviewVideo>),
             SubmitComposer(Option<ComposerState>),
             DeletePost(String),
@@ -931,7 +978,7 @@ impl App {
                 _ => action = Action::Close,
             },
             Some(Overlay::Composer(state)) => match key.code {
-                KeyCode::Esc => action = Action::Close,
+                KeyCode::Esc => action = Action::CloseComposer(state.clone()),
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     action = Action::SubmitComposer(Some(state.clone()));
                 }
@@ -952,6 +999,13 @@ impl App {
         match action {
             Action::None => {}
             Action::Close => self.overlay = None,
+            Action::CloseComposer(state) => {
+                self.overlay = None;
+                if !state.buffer.trim().is_empty() {
+                    self.saved_draft = Some(state);
+                    self.set_status("Draft kept; reopen the composer to continue");
+                }
+            }
             Action::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
             Action::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
             Action::OpenLink(link) => {
@@ -1186,6 +1240,12 @@ impl App {
     }
 
     fn open_uri(&mut self, uri: String) {
+        // Facet URIs are author-controlled and need not match the visible
+        // text; never hand a custom scheme (file:, app handlers) to the OS.
+        if !is_web_uri(&uri) {
+            self.set_error_status(format!("Refusing to open non-web link: {uri}"));
+            return;
+        }
         self.set_status(format!("Opening {uri}"));
         self.spawn_event(async move {
             let opened_uri = uri.clone();
@@ -1943,12 +2003,20 @@ impl App {
         Ok(())
     }
 
+    fn open_composer(&mut self, kind: ComposerKind, status: &str) {
+        let buffer = match self.saved_draft.take() {
+            Some(draft) if draft.kind == kind => draft.buffer,
+            other => {
+                self.saved_draft = other;
+                String::new()
+            }
+        };
+        self.overlay = Some(Overlay::Composer(ComposerState { kind, buffer }));
+        self.set_status(status);
+    }
+
     fn open_post_composer(&mut self) {
-        self.overlay = Some(Overlay::Composer(ComposerState {
-            kind: ComposerKind::Post,
-            buffer: String::new(),
-        }));
-        self.set_status("Compose post");
+        self.open_composer(ComposerKind::Post, "Compose post");
     }
 
     fn open_reply_composer(&mut self) {
@@ -1961,15 +2029,14 @@ impl App {
             return;
         };
         let root = item.reply_root.clone().unwrap_or_else(|| parent.clone());
-        self.overlay = Some(Overlay::Composer(ComposerState {
-            kind: ComposerKind::Reply {
+        self.open_composer(
+            ComposerKind::Reply {
                 root,
                 parent,
                 parent_handle: item.author_handle,
             },
-            buffer: String::new(),
-        }));
-        self.set_status("Compose reply");
+            "Compose reply",
+        );
     }
 
     fn open_quote_composer(&mut self) {
@@ -1981,14 +2048,13 @@ impl App {
             self.set_status("Selected post is missing a CID; cannot quote");
             return;
         };
-        self.overlay = Some(Overlay::Composer(ComposerState {
-            kind: ComposerKind::Quote {
+        self.open_composer(
+            ComposerKind::Quote {
                 quote,
                 quote_handle: item.author_handle,
             },
-            buffer: String::new(),
-        }));
-        self.set_status("Compose quote");
+            "Compose quote",
+        );
     }
 
     fn submit_composer(&mut self, state: ComposerState) {
@@ -2003,7 +2069,7 @@ impl App {
             return;
         }
 
-        let (reply, quote) = match state.kind {
+        let (reply, quote) = match state.kind.clone() {
             ComposerKind::Post => (None, None),
             ComposerKind::Reply { root, parent, .. } => (Some((root, parent)), None),
             ComposerKind::Quote { quote, .. } => (None, Some(quote)),
@@ -2017,9 +2083,12 @@ impl App {
             let result = client
                 .create_post(&text, reply, quote)
                 .await
-                .map(|record| WriteResult::Posted { uri: record.uri })
+                .map(|record| record.uri)
                 .map_err(|error| format!("{error:#}"));
-            AppEvent::WriteCompleted { result }
+            AppEvent::PostCompleted {
+                draft: state,
+                result,
+            }
         });
     }
 
@@ -2464,6 +2533,11 @@ pub fn post_grapheme_count(text: &str) -> usize {
     text.graphemes(true).count()
 }
 
+fn is_web_uri(uri: &str) -> bool {
+    let lower = uri.trim_start().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
 fn post_ref_from_item(item: &FeedItem) -> Option<PostRef> {
     Some(PostRef {
         uri: item.uri.clone(),
@@ -2530,7 +2604,12 @@ pub async fn run_tui(
     let _session = TerminalSession;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2589,6 +2668,10 @@ pub async fn run_tui(
                         dirty = true;
                     }
                 }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                    dirty = true;
+                }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -2605,7 +2688,12 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
     }
 }
 
@@ -2833,6 +2921,104 @@ mod tests {
             rows[11].contains("⚠ Bluesky API returned 502: gateway"),
             "{rows:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn paste_outside_text_fields_fires_no_actions() {
+        let mut item = item("post", "hello");
+        item.cid = Some("cid".into());
+        let mut app = app_with_items(vec![item]);
+
+        app.handle_paste("fbFdp stuff");
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.pending_writes, 0);
+        assert_eq!(app.status, "Paste ignored outside the composer and search");
+    }
+
+    #[test]
+    fn paste_lands_in_composer_with_normalized_newlines() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.open_post_composer();
+
+        app.handle_paste("one\r\ntwo\rthree");
+
+        let Some(Overlay::Composer(state)) = &app.overlay else {
+            panic!("composer closed");
+        };
+        assert_eq!(state.buffer, "one\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_from_search_and_overlays() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.input_mode = InputMode::Search {
+            buffer: String::new(),
+        };
+        app.handle_key(ctrl_c).await.unwrap();
+        assert!(app.should_quit);
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.overlay = Some(Overlay::Menu(MenuState::default()));
+        app.handle_key(ctrl_c).await.unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn only_web_links_are_handed_to_the_os() {
+        assert!(is_web_uri("https://example.com"));
+        assert!(is_web_uri("HTTP://example.com"));
+        assert!(!is_web_uri("file:///etc/passwd"));
+        assert!(!is_web_uri(
+            "x-apple.systempreferences:com.apple.preference"
+        ));
+        assert!(!is_web_uri("javascript:alert(1)"));
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.open_uri("file:///Applications/Calculator.app".into());
+        assert!(app.status.starts_with("Refusing to open non-web link"));
+    }
+
+    #[tokio::test]
+    async fn escaped_draft_returns_only_for_the_same_target() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.open_post_composer();
+        app.handle_paste("half-written thought");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+
+        app.open_post_composer();
+        let Some(Overlay::Composer(state)) = &app.overlay else {
+            panic!("composer closed");
+        };
+        assert_eq!(state.buffer, "half-written thought");
+    }
+
+    #[test]
+    fn failed_post_keeps_its_draft() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.pending_writes = 1;
+        let draft = ComposerState {
+            kind: ComposerKind::Post,
+            buffer: "important words".into(),
+        };
+
+        app.apply_event(AppEvent::PostCompleted {
+            draft,
+            result: Err("Bluesky API returned 502".into()),
+        })
+        .unwrap();
+
+        assert_eq!(app.pending_writes, 0);
+        app.open_post_composer();
+        let Some(Overlay::Composer(state)) = &app.overlay else {
+            panic!("composer closed");
+        };
+        assert_eq!(state.buffer, "important words");
     }
 
     #[test]
@@ -3675,6 +3861,7 @@ mod tests {
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
+            saved_draft: None,
             unread_notifications: 0,
             consecutive_poll_failures: 0,
             events_tx,
