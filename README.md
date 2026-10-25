@@ -6,9 +6,9 @@ interacting with posts.
 
 ## Project status
 
-AT-TUI is in beta and is working toward a tagged `1.0.0` release. Core
-workflows are implemented, but long-running session and terminal media
-validation remain in progress.
+AT-TUI is complete. Core workflows, long-running session behavior, and
+terminal media rendering are implemented and validated, and the runtime
+correctness and efficiency pass is done. The next tag is `1.0.0`.
 
 ## Features
 
