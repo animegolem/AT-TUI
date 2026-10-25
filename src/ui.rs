@@ -7,10 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{
-        App, ComposerKind, ComposerState, InputMode, KeyHelpGroup, MenuSection, Overlay,
-        key_help_groups,
-    },
+    app::{App, ComposerKind, ComposerState, InputMode, KeyHelpGroup, Overlay, key_help_groups},
     media::{PreviewImage, PreviewMedia},
     model::{
         ExternalRef, FeedItem, FeedReason, ImageRef, NotificationItem, NotificationReason,
@@ -223,7 +220,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
 
     match overlay {
-        Overlay::Menu(state) => render_menu_overlay(frame, area, app, state.section),
+        Overlay::Menu(state) => render_menu_overlay(frame, area, app, state.selected),
         Overlay::Media(state) => {
             if let Some(media) = state.selected_media().cloned() {
                 render_media_overlay(frame, area, app, &media, state.selected, state.media.len());
@@ -258,9 +255,55 @@ fn render_confirm_delete_overlay(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, _app: &App, _selected: MenuSection) {
-    // A grouped reference card (which-key style) instead of a scrolling
-    // wall; feeds and accounts moved to the Tab switcher.
+/// The menu (Esc on the timeline, or `?`): feeds and accounts to switch
+/// between, the key reference, and settings, in one place.
+fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: usize) {
+    let (feeds, accounts) = switch_lists(app, selected);
+    let list_rows = feeds.len().max(accounts.len()) as u16;
+    let rect = centered_fixed(80, 2 + list_rows + 1 + KEY_CARD_ROWS + 1 + 1, area);
+    frame.render_widget(Clear, rect);
+    let block = rounded_block()
+        .title(" Menu ")
+        .border_style(Style::default().fg(MUTED));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(list_rows),
+            Constraint::Length(1),
+            Constraint::Length(KEY_CARD_ROWS),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let lists = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2); 2])
+        .split(chunks[0]);
+    let margin = ratatui::layout::Margin::new(1, 0);
+    frame.render_widget(Paragraph::new(Text::from(feeds)), lists[0].inner(margin));
+    frame.render_widget(Paragraph::new(Text::from(accounts)), lists[1].inner(margin));
+    render_key_card(frame, chunks[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" images: ", Style::default().fg(MUTED)),
+            Span::raw(app.media.protocol_name()),
+            Span::styled("   ", Style::default()),
+            Span::styled("●", Style::default().fg(Color::Green)),
+            Span::styled(
+                " current · j/k move · Enter switch · Esc close",
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        chunks[4],
+    );
+}
+
+const KEY_CARD_ROWS: u16 = 14;
+
+/// The grouped key reference (which-key style), two rows of three groups.
+fn render_key_card(frame: &mut Frame<'_>, area: Rect) {
     let groups = key_help_groups();
     let key_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let head_style = Style::default().fg(MUTED).add_modifier(Modifier::BOLD);
@@ -274,23 +317,14 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, _app: &App, _selected:
         }
         lines
     };
-    let height = 2 + 7 + 7;
-    let rect = centered_fixed(80, height as u16, area);
-    frame.render_widget(Clear, rect);
-    let block = rounded_block()
-        .title(" Keys ")
-        .border_style(Style::default().fg(MUTED));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Length(7)])
-        .split(inner);
+        .constraints([Constraint::Length(KEY_CARD_ROWS / 2); 2])
+        .split(area);
     for (row, chunk) in groups.chunks(3).enumerate() {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Ratio(1, 3); 3])
-            .margin(0)
             .split(rows[row]);
         for (index, group) in chunk.iter().enumerate() {
             let area = cols[index].inner(ratatui::layout::Margin::new(1, 0));
@@ -299,59 +333,60 @@ fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, _app: &App, _selected:
     }
 }
 
-fn render_switcher_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: usize) {
-    let mut lines = vec![Line::from(Span::styled(
-        "FEEDS",
-        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-    ))];
-    let current_did = app.client.session().did;
-    let mut index = 0;
-    let mut row = |label: String, active: bool, lines: &mut Vec<Line<'static>>| {
-        let marker = if index == selected {
-            Span::styled("▌ ", Style::default().fg(ACCENT))
+/// Feed and account rows shared by the menu and the Tab switcher. Feeds
+/// come first, then accounts; `selected` indexes across both.
+fn switch_lists(app: &App, selected: usize) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let head = |label: &str| {
+        Line::from(Span::styled(
+            label.to_owned(),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |index: usize, label: String, active: bool| {
+        let (marker, style) = if index == selected {
+            (
+                Span::styled("▌ ", Style::default().fg(ACCENT)),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
         } else {
-            Span::raw("  ")
-        };
-        let style = if index == selected {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
+            (Span::raw("  "), Style::default())
         };
         let mut spans = vec![marker, Span::styled(label, style)];
         if active {
-            spans.push(Span::styled(
-                "  ● current",
-                Style::default().fg(Color::Green),
-            ));
+            spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
         }
-        lines.push(Line::from(spans));
-        index += 1;
+        Line::from(spans)
     };
-    for (feed_index, feed) in app.feeds.iter().enumerate() {
+    let mut feeds = vec![head("FEEDS")];
+    feeds.extend(
+        app.feeds
+            .iter()
+            .enumerate()
+            .map(|(index, feed)| row(index, feed.label.clone(), index == app.active_feed)),
+    );
+    let current_did = app.client.session().did;
+    let mut accounts = vec![head("ACCOUNTS")];
+    accounts.extend(app.accounts.iter().enumerate().map(|(index, account)| {
         row(
-            feed.label.clone(),
-            feed_index == app.active_feed,
-            &mut lines,
-        );
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "ACCOUNTS",
-        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-    )));
-    for account in &app.accounts {
-        row(
+            app.feeds.len() + index,
             format!("@{}", account.session.handle),
             account.session.did == current_did,
-            &mut lines,
-        );
-    }
+        )
+    }));
+    (feeds, accounts)
+}
+
+fn render_switcher_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: usize) {
+    let (feeds, accounts) = switch_lists(app, selected);
+    let mut lines = feeds;
+    lines.push(Line::from(""));
+    lines.extend(accounts);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "j/k move · Enter switch · Esc close",
+        "● current · j/k move · Enter switch · Esc close",
         Style::default().fg(MUTED),
     )));
-    let rect = centered_fixed(48, lines.len() as u16 + 2, area);
+    let rect = centered_fixed(52, lines.len() as u16 + 2, area);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -631,7 +666,7 @@ fn status_text(app: &App) -> String {
 pub(crate) fn status_right_line(app: &App) -> Line<'static> {
     Line::from(vec![
         Span::styled(app.current_position_label(), Style::default().fg(MUTED)),
-        Span::styled("  ? help ", Style::default().fg(MUTED)),
+        Span::styled("  ? menu ", Style::default().fg(MUTED)),
     ])
 }
 

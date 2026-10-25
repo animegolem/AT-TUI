@@ -61,70 +61,12 @@ pub struct ConfirmDeleteState {
     pub uri: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The menu (Esc on the timeline, or `?`): feeds and accounts, the key
+/// reference and settings together. `selected` indexes feeds then
+/// accounts; nothing switches until Enter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MenuState {
-    pub section: MenuSection,
-}
-
-impl Default for MenuState {
-    fn default() -> Self {
-        Self {
-            section: MenuSection::Keys,
-        }
-    }
-}
-
-impl MenuState {
-    pub fn settings() -> Self {
-        Self {
-            section: MenuSection::Settings,
-        }
-    }
-
-    pub fn next(&mut self) {
-        self.section = self.section.next();
-    }
-
-    pub fn previous(&mut self) {
-        self.section = self.section.previous();
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuSection {
-    Keys,
-    Accounts,
-    Feeds,
-    Settings,
-}
-
-impl MenuSection {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Keys => "Keys",
-            Self::Accounts => "Accounts",
-            Self::Feeds => "Feeds",
-            Self::Settings => "Settings",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Keys => Self::Accounts,
-            Self::Accounts => Self::Feeds,
-            Self::Feeds => Self::Settings,
-            Self::Settings => Self::Keys,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Keys => Self::Settings,
-            Self::Accounts => Self::Keys,
-            Self::Feeds => Self::Accounts,
-            Self::Settings => Self::Feeds,
-        }
-    }
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +204,12 @@ pub fn key_help_groups() -> [KeyHelpGroup; 6] {
         ),
         (
             "APP",
-            &[("?", "help"), ("q", "quit at root"), ("^C", "quit")],
+            &[
+                ("?", "menu"),
+                ("Esc", "back / menu"),
+                ("q", "quit at root"),
+                ("^C", "quit"),
+            ],
         ),
     ]
 }
@@ -958,7 +905,6 @@ impl App {
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
             CloseComposer(ComposerState),
-            OpenSwitcher,
             SwitchTo(usize),
             PlayVideo(Option<PreviewVideo>),
             SubmitComposer(Option<ComposerState>),
@@ -967,15 +913,26 @@ impl App {
 
         let mut action = Action::None;
         match self.overlay.as_mut() {
-            // The help card is read-only: no hidden section cursor that
-            // could switch accounts without a visible cue.
-            Some(Overlay::Menu(_)) => match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
-                    action = Action::Close;
+            Some(Overlay::Menu(state)) => {
+                let total = self.feeds.len() + self.accounts.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                        action = Action::Close;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        state.selected = (state.selected + 1).min(total.saturating_sub(1));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    // On the current feed this switches nothing and closes,
+                    // as Enter always did here.
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        action = Action::SwitchTo(state.selected)
+                    }
+                    _ => {}
                 }
-                KeyCode::Tab => action = Action::OpenSwitcher,
-                _ => {}
-            },
+            }
             Some(Overlay::Media(state)) => match key.code {
                 KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q') => {
                     action = Action::Close;
@@ -1076,11 +1033,6 @@ impl App {
                     self.set_status("Draft kept; reopen the composer to continue");
                 }
             }
-            Action::OpenSwitcher => {
-                self.overlay = Some(Overlay::Switcher(SwitcherState {
-                    selected: self.active_feed,
-                }));
-            }
             Action::SwitchTo(index) => {
                 self.overlay = None;
                 if index < self.feeds.len() {
@@ -1146,7 +1098,7 @@ impl App {
             Action::HalfPageUp => self.nav.current_mut().move_by(-5),
             Action::PageDown => self.nav.current_mut().move_by(10),
             Action::PageUp => self.nav.current_mut().move_by(-10),
-            Action::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
+            Action::OpenMenu => self.open_menu(),
             Action::OpenSwitcher => {
                 self.overlay = Some(Overlay::Switcher(SwitcherState {
                     selected: self.active_feed,
@@ -1196,7 +1148,7 @@ impl App {
                 if self.nav.pop() {
                     self.set_status("Back");
                 } else {
-                    self.overlay = Some(Overlay::Menu(MenuState::settings()));
+                    self.open_menu();
                 }
             }
             Action::OpenSelected => self.open_selected_detail().await?,
@@ -1206,6 +1158,12 @@ impl App {
             Action::Reload => self.reload_current().await?,
         }
         Ok(())
+    }
+
+    fn open_menu(&mut self) {
+        self.overlay = Some(Overlay::Menu(MenuState {
+            selected: self.active_feed,
+        }));
     }
 
     async fn open_media_overlay_for_selected(&mut self) -> Result<()> {
@@ -2914,19 +2872,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn menu_state_cycles_sections() {
-        let mut state = MenuState::default();
-
-        assert_eq!(state.section, MenuSection::Keys);
-        state.next();
-        assert_eq!(state.section, MenuSection::Accounts);
-        state.next();
-        assert_eq!(state.section, MenuSection::Feeds);
-        state.previous();
-        assert_eq!(state.section, MenuSection::Accounts);
-    }
-
     #[tokio::test]
     async fn image_overlay_opens_before_image_load_finishes() {
         let mut item = item("post", "hello");
@@ -3218,7 +3163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn help_card_keys_never_switch_feed_or_account() {
+    async fn menu_lists_feeds_and_switches_only_on_enter() {
         let mut app = app_with_items(vec![item("post", "hello")]);
         app.feeds.push(FeedSource {
             label: "News".into(),
@@ -3228,8 +3173,15 @@ mod tests {
         });
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
+        // Esc on the timeline opens the menu on the current feed.
+        app.handle_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Menu(MenuState { selected: 0 }))
+        ));
+
+        // Moving never switches; stray keys are ignored.
         for code in [
-            KeyCode::Char('?'),
             KeyCode::Char('j'),
             KeyCode::Char(']'),
             KeyCode::BackTab,
@@ -3237,12 +3189,31 @@ mod tests {
         ] {
             app.handle_key(press(code)).await.unwrap();
         }
-
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Menu(MenuState { selected: 1 }))
+        ));
         assert_eq!(app.active_feed, 0);
         assert!(app.pending_feed.is_none());
-        assert!(app.pending_account.is_none());
-        // Tab from help opens the visible switcher, which still needs Enter.
-        assert!(matches!(app.overlay, Some(Overlay::Switcher(_))));
+
+        // Enter switches to the highlighted feed and closes the menu.
+        app.handle_key(press(KeyCode::Enter)).await.unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.active_feed, 1);
+        assert!(app.pending_feed.is_some());
+    }
+
+    #[tokio::test]
+    async fn enter_on_current_feed_just_closes_the_menu() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert!(app.pending_feed.is_none());
     }
 
     #[test]
@@ -3739,9 +3710,7 @@ mod tests {
 
         assert!(matches!(
             app.overlay,
-            Some(Overlay::Menu(MenuState {
-                section: MenuSection::Settings
-            }))
+            Some(Overlay::Menu(MenuState { selected: 0 }))
         ));
     }
 
@@ -3776,7 +3745,7 @@ mod tests {
         assert!(!narrow.contains("Loaded a surprisingly long status message"));
 
         let right = ui::status_right_line(&app);
-        assert_eq!(line_text(&right), "1/1  ? help ");
+        assert_eq!(line_text(&right), "1/1  ? menu ");
         assert_eq!(ui::line_width(&right), 12);
     }
 

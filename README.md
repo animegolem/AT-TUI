@@ -67,7 +67,7 @@ cargo run -- --no-images
 - `g`: top
 - `G`: bottom
 - `l` / Right / Enter: open replies/thread for the selected post
-- `h` / Left / Esc: go back
+- `h` / Left / Esc: go back; Esc on the timeline opens the menu
 - `q`: go back; quits when already at the timeline root
 - `[` / `]`: previous/next saved feed
 - Space: open media overlay for selected post
@@ -87,14 +87,15 @@ cargo run -- --no-images
 - `R`: reload current view
 - `P`: open the selected author's profile
 - `N`: open notifications
-- Tab: switch feed or account
-- `?`: key reference
+- Tab: quick feed/account switcher
+- `?`: menu
 - `Ctrl-C`: quit from anywhere
 
-Key reference (`?`):
+Menu (`?`, or Esc on the timeline): your feeds and accounts at the top, the key reference below, and the image setting at the bottom.
 
-- Esc / `?` / Enter / `q`: close
-- Tab: open the feed and account switcher
+- `j` / Down, `k` / Up: move through feeds and accounts
+- Enter / `l`: switch to the highlighted feed or account (on the current feed, just closes)
+- Esc / `?` / `q`: close
 
 Feed and account switcher (Tab):
 

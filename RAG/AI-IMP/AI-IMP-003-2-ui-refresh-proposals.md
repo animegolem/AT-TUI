@@ -31,6 +31,7 @@ Prototype on `proposal/ui-refresh` (unmerged) covering proposals 1–15: full-he
 ### Implementation Checklist
 - [x] Prototype 1–15 with tests (138 passing, gate green) on `proposal/ui-refresh`.
 - [x] Record the owner's decision: 1–15 approved 2026-10-25 ("the examples look good to me, we can move ahead"). 16–20 and item 0 (reply-filter keep/revert) awaiting an explicit word.
+- [x] Owner follow-up 2026-10-25: Esc on the timeline is his main way into the menu, so item 16 is dropped, and the menu again holds feeds and accounts (selectable, Enter switches), the key card and the image setting together, opened by Esc at the top level or `?`. Tab stays as a quick switcher.
 - [ ] Implement whichever of 16–20 are approved.
 - [x] Update README keys (Tab switcher, P/N, ^E, ^W/^U) together with the help card.
 - [x] Rebase onto `review/release-fixes`, gate, fast-forward `review/release-fixes`.
