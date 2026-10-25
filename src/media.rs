@@ -154,7 +154,7 @@ impl MediaCache {
         Ok(Self {
             enabled,
             cache_dir,
-            http: Client::new(),
+            http: crate::api::http_client(),
             picker,
             images: HashMap::new(),
             videos: HashMap::new(),
@@ -167,7 +167,7 @@ impl MediaCache {
         Self {
             enabled: false,
             cache_dir: PathBuf::new(),
-            http: Client::new(),
+            http: crate::api::http_client(),
             picker: None,
             images: HashMap::new(),
             videos: HashMap::new(),
