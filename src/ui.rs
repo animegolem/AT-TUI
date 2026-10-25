@@ -7,13 +7,11 @@ use ratatui::{
 };
 
 use crate::{
-    app::{
-        App, ComposerKind, ComposerState, InputMode, MenuSection, Overlay, normal_key_help_lines,
-    },
+    app::{App, ComposerKind, ComposerState, InputMode, KeyHelpGroup, Overlay, key_help_groups},
     media::{PreviewImage, PreviewMedia},
     model::{
-        ExternalRef, FeedItem, FeedReason, ImageRef, NotificationItem, NotificationTarget,
-        ProfileSummary, QuotePost, ReplyContext, ReplyParentStatus, ViewItem, compact_time,
+        ExternalRef, FeedItem, FeedReason, ImageRef, NotificationItem, NotificationReason,
+        ProfileSummary, QuotePost, ReplyParentStatus, ViewItem, compact_time,
     },
     navigation::{CachedItemLines, ViewKind, ViewState},
 };
@@ -37,7 +35,7 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let active_did = app.client.session().did.clone();
     let view = app.nav.current_mut();
-    let title = if view.loading {
+    let title = if view.loading || view.page_request.is_some() {
         format!("{} [loading]", view.title)
     } else {
         view.title.clone()
@@ -50,18 +48,26 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .as_ref()
         .map(|profile| render_profile_header_lines(profile, inner_width, &active_did))
         .unwrap_or_default();
-    let list_available = available_lines.saturating_sub(profile_lines.len());
+    // Reserve the error row before laying out the list; appended after a
+    // full page of posts it was clipped and never seen.
+    let error_line = view.error.as_ref().map(|error| {
+        Line::from(vec![Span::styled(
+            truncate(&format!("⚠ {}", single_line(error)), inner_width + 2),
+            Style::default().fg(Color::Red),
+        )])
+    });
+    let list_available = available_lines
+        .saturating_sub(profile_lines.len())
+        .saturating_sub(usize::from(error_line.is_some()));
     let mut lines = profile_lines;
     lines.extend(visible_feed_lines(view, inner_width, list_available));
-
-    if let Some(error) = &view.error {
-        lines.push(Line::from(vec![Span::styled(
-            format!("Error: {error}"),
-            Style::default().fg(Color::Red),
-        )]));
-    }
+    lines.extend(error_line);
 
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+pub(crate) fn current_minute() -> i64 {
+    chrono::Utc::now().timestamp() / 60
 }
 
 fn visible_feed_lines(
@@ -69,7 +75,16 @@ fn visible_feed_lines(
     width: usize,
     available_lines: usize,
 ) -> Vec<Line<'static>> {
-    ensure_layout_cache(view, width);
+    visible_feed_lines_at(view, width, available_lines, current_minute())
+}
+
+fn visible_feed_lines_at(
+    view: &mut ViewState,
+    width: usize,
+    available_lines: usize,
+    minute: i64,
+) -> Vec<Line<'static>> {
+    ensure_layout_cache(view, width, minute);
     ensure_selected_rendered(view, width, available_lines);
 
     if view.items.is_empty() {
@@ -99,20 +114,24 @@ fn visible_feed_lines(
     lines
 }
 
-fn ensure_layout_cache(view: &mut ViewState, width: usize) {
-    let needs_rebuild =
-        view.layout_cache.width != Some(width) || view.layout_cache.items.len() != view.items.len();
+fn ensure_layout_cache(view: &mut ViewState, width: usize, minute: i64) {
+    let needs_rebuild = view.layout_cache.width != Some(width)
+        || view.layout_cache.minute != Some(minute)
+        || view.layout_cache.items.len() != view.items.len();
     if !needs_rebuild {
         return;
     }
 
     view.layout_cache.width = Some(width);
+    view.layout_cache.minute = Some(minute);
+    let contexts = row_contexts(view);
     view.layout_cache.items = view
         .items
         .iter()
-        .map(|item| CachedItemLines {
-            selected: render_view_item_lines(item, true, width),
-            unselected: render_view_item_lines(item, false, width),
+        .zip(&contexts)
+        .map(|(item, context)| CachedItemLines {
+            selected: render_view_item_lines(item, true, width, context),
+            unselected: render_view_item_lines(item, false, width, context),
         })
         .collect();
     view.layout_cache.builds += 1;
@@ -158,9 +177,11 @@ fn ensure_selected_rendered(view: &mut ViewState, width: usize, available_lines:
 
 fn rendered_height(view: &ViewState, start: usize, end: usize, width: usize) -> usize {
     if view.layout_cache.width != Some(width) {
-        return view.items[start..=end]
-            .iter()
-            .map(|item| render_view_item_lines(item, false, width).len())
+        let contexts = row_contexts(view);
+        return (start..=end)
+            .map(|index| {
+                render_view_item_lines(&view.items[index], false, width, &contexts[index]).len()
+            })
             .sum();
     }
 
@@ -171,10 +192,8 @@ fn rendered_height(view: &ViewState, start: usize, end: usize, width: usize) -> 
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    frame.render_widget(
-        Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(Color::DarkGray)),
-        area,
-    );
+    // No filled bar: the list's bottom border already separates it, and a
+    // row of saturated blocks competes with the content above.
     render_status_content(frame, area, app);
 }
 
@@ -201,7 +220,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
 
     match overlay {
-        Overlay::Menu(state) => render_menu_overlay(frame, area, app, state.section),
+        Overlay::Menu(state) => render_menu_overlay(frame, area, app, state.selected),
         Overlay::Media(state) => {
             if let Some(media) = state.selected_media().cloned() {
                 render_media_overlay(frame, area, app, &media, state.selected, state.media.len());
@@ -210,6 +229,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Overlay::Links(state) => render_link_overlay(frame, area, state.links, state.selected),
         Overlay::Composer(state) => render_composer_overlay(frame, area, state),
         Overlay::ConfirmDelete(_) => render_confirm_delete_overlay(frame, area),
+        Overlay::Switcher(state) => render_switcher_overlay(frame, area, app, state.selected),
     }
 }
 
@@ -235,59 +255,158 @@ fn render_confirm_delete_overlay(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: MenuSection) {
-    let area = centered_rect(86, 82, area);
-    frame.render_widget(Clear, area);
-
-    let mut lines = Vec::new();
-    lines.push(section_line(MenuSection::Keys, selected));
-    lines.extend(normal_key_help_lines().into_iter().map(Line::from));
-    lines.push(Line::from(""));
-
-    lines.push(section_line(MenuSection::Accounts, selected));
-    lines.push(Line::from(format!(
-        "  active: @{}",
-        app.client.session().handle
-    )));
-    for account in app.accounts.iter().take(6) {
-        let marker = if account.session.did == app.client.session().did {
-            "*"
-        } else {
-            " "
-        };
-        lines.push(Line::from(format!(
-            "  {marker} {} @{}",
-            account.label, account.session.handle
-        )));
-    }
-    lines.push(Line::from(
-        "  Tab next account · Shift-Tab previous account",
-    ));
-    lines.push(Line::from(""));
-
-    lines.push(section_line(MenuSection::Feeds, selected));
-    for (index, feed) in app.feeds.iter().take(8).enumerate() {
-        let marker = if index == app.active_feed { "*" } else { " " };
-        lines.push(Line::from(format!("  {marker} {}", feed.label)));
-    }
-    lines.push(Line::from(
-        "  Tab next feed · Shift-Tab previous feed · [ and ] also switch feeds",
-    ));
-    lines.push(Line::from(""));
-
-    lines.push(section_line(MenuSection::Settings, selected));
-    lines.push(Line::from(format!(
-        "  images: {}",
-        app.media.protocol_name()
-    )));
-    lines.push(Line::from("  Esc, ?, Enter, or q closes this menu"));
-
+/// The menu (Esc on the timeline, or `?`): feeds and accounts to switch
+/// between, the key reference, and settings, in one place.
+fn render_menu_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: usize) {
+    let (feeds, accounts) = switch_lists(app, selected);
+    let list_rows = feeds.len().max(accounts.len()) as u16;
+    let rect = centered_fixed(80, 2 + list_rows + 1 + KEY_CARD_ROWS + 1 + 1, area);
+    frame.render_widget(Clear, rect);
+    let block = rounded_block()
+        .title(" Menu ")
+        .border_style(Style::default().fg(MUTED));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(list_rows),
+            Constraint::Length(1),
+            Constraint::Length(KEY_CARD_ROWS),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let lists = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2); 2])
+        .split(chunks[0]);
+    let margin = ratatui::layout::Margin::new(1, 0);
+    frame.render_widget(Paragraph::new(Text::from(feeds)), lists[0].inner(margin));
+    frame.render_widget(Paragraph::new(Text::from(accounts)), lists[1].inner(margin));
+    render_key_card(frame, chunks[2]);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(rounded_block().title("Menu"))
-            .wrap(Wrap { trim: false }),
-        area,
+        Paragraph::new(Line::from(vec![
+            Span::styled(" images: ", Style::default().fg(MUTED)),
+            Span::raw(app.media.protocol_name()),
+            Span::styled("   ", Style::default()),
+            Span::styled("●", Style::default().fg(Color::Green)),
+            Span::styled(
+                " current · j/k move · Enter switch · Esc close",
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        chunks[4],
     );
+}
+
+const KEY_CARD_ROWS: u16 = 14;
+
+/// The grouped key reference (which-key style), two rows of three groups.
+fn render_key_card(frame: &mut Frame<'_>, area: Rect) {
+    let groups = key_help_groups();
+    let key_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let head_style = Style::default().fg(MUTED).add_modifier(Modifier::BOLD);
+    let column = |group: &KeyHelpGroup| {
+        let mut lines = vec![Line::from(Span::styled(group.0.to_owned(), head_style))];
+        for (key, label) in group.1 {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{key:<10}"), key_style),
+                Span::raw(label.to_string()),
+            ]));
+        }
+        lines
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(KEY_CARD_ROWS / 2); 2])
+        .split(area);
+    for (row, chunk) in groups.chunks(3).enumerate() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 3); 3])
+            .split(rows[row]);
+        for (index, group) in chunk.iter().enumerate() {
+            let area = cols[index].inner(ratatui::layout::Margin::new(1, 0));
+            frame.render_widget(Paragraph::new(Text::from(column(group))), area);
+        }
+    }
+}
+
+/// Feed and account rows shared by the menu and the Tab switcher. Feeds
+/// come first, then accounts; `selected` indexes across both.
+fn switch_lists(app: &App, selected: usize) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let head = |label: &str| {
+        Line::from(Span::styled(
+            label.to_owned(),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |index: usize, label: String, active: bool| {
+        let (marker, style) = if index == selected {
+            (
+                Span::styled("▌ ", Style::default().fg(ACCENT)),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (Span::raw("  "), Style::default())
+        };
+        let mut spans = vec![marker, Span::styled(label, style)];
+        if active {
+            spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
+        }
+        Line::from(spans)
+    };
+    let mut feeds = vec![head("FEEDS")];
+    feeds.extend(
+        app.feeds
+            .iter()
+            .enumerate()
+            .map(|(index, feed)| row(index, feed.label.clone(), index == app.active_feed)),
+    );
+    let current_did = app.client.session().did;
+    let mut accounts = vec![head("ACCOUNTS")];
+    accounts.extend(app.accounts.iter().enumerate().map(|(index, account)| {
+        row(
+            app.feeds.len() + index,
+            format!("@{}", account.session.handle),
+            account.session.did == current_did,
+        )
+    }));
+    (feeds, accounts)
+}
+
+fn render_switcher_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, selected: usize) {
+    let (feeds, accounts) = switch_lists(app, selected);
+    let mut lines = feeds;
+    lines.push(Line::from(""));
+    lines.extend(accounts);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "● current · j/k move · Enter switch · Esc close",
+        Style::default().fg(MUTED),
+    )));
+    let rect = centered_fixed(52, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            rounded_block()
+                .title(" Switch ")
+                .border_style(Style::default().fg(MUTED)),
+        ),
+        rect,
+    );
+}
+
+fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 fn render_link_overlay(
@@ -391,59 +510,52 @@ fn render_media_overlay(
 fn render_composer_overlay(frame: &mut Frame<'_>, area: Rect, state: ComposerState) {
     let area = centered_rect(82, 54, area);
     frame.render_widget(Clear, area);
-
-    let mut lines = Vec::new();
-    match &state.kind {
-        ComposerKind::Post => {}
-        ComposerKind::Reply { parent_handle, .. } => {
-            lines.push(Line::from(format!("Replying to @{parent_handle}")));
-            lines.push(Line::from(""));
-        }
-        ComposerKind::Quote { quote_handle, .. } => {
-            lines.push(Line::from(format!("Quoting @{quote_handle}")));
-            lines.push(Line::from(""));
-        }
-    }
-    if state.buffer.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "Type your post...",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    } else {
-        lines.extend(state.buffer.lines().map(|line| Line::from(line.to_owned())));
-    }
-    lines.push(Line::from(""));
-    let count = crate::app::post_grapheme_count(&state.buffer);
-    let count_style = if count > 300 {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let muted = Style::default().fg(MUTED);
+    let title = match &state.kind {
+        ComposerKind::Post => " New post ".to_owned(),
+        ComposerKind::Reply { parent_handle, .. } => format!(" Reply to @{parent_handle} "),
+        ComposerKind::Quote { quote_handle, .. } => format!(" Quote @{quote_handle} "),
     };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{count}/300"), count_style),
-        Span::raw(" · Ctrl-S send · Esc cancel"),
-    ]));
-
+    let count = crate::app::post_grapheme_count(&state.buffer);
+    let count_style = match count {
+        0..=279 => muted,
+        280..=300 => Style::default().fg(ACCENT),
+        _ => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    };
+    let mut lines = Vec::new();
+    if state.buffer.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("▏", Style::default().fg(ACCENT)),
+            Span::styled("What's up?", muted),
+        ]));
+    } else {
+        let mut body = state
+            .buffer
+            .split('\n')
+            .map(|line| Line::from(rich_text_spans(line)))
+            .collect::<Vec<_>>();
+        if let Some(last) = body.last_mut() {
+            last.spans
+                .push(Span::styled("▏", Style::default().fg(ACCENT)));
+        }
+        lines.extend(body);
+    }
+    let block = rounded_block()
+        .title(title)
+        .title_bottom(Line::from(vec![Span::styled(
+            " ^S send · Esc keep draft · ^E $EDITOR ",
+            muted,
+        )]))
+        .title_bottom(
+            Line::from(Span::styled(format!(" {count}/300 "), count_style)).right_aligned(),
+        )
+        .border_style(Style::default().fg(MUTED));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(rounded_block().title(state.title()))
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
-}
-
-fn section_line(section: MenuSection, selected: MenuSection) -> Line<'static> {
-    let style = if section == selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    };
-    Line::from(vec![Span::styled(section.label(), style)])
 }
 
 fn active_feed_label(app: &App) -> &str {
@@ -466,45 +578,59 @@ pub(crate) fn status_left_line(app: &App, max_width: usize) -> Line<'static> {
     status_left_line_inner(app, false)
 }
 
-fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'static> {
-    let mut spans = vec![
-        segment(
-            format!(" @{} ", app.client.session().handle),
-            Color::Black,
-            Color::Cyan,
-        ),
-        segment(
-            format!(" {} ", current_location_label(app)),
-            Color::Black,
-            Color::Yellow,
-        ),
-    ];
+fn short_handle(handle: &str) -> &str {
+    handle.strip_suffix(".bsky.social").unwrap_or(handle)
+}
 
-    if app.pending_new_count() > 0 {
-        spans.push(segment(
-            format!(" ↑ {} new ", app.pending_new_count()),
-            Color::Black,
-            Color::Green,
+fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'static> {
+    let bold = |color: Color| Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let mut spans = vec![
+        Span::styled(
+            format!(" @{}", short_handle(&app.client.session().handle)),
+            bold(Color::Cyan),
+        ),
+        Span::styled("  ", Style::default()),
+    ];
+    let root = active_feed_label(app).to_owned();
+    if app.nav.depth() > 1 {
+        spans.push(Span::styled(root, Style::default().fg(MUTED)));
+        if app.nav.depth() > 2 {
+            spans.push(Span::styled(" › …", Style::default().fg(MUTED)));
+        }
+        spans.push(Span::styled(" › ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            app.nav.current().title.clone(),
+            bold(Color::White),
         ));
+    } else {
+        spans.push(Span::styled(root, bold(Color::White)));
     }
 
     if app.unread_notifications > 0 {
-        spans.push(segment(
-            format!(" ! {} ", app.unread_notifications),
-            Color::Black,
-            Color::LightRed,
+        spans.push(Span::styled(
+            format!("  ● {}", app.unread_notifications),
+            bold(Color::LightRed),
         ));
     }
-
-    if app.is_offline() {
-        spans.push(segment(" ⚠ offline ".to_owned(), Color::Black, Color::Red));
+    if app.pending_new_count() > 0 {
+        spans.push(Span::styled(
+            format!("  ↑ {} new", app.pending_new_count()),
+            bold(Color::Green),
+        ));
     }
-
+    if app.is_offline() {
+        spans.push(Span::styled(
+            "  ⚠ offline",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.has_pending_tasks() {
-        spans.push(segment(
-            format!(" {} ", app.spinner_char()),
-            Color::Black,
-            Color::Magenta,
+        spans.push(Span::styled(
+            format!("  {}", app.spinner_char()),
+            Style::default().fg(Color::Magenta),
         ));
     }
 
@@ -514,10 +640,12 @@ fn status_left_line_inner(app: &App, include_transient_status: bool) -> Line<'st
         String::new()
     };
     if !status.is_empty() {
-        spans.push(Span::styled(
-            format!(" {status} "),
-            Style::default().fg(Color::Gray),
-        ));
+        let style = if app.status_is_error {
+            Style::default().fg(Color::LightRed)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        spans.push(Span::styled(format!("  {status}"), style));
     }
 
     Line::from(spans)
@@ -536,13 +664,13 @@ fn status_text(app: &App) -> String {
 }
 
 pub(crate) fn status_right_line(app: &App) -> Line<'static> {
-    Line::from(vec![segment(
-        format!(" {} ", app.current_position_label()),
-        Color::Black,
-        Color::LightBlue,
-    )])
+    Line::from(vec![
+        Span::styled(app.current_position_label(), Style::default().fg(MUTED)),
+        Span::styled("  ? menu ", Style::default().fg(MUTED)),
+    ])
 }
 
+#[cfg(test)]
 pub(crate) fn current_location_label(app: &App) -> String {
     if app.nav.depth() > 1 {
         app.nav.current().title.clone()
@@ -552,17 +680,7 @@ pub(crate) fn current_location_label(app: &App) -> String {
 }
 
 pub(crate) fn line_width(line: &Line<'_>) -> usize {
-    line.spans
-        .iter()
-        .map(|span| span.content.chars().count())
-        .sum()
-}
-
-fn segment(text: String, fg: Color, bg: Color) -> Span<'static> {
-    Span::styled(
-        text,
-        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
-    )
+    line.width()
 }
 
 #[cfg(test)]
@@ -602,6 +720,10 @@ fn truncate(value: &str, max: usize) -> String {
     truncated
 }
 
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn rounded_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -629,265 +751,582 @@ fn empty_view_text(kind: &ViewKind) -> &'static str {
     }
 }
 
+// ---- Row rendering -------------------------------------------------------
+//
+// Every row is drawn as `gutter + content`. The two-column gutter carries the
+// selection bar down the full height of the selected item, so the extent of
+// a multi-line post is obvious; colour is kept for information (who, what you
+// did, what is a link) rather than decoration.
+
+const ACCENT: Color = Color::Yellow;
+const MUTED: Color = Color::DarkGray;
+const LINK: Color = Color::LightBlue;
+const MENTION: Color = Color::LightCyan;
+const TAG: Color = Color::LightMagenta;
+const FRAME: Color = Color::DarkGray;
+const MAX_THREAD_DEPTH: usize = 6;
+/// Stable per-account name colours (irssi/weechat nick colours). Yellow is
+/// reserved for selection and red for likes/errors.
+const NICK_COLORS: [Color; 7] = [
+    Color::Cyan,
+    Color::Green,
+    Color::Magenta,
+    Color::LightBlue,
+    Color::LightCyan,
+    Color::LightMagenta,
+    Color::LightGreen,
+];
+
+pub(crate) fn nick_color(key: &str) -> Color {
+    // FNV-1a: stable across runs and Rust versions, unlike DefaultHasher.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in key.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    NICK_COLORS[hash as usize % NICK_COLORS.len()]
+}
+
+fn display_width(text: &str) -> usize {
+    Span::raw(text.to_owned()).width()
+}
+
+fn truncate_width(text: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if display_width(text) <= max {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let width = display_width(grapheme);
+        if used + width + 1 > max {
+            break;
+        }
+        out.push_str(grapheme);
+        used += width;
+    }
+    out.push('…');
+    out
+}
+
+pub(crate) fn compact_count(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=9_999 => format!("{:.1}K", count as f64 / 1_000.0).replace(".0K", "K"),
+        10_000..=999_999 => format!("{}K", count / 1_000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0).replace(".0M", "M"),
+    }
+}
+
+/// Per-row context the row itself cannot know: thread tree guides and
+/// whether this is the post the thread was opened on.
+#[derive(Debug, Clone, Default)]
+struct RowContext {
+    header_guide: String,
+    body_guide: String,
+    anchor: bool,
+}
+
+fn row_contexts(view: &ViewState) -> Vec<RowContext> {
+    let anchor_uri = match &view.kind {
+        ViewKind::Thread { root_uri } => Some(root_uri.as_str()),
+        ViewKind::Quote { uri } => Some(uri.as_str()),
+        _ => None,
+    };
+    let Some(anchor_uri) = anchor_uri else {
+        return vec![RowContext::default(); view.items.len()];
+    };
+    let depths = view
+        .items
+        .iter()
+        .map(|item| item.as_post().map_or(0, |post| post.depth))
+        .collect::<Vec<_>>();
+    thread_guides(&depths)
+        .into_iter()
+        .zip(&view.items)
+        .map(|((header_guide, body_guide), item)| RowContext {
+            header_guide,
+            body_guide,
+            anchor: item.uri() == anchor_uri,
+        })
+        .collect()
+}
+
+/// Tree connectors for a depth-first flattened thread (slrn/mutt style).
+/// Each level is three columns; a body line also reserves two columns for
+/// the line that leads down to this post's own replies.
+pub(crate) fn thread_guides(depths: &[usize]) -> Vec<(String, String)> {
+    let depths = depths
+        .iter()
+        .map(|depth| (*depth).min(MAX_THREAD_DEPTH))
+        .collect::<Vec<_>>();
+    let later_at = |index: usize, level: usize| {
+        for depth in &depths[index + 1..] {
+            if *depth < level {
+                return false;
+            }
+            if *depth == level {
+                return true;
+            }
+        }
+        false
+    };
+    (0..depths.len())
+        .map(|index| {
+            let depth = depths[index];
+            let mut header = String::new();
+            let mut body = String::new();
+            for level in 1..depth {
+                let column = if later_at(index, level) {
+                    "│  "
+                } else {
+                    "   "
+                };
+                header.push_str(column);
+                body.push_str(column);
+            }
+            if depth >= 1 {
+                let last = !later_at(index, depth);
+                header.push_str(if last { "└─ " } else { "├─ " });
+                body.push_str(if last { "   " } else { "│  " });
+            }
+            let has_replies = depths.get(index + 1).is_some_and(|next| *next > depth);
+            let chain_continues = depth == 0 && later_at(index, 0);
+            body.push_str(if has_replies || chain_continues {
+                "│ "
+            } else {
+                "  "
+            });
+            (header, body)
+        })
+        .collect()
+}
+
+fn with_gutter(lines: Vec<Line<'static>>, selected: bool) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let bar = if selected {
+                Span::styled("▌ ", Style::default().fg(ACCENT))
+            } else {
+                Span::raw("  ")
+            };
+            let mut spans = vec![bar];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn guide_span(guide: &str) -> Span<'static> {
+    Span::styled(guide.to_owned(), Style::default().fg(FRAME))
+}
+
+/// `Name @handle ··· 5m` with the time right-aligned. A display name that is
+/// just the handle is shown once.
+fn author_header(
+    lead: Vec<Span<'static>>,
+    name: &str,
+    handle: &str,
+    color_key: &str,
+    time: &str,
+    width: usize,
+) -> Line<'static> {
+    let lead_width = lead.iter().map(Span::width).sum::<usize>();
+    let time_width = if time.is_empty() {
+        0
+    } else {
+        display_width(time) + 1
+    };
+    let room = width.saturating_sub(lead_width + time_width);
+    let name_style = Style::default()
+        .fg(nick_color(color_key))
+        .add_modifier(Modifier::BOLD);
+    let mut spans = lead;
+    let handle_text = format!("@{handle}");
+    let mut used = 0;
+    if name.trim().is_empty() || name == handle {
+        let shown = truncate_width(&handle_text, room);
+        used += display_width(&shown);
+        spans.push(Span::styled(shown, name_style));
+    } else {
+        let shown_name = truncate_width(name, room.saturating_sub(2).max(8));
+        used += display_width(&shown_name);
+        spans.push(Span::styled(shown_name, name_style));
+        let handle_room = room.saturating_sub(used + 1);
+        if handle_room >= 4 {
+            let shown = format!(" {}", truncate_width(&handle_text, handle_room));
+            used += display_width(&shown);
+            spans.push(Span::styled(shown, Style::default().fg(MUTED)));
+        }
+    }
+    if !time.is_empty() {
+        spans.push(Span::raw(" ".repeat(room.saturating_sub(used) + 1)));
+        spans.push(Span::styled(time.to_owned(), Style::default().fg(MUTED)));
+    }
+    Line::from(spans)
+}
+
+/// Colours @mentions, #tags and links inside an already-wrapped line.
+fn rich_text_spans(line: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for token in line.split_inclusive(' ') {
+        let word = token
+            .trim_end()
+            .trim_end_matches(['.', ',', ':', ';', '!', '?', ')', '"', '\'', '”', '’']);
+        let style = if word.len() > 3 && word.starts_with('@') && word.contains('.') {
+            Some(Style::default().fg(MENTION))
+        } else if word.len() > 1 && word.starts_with('#') && !word[1..].starts_with('#') {
+            Some(Style::default().fg(TAG))
+        } else if word.starts_with("http://")
+            || word.starts_with("https://")
+            || word.starts_with("www.")
+            || (word.contains('.') && word.contains('/') && !word.contains('@'))
+        {
+            Some(Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED))
+        } else {
+            None
+        };
+        match style {
+            Some(style) => {
+                let tail = &token[word.len()..];
+                spans.push(Span::styled(word.to_owned(), style));
+                if !tail.is_empty() {
+                    spans.push(Span::raw(tail.to_owned()));
+                }
+            }
+            None => match spans.last_mut() {
+                Some(last) if last.style == Style::default() => {
+                    last.content = format!("{}{token}", last.content).into();
+                }
+                _ => spans.push(Span::raw(token.to_owned())),
+            },
+        }
+    }
+    spans
+}
+
+fn body_lines(text: &str, prefix: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+    let prefix_width = prefix.iter().map(Span::width).sum::<usize>();
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    wrap_text(text, width.saturating_sub(prefix_width).max(10))
+        .into_iter()
+        .map(|line| {
+            let mut spans = prefix.to_vec();
+            spans.extend(rich_text_spans(&line));
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_profile_header_lines(
     profile: &ProfileSummary,
     width: usize,
     active_did: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        format!("{} @{}", profile.display_name, profile.handle),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    if let Some(description) = &profile.description {
-        for line in wrap_text(description, width).into_iter().take(3) {
-            lines.push(Line::from(line));
-        }
-    }
-    let follow_state = if !profile.did.is_empty() && profile.did != active_did {
+    let pill = if !profile.did.is_empty() && profile.did != active_did {
         if profile.viewer_following.is_some() {
-            "  · following"
+            Some(Span::styled(
+                "✓ following",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ))
         } else {
-            "  · not following"
+            Some(Span::styled(
+                "not following · F to follow",
+                Style::default().fg(MUTED),
+            ))
         }
     } else {
-        ""
+        None
     };
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{} followers  {} following  {} posts{}",
-            profile.followers_count, profile.follows_count, profile.posts_count, follow_state
-        ),
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(""));
-    lines
-}
-
-fn render_view_item_lines(item: &ViewItem, selected: bool, width: usize) -> Vec<Line<'static>> {
-    match item {
-        ViewItem::Post(item) => render_item_lines(item, selected, width),
-        ViewItem::Notification(item) => render_notification_lines(item, selected, width),
+    let pill_width = pill.as_ref().map_or(0, |pill| pill.width() + 1);
+    let mut header = author_header(
+        vec![Span::raw("  ")],
+        &profile.display_name,
+        &profile.handle,
+        &profile.did,
+        "",
+        width.saturating_sub(pill_width),
+    );
+    if let Some(pill) = pill {
+        let used = header.width();
+        header.spans.push(Span::raw(
+            " ".repeat((width + 2).saturating_sub(used + pill.width())),
+        ));
+        header.spans.push(pill);
     }
-}
-
-fn render_notification_lines(
-    item: &NotificationItem,
-    selected: bool,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let marker = if selected { ">" } else { " " };
-    let unread = if item.is_read { " " } else { "●" };
-    let time = compact_time(Some(&item.indexed_at));
-    let header_style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if item.is_read {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    };
-
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{marker} {unread} {} @{} {} {}",
-            item.author_name,
-            item.author_handle,
-            item.reason.label(),
-            time
-        ),
-        header_style,
-    )]));
-
-    let body_prefix = "  ";
-    if !item.text.trim().is_empty() {
-        for line in wrap_text(&item.text, width.saturating_sub(body_prefix.len()).max(10))
+    lines.push(header);
+    if let Some(description) = &profile.description {
+        for line in wrap_text(description, width.saturating_sub(2))
             .into_iter()
             .take(3)
         {
-            lines.push(Line::from(format!("{body_prefix}{line}")));
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(rich_text_spans(&line));
+            lines.push(Line::from(spans));
         }
     }
-
-    if let Some(subject) = &item.reason_subject {
-        lines.push(Line::from(vec![Span::styled(
-            format!("{body_prefix}subject: {subject}"),
-            Style::default().fg(Color::DarkGray),
-        )]));
-    } else if matches!(item.target, NotificationTarget::None) {
-        lines.push(Line::from(vec![Span::styled(
-            format!("{body_prefix}[no openable target]"),
-            Style::default().fg(Color::DarkGray),
-        )]));
-    }
-
-    lines.push(Line::from(""));
+    let count = |value: u64, label: &str| {
+        vec![
+            Span::styled(
+                compact_count(value),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {label}"), Style::default().fg(MUTED)),
+        ]
+    };
+    let mut stats = vec![Span::raw("  ")];
+    stats.extend(count(profile.followers_count, "followers"));
+    stats.push(Span::styled(" · ", Style::default().fg(MUTED)));
+    stats.extend(count(profile.follows_count, "following"));
+    stats.push(Span::styled(" · ", Style::default().fg(MUTED)));
+    stats.extend(count(profile.posts_count, "posts"));
+    lines.push(Line::from(stats));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(width.saturating_sub(2))),
+        Style::default().fg(FRAME),
+    )));
     lines
 }
 
-fn render_item_lines(item: &FeedItem, selected: bool, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let marker = if selected { ">" } else { " " };
-    let indent = "  ".repeat(item.depth.min(6));
-    let time = compact_time(item.indexed_at.as_deref());
-    let header_style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+fn render_view_item_lines(
+    item: &ViewItem,
+    selected: bool,
+    width: usize,
+    context: &RowContext,
+) -> Vec<Line<'static>> {
+    let (lines, separator) = match item {
+        ViewItem::Post(item) => render_item_lines(item, width, context),
+        ViewItem::Notification(item) => (render_notification_lines(item, width), Line::from("")),
     };
+    let mut lines = with_gutter(lines, selected);
+    lines.push(separator);
+    lines
+}
+
+fn notification_glyph(reason: &NotificationReason) -> (&'static str, Color) {
+    match reason {
+        NotificationReason::Like | NotificationReason::LikeViaRepost => ("♥", Color::Red),
+        NotificationReason::Repost | NotificationReason::RepostViaRepost => ("⟳", Color::Green),
+        NotificationReason::Follow
+        | NotificationReason::StarterpackJoined
+        | NotificationReason::ContactMatch => ("+", Color::Cyan),
+        NotificationReason::Reply => ("↩", Color::LightBlue),
+        NotificationReason::Mention => ("@", Color::LightCyan),
+        NotificationReason::Quote => ("❞", Color::LightMagenta),
+        NotificationReason::Verified | NotificationReason::Unverified => ("✓", Color::LightBlue),
+        NotificationReason::SubscribedPost | NotificationReason::Unknown(_) => ("•", MUTED),
+    }
+}
+
+fn notification_actors(item: &NotificationItem) -> String {
+    let first = if item.author_name.trim().is_empty() || item.author_name == item.author_handle {
+        format!("@{}", item.author_handle)
+    } else {
+        item.author_name.clone()
+    };
+    match item.others.as_slice() {
+        [] => first,
+        [other] => format!("{first} and {other}"),
+        [other, last] => format!("{first}, {other} and {last}"),
+        [other, rest @ ..] => format!("{first}, {other} and {} others", rest.len()),
+    }
+}
+
+fn render_notification_lines(item: &NotificationItem, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let (glyph, glyph_color) = notification_glyph(&item.reason);
+    let unread = if item.is_read {
+        Span::raw("  ")
+    } else {
+        Span::styled("● ", Style::default().fg(Color::LightRed))
+    };
+    let lead = vec![
+        unread,
+        Span::styled(
+            format!("{glyph} "),
+            Style::default()
+                .fg(glyph_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let actors = notification_actors(item);
+    let verb = format!(" {}", item.reason.label());
+    let time = compact_time(Some(&item.indexed_at));
+    let room = width.saturating_sub(4 + display_width(&time) + 1);
+    let actors_shown = truncate_width(&actors, room.saturating_sub(display_width(&verb)).max(12));
+    let verb_shown = truncate_width(&verb, room.saturating_sub(display_width(&actors_shown)));
+    let used = 4 + display_width(&actors_shown) + display_width(&verb_shown);
+    let mut header = lead;
+    let name_style = Style::default()
+        .fg(nick_color(
+            item.author_did.as_deref().unwrap_or(&item.author_handle),
+        ))
+        .add_modifier(if item.is_read {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        });
+    header.push(Span::styled(actors_shown, name_style));
+    header.push(Span::raw(verb_shown));
+    header.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + display_width(&time)).max(1)),
+    ));
+    header.push(Span::styled(time, Style::default().fg(MUTED)));
+    lines.push(Line::from(header));
+
+    let indent = [Span::raw("    ")];
+    if !item.text.trim().is_empty() {
+        lines.extend(body_lines(&item.text, &indent, width).into_iter().take(3));
+    } else if let Some(subject) = &item.subject_text {
+        let quoted = truncate_width(&single_line(subject), width.saturating_sub(6));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("“{quoted}”"), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines
+}
+
+fn render_item_lines(
+    item: &FeedItem,
+    width: usize,
+    context: &RowContext,
+) -> (Vec<Line<'static>>, Line<'static>) {
+    let mut lines = Vec::new();
+    let header_guide = guide_span(&context.header_guide);
+    let body_guide = guide_span(&context.body_guide);
+    let body_prefix = vec![body_guide.clone()];
+    let time = compact_time(item.indexed_at.as_deref());
+    let muted = Style::default().fg(MUTED);
 
     if let Some(reason) = &item.reason {
-        lines.push(Line::from(vec![Span::styled(
-            format!("  {indent}{}", reason_text(reason)),
-            Style::default().fg(Color::DarkGray),
-        )]));
+        let line = match reason {
+            FeedReason::Repost {
+                by_name, by_handle, ..
+            } => {
+                let by = if by_name.trim().is_empty() || by_name == by_handle {
+                    format!("@{by_handle}")
+                } else {
+                    by_name.clone()
+                };
+                vec![
+                    Span::styled("⟳ ", Style::default().fg(Color::Green)),
+                    Span::styled(format!("reposted by {by}"), muted),
+                ]
+            }
+            FeedReason::Pin => vec![Span::styled("⚑ pinned", muted)],
+        };
+        let mut spans = vec![header_guide.clone()];
+        spans.extend(line);
+        lines.push(Line::from(spans));
     }
 
     if let Some(reply) = &item.reply {
-        lines.extend(reply_preview_lines(reply, width, &format!("  {indent}")));
+        let label = match reply.parent_status {
+            Some(ReplyParentStatus::Blocked) => "↩ replying to a blocked post".to_owned(),
+            Some(ReplyParentStatus::NotFound) => "↩ replying to a deleted post".to_owned(),
+            None => format!("↩ replying to @{}", reply.parent_author_handle),
+        };
+        lines.push(Line::from(vec![
+            header_guide.clone(),
+            Span::styled(label, muted),
+        ]));
+        if reply.parent_status.is_none() && !reply.parent_text.trim().is_empty() {
+            let preview = truncate_width(&single_line(&reply.parent_text), width.saturating_sub(4));
+            lines.push(Line::from(vec![
+                header_guide.clone(),
+                Span::styled("│ ", Style::default().fg(FRAME)),
+                Span::styled(preview, muted),
+            ]));
+        }
     }
 
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{marker} {indent}{} @{} {}",
-            item.author_name, item.author_handle, time
-        ),
-        header_style,
-    )]));
-
-    let body_prefix = format!("  {indent}");
-    for line in wrap_text(&item.text, width.saturating_sub(body_prefix.len()).max(10)) {
-        lines.push(Line::from(format!("{body_prefix}{line}")));
+    let mut lead = vec![header_guide.clone()];
+    if context.anchor {
+        lead.push(Span::styled(
+            "◆ ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
     }
+    lines.push(author_header(
+        lead,
+        &item.author_name,
+        &item.author_handle,
+        item.author_did.as_deref().unwrap_or(&item.author_handle),
+        &time,
+        width,
+    ));
 
-    render_media_summary(
-        &mut lines,
+    lines.extend(body_lines(&item.text, &body_prefix, width));
+    lines.extend(media_lines(
         &body_prefix,
         width,
         &item.images,
         &item.videos,
         item.external.as_ref(),
-    );
-
+    ));
     if let Some(quote) = &item.quote {
         render_quote_lines(&mut lines, quote, width, &body_prefix);
     }
-
     if let Some(status) = &item.embed_status {
-        lines.push(Line::from(format!("{body_prefix}{status}")));
+        lines.push(Line::from(vec![
+            body_guide.clone(),
+            Span::styled(status.clone(), muted),
+        ]));
     }
+    lines.push(engagement_line(item, &context.body_guide));
 
-    lines.push(engagement_line(item, &body_prefix));
-    lines.push(Line::from(""));
-    lines
-}
-
-fn reason_text(reason: &FeedReason) -> String {
-    match reason {
-        FeedReason::Repost {
-            by_handle,
-            indexed_at,
-            ..
-        } => {
-            let time = compact_time(indexed_at.as_deref());
-            if time.is_empty() {
-                format!("⟳ @{by_handle} reposted")
-            } else {
-                format!("⟳ @{by_handle} reposted {time}")
-            }
-        }
-        FeedReason::Pin => "⚑ pinned".into(),
-    }
-}
-
-fn reply_preview_lines(reply: &ReplyContext, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let grandparent = reply
-        .grandparent_author_handle
-        .as_ref()
-        .map(|handle| format!(" via @{handle}"))
-        .unwrap_or_default();
-    let label = match reply.parent_status {
-        Some(ReplyParentStatus::Blocked) => "↩ replying to blocked post".to_owned(),
-        Some(ReplyParentStatus::NotFound) => "↩ replying to missing post".to_owned(),
-        None => format!(
-            "↩ replying to @{}{}",
-            reply.parent_author_handle, grandparent
-        ),
+    let separator = if context.body_guide.trim().is_empty() {
+        Line::from("")
+    } else {
+        Line::from(vec![
+            Span::raw("  "),
+            guide_span(context.body_guide.trim_end()),
+        ])
     };
-    lines.push(Line::from(vec![Span::styled(
-        format!("{prefix}{label}"),
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    let preview_prefix = format!("{prefix}│ ");
-    for line in wrap_text(
-        &reply.parent_text,
-        width.saturating_sub(preview_prefix.len()).max(10),
-    )
-    .into_iter()
-    .take(2)
-    {
-        lines.push(Line::from(vec![Span::styled(
-            format!("{preview_prefix}{line}"),
-            Style::default().fg(Color::DarkGray),
-        )]));
-    }
-
-    lines
+    (lines, separator)
 }
 
 #[cfg(test)]
 pub(crate) fn engagement_summary(item: &FeedItem) -> String {
-    let like_symbol = if item.viewer_like.is_some() {
-        "♥"
-    } else {
-        "♡"
-    };
-    format!(
-        "↩ {}  ⟳ {}  {} {}  ❞ {}",
-        item.reply_count, item.repost_count, like_symbol, item.like_count, item.quote_count
-    )
+    engagement_line(item, "")
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 pub(crate) fn engagement_line(item: &FeedItem, prefix: &str) -> Line<'static> {
-    let repost_style = if item.viewer_repost.is_some() {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
+    let counter = |glyph: &str, count: u64, active: Option<Color>| {
+        let style = match active {
+            Some(color) => Style::default().fg(color).add_modifier(Modifier::BOLD),
+            None if count == 0 => Style::default().fg(MUTED),
+            None => Style::default(),
+        };
+        Span::styled(format!("{glyph} {}", compact_count(count)), style)
     };
-    let like_symbol = if item.viewer_like.is_some() {
-        "♥"
-    } else {
-        "♡"
-    };
-    let like_style = if item.viewer_like.is_some() {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-
+    let liked = item.viewer_like.is_some();
+    let reposted = item.viewer_repost.is_some();
     Line::from(vec![
-        Span::raw(prefix.to_owned()),
-        Span::raw(format!("↩ {}  ", item.reply_count)),
-        Span::styled(format!("⟳ {}", item.repost_count), repost_style),
-        Span::raw("  "),
-        Span::styled(format!("{} {}", like_symbol, item.like_count), like_style),
-        Span::raw(format!("  ❞ {}", item.quote_count)),
+        guide_span(prefix),
+        counter("↩", item.reply_count, None),
+        Span::raw("   "),
+        counter("⟳", item.repost_count, reposted.then_some(Color::Green)),
+        Span::raw("   "),
+        counter(
+            if liked { "♥" } else { "♡" },
+            item.like_count,
+            liked.then_some(Color::Red),
+        ),
+        Span::raw("   "),
+        counter("❞", item.quote_count, None),
     ])
 }
 
@@ -895,119 +1334,127 @@ fn render_quote_lines(
     lines: &mut Vec<Line<'static>>,
     quote: &QuotePost,
     width: usize,
-    body_prefix: &str,
+    body_prefix: &[Span<'static>],
 ) {
-    let frame_style = Style::default().fg(Color::Yellow);
-    let quote_prefix = format!("{body_prefix}│ ");
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{body_prefix}╭─ ❞ {} @{} {}",
-            quote.author_name,
-            quote.author_handle,
-            compact_time(quote.indexed_at.as_deref())
-        ),
-        frame_style,
-    )]));
-    for line in wrap_text(
-        &quote.text,
-        width.saturating_sub(quote_prefix.chars().count()).max(10),
-    ) {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{body_prefix}│ "), frame_style),
-            Span::raw(line),
-        ]));
-    }
-    render_media_summary(
-        lines,
-        &quote_prefix,
+    let frame_style = Style::default().fg(FRAME);
+    let mut lead = body_prefix.to_vec();
+    lead.push(Span::styled("╭ ", frame_style));
+    lines.push(author_header(
+        lead,
+        &quote.author_name,
+        &quote.author_handle,
+        &quote.author_handle,
+        &compact_time(quote.indexed_at.as_deref()),
+        width,
+    ));
+    let mut inner = body_prefix.to_vec();
+    inner.push(Span::styled("│ ", frame_style));
+    let mut quote_body = body_lines(&quote.text, &inner, width);
+    quote_body.truncate(6);
+    lines.extend(quote_body);
+    lines.extend(media_lines(
+        &inner,
         width,
         &quote.images,
         &quote.videos,
         quote.external.as_ref(),
-    );
+    ));
     if let Some(nested) = &quote.nested_quote {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{body_prefix}│ "), frame_style),
-            Span::raw(format!("nested quote: {nested}")),
-        ]));
+        let mut spans = inner.clone();
+        spans.push(Span::styled(
+            truncate_width(&format!("❞ {nested}"), width.saturating_sub(6)),
+            Style::default().fg(MUTED),
+        ));
+        lines.push(Line::from(spans));
     }
-    lines.push(Line::from(vec![Span::styled(
-        format!("{body_prefix}╰─"),
-        frame_style,
-    )]));
+    let mut close = body_prefix.to_vec();
+    close.push(Span::styled("╰─", frame_style));
+    lines.push(Line::from(close));
 }
 
-fn render_media_summary(
-    lines: &mut Vec<Line<'static>>,
-    prefix: &str,
+fn link_domain(uri: &str) -> String {
+    uri.split("://")
+        .nth(1)
+        .unwrap_or(uri)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_owned()
+}
+
+/// One line per attachment: alt text and card descriptions are truncated
+/// here and shown in full in the media overlay / link picker.
+fn media_lines(
+    prefix: &[Span<'static>],
     width: usize,
     images: &[ImageRef],
     videos: &[crate::model::VideoRef],
     external: Option<&ExternalRef>,
-) {
-    let content_width = width.saturating_sub(prefix.len()).max(10);
+) -> Vec<Line<'static>> {
+    let prefix_width = prefix.iter().map(Span::width).sum::<usize>();
+    let room = width.saturating_sub(prefix_width);
     let media_style = Style::default().fg(Color::LightMagenta);
-    let link_style = Style::default().fg(Color::LightCyan);
-
+    let mut lines = Vec::new();
+    let mut push = |tag: String, detail: String, style: Style| {
+        let text = if detail.is_empty() {
+            tag
+        } else {
+            format!("{tag} {}", single_line(&detail))
+        };
+        let mut spans = prefix.to_vec();
+        spans.push(Span::styled(truncate_width(&text, room), style));
+        lines.push(Line::from(spans));
+    };
     if !images.is_empty() {
-        let label = if images.len() == 1 { "image" } else { "images" };
+        let tag = if images.len() == 1 {
+            "[image]".to_owned()
+        } else {
+            format!("[{} images]", images.len())
+        };
         let alt = images
-            .first()
-            .and_then(|image| image.alt.as_ref())
-            .map(|alt| format!(": {alt}"))
-            .unwrap_or_default();
-        push_wrapped_summary(
-            lines,
-            prefix,
-            &format!("[{} {label}{alt}]", images.len()),
-            content_width,
-            media_style,
-        );
+            .iter()
+            .find_map(|image| image.alt.clone())
+            .unwrap_or_else(|| "(no alt text)".into());
+        push(tag, alt, media_style);
     }
     if !videos.is_empty() {
-        let label = if videos.len() == 1 { "video" } else { "videos" };
         let alt = videos
-            .first()
-            .and_then(|video| video.alt.as_ref())
-            .map(|alt| format!(": {alt}"))
+            .iter()
+            .find_map(|video| video.alt.clone())
             .unwrap_or_default();
-        push_wrapped_summary(
-            lines,
-            prefix,
-            &format!("[{} {label}{alt}]", videos.len()),
-            content_width,
-            media_style,
-        );
+        push("[video]".into(), alt, media_style);
     }
     if let Some(external) = external {
-        let description = external
-            .description
-            .as_ref()
-            .map(|description| format!(" - {description}"))
-            .unwrap_or_default();
-        push_wrapped_summary(
-            lines,
-            prefix,
-            &format!("[link] {}{}", external.title, description),
-            content_width,
-            link_style,
+        let domain = link_domain(&external.uri);
+        push(
+            "[link]".into(),
+            format!("{} · {domain}", external.title),
+            Style::default().fg(LINK),
         );
     }
+    lines
 }
 
-fn push_wrapped_summary(
-    lines: &mut Vec<Line<'static>>,
-    prefix: &str,
-    text: &str,
-    width: usize,
-    style: Style,
-) {
-    for line in wrap_text(text, width) {
-        lines.push(Line::from(vec![
-            Span::raw(prefix.to_owned()),
-            Span::styled(line, style),
-        ]));
-    }
+pub(crate) fn render_splash(frame: &mut Frame<'_>, handle: &str) {
+    let area = frame.area();
+    let lines = vec![
+        Line::from(Span::styled(
+            "at-tui",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Connecting to Bluesky as @{handle}…"),
+            Style::default().fg(MUTED),
+        )),
+    ];
+    let top = area.height.saturating_sub(lines.len() as u16) / 2;
+    let rect = Rect::new(area.x, area.y + top, area.width, lines.len() as u16);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).alignment(ratatui::layout::Alignment::Center),
+        rect,
+    );
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -1067,11 +1514,11 @@ mod tests {
 
     #[test]
     fn renders_unicode_engagement_summary() {
-        assert_eq!(engagement_summary(&item()), "↩ 2  ⟳ 3  ♡ 5  ❞ 7");
+        assert_eq!(engagement_summary(&item()), "↩ 2   ⟳ 3   ♡ 5   ❞ 7");
 
         let mut liked = item();
         liked.viewer_like = Some("at://did:plc:viewer/app.bsky.feed.like/1".into());
-        assert_eq!(engagement_summary(&liked), "↩ 2  ⟳ 3  ♥ 5  ❞ 7");
+        assert_eq!(engagement_summary(&liked), "↩ 2   ⟳ 3   ♥ 5   ❞ 7");
     }
 
     #[test]
@@ -1081,8 +1528,8 @@ mod tests {
 
         let line = engagement_line(&item, "");
 
-        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
-        assert!(line.spans[2].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[3].style.fg, Some(Color::Green));
+        assert!(line.spans[3].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1092,9 +1539,9 @@ mod tests {
 
         let line = engagement_line(&item, "");
 
-        assert_eq!(line.spans[4].content.as_ref(), "♥ 5");
-        assert_eq!(line.spans[4].style.fg, Some(Color::Red));
-        assert!(line.spans[4].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[5].content.as_ref(), "♥ 5");
+        assert_eq!(line.spans[5].style.fg, Some(Color::Red));
+        assert!(line.spans[5].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1114,7 +1561,7 @@ mod tests {
             nested_quote: None,
         });
 
-        let lines = render_item_lines(&item, false, 80);
+        let (lines, _) = render_item_lines(&item, 80, &RowContext::default());
         let text = lines
             .iter()
             .map(|line| {
@@ -1126,20 +1573,92 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("╭─ ❞ Bob @bob.test"));
+        assert!(text.contains("╭ Bob @bob.test"));
         assert!(text.contains("│ quoted words"));
         assert!(text.contains("╰─"));
         assert!(!text.contains("+--"));
     }
 
+    fn plain(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn renders_repost_reason_text() {
-        let reason = FeedReason::Repost {
+        let mut item = item();
+        item.reason = Some(FeedReason::Repost {
             by_name: "Alice".into(),
             by_handle: "alice.test".into(),
             indexed_at: None,
-        };
-        assert_eq!(reason_text(&reason), "⟳ @alice.test reposted");
+        });
+        let (lines, _) = render_item_lines(&item, 80, &RowContext::default());
+        assert!(plain(&lines).starts_with("⟳ reposted by Alice"));
+    }
+
+    #[test]
+    fn selection_bar_runs_the_full_height_of_the_post() {
+        let item = ViewItem::Post(Box::new(item_with_text("one\ntwo")));
+        let lines = render_view_item_lines(&item, true, 40, &RowContext::default());
+        let (separator, post) = lines.split_last().unwrap();
+        assert!(post.iter().all(|line| line.spans[0].content == "▌ "));
+        assert_eq!(separator.width(), 0);
+    }
+
+    #[test]
+    fn header_right_aligns_time_and_shows_handle_once() {
+        let line = author_header(
+            Vec::new(),
+            "alice.test",
+            "alice.test",
+            "did:plc:a",
+            "5m",
+            30,
+        );
+        let text = plain(std::slice::from_ref(&line));
+        assert!(text.starts_with("@alice.test"), "{text}");
+        assert!(text.ends_with(" 5m"));
+        assert_eq!(line.width(), 30);
+    }
+
+    #[test]
+    fn thread_guides_draw_siblings_and_last_children() {
+        // anchor(0) -> a(1) -> a1(2); b(1)
+        let guides = thread_guides(&[0, 1, 2, 1]);
+        let headers = guides
+            .iter()
+            .map(|(header, _)| header.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(headers, vec!["", "├─ ", "│  └─ ", "└─ "]);
+        // Body lines keep the column for later siblings and lead to replies.
+        assert_eq!(guides[0].1, "│ ");
+        assert_eq!(guides[1].1, "│  │ ");
+        assert_eq!(guides[2].1, "│       ");
+        assert_eq!(guides[3].1, "     ");
+    }
+
+    #[test]
+    fn compacts_large_counts() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_000), "1K");
+        assert_eq!(compact_count(9_231), "9.2K");
+        assert_eq!(compact_count(86_027), "86K");
+        assert_eq!(compact_count(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn author_colour_is_stable_per_account() {
+        assert_eq!(nick_color("did:plc:alice"), nick_color("did:plc:alice"));
+        assert!(!NICK_COLORS.contains(&Color::Yellow));
+        assert!(!NICK_COLORS.contains(&Color::Red));
     }
 
     #[test]
@@ -1172,12 +1691,19 @@ mod tests {
             text: "reply text".into(),
             indexed_at: "2026-05-22T00:00:00Z".into(),
             is_read: false,
-            target: NotificationTarget::Post {
+            target: crate::model::NotificationTarget::Post {
                 uri: "at://did:plc:alice/app.bsky.feed.post/1".into(),
             },
+            others: vec!["Carol".into(), "Dan".into(), "Erin".into()],
+            subject_text: None,
         };
 
-        let lines = render_view_item_lines(&ViewItem::Notification(Box::new(item)), true, 80);
+        let lines = render_view_item_lines(
+            &ViewItem::Notification(Box::new(item)),
+            true,
+            80,
+            &RowContext::default(),
+        );
         let text = lines
             .iter()
             .map(|line| {
@@ -1189,7 +1715,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("● Bob @bob.test replied to you"));
+        assert!(
+            text.contains("● ↩ Bob, Carol and 2 others replied to you"),
+            "{text}"
+        );
         assert!(text.contains("reply text"));
     }
 
@@ -1221,7 +1750,8 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("Alice @alice.test"));
-        assert!(text.contains("1 followers  2 following  3 posts  · following"));
+        assert!(text.contains("1 followers · 2 following · 3 posts"));
+        assert!(text.contains("✓ following"));
     }
 
     #[test]
@@ -1251,8 +1781,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("1 followers  2 following  3 posts"));
+        assert!(text.contains("1 followers · 2 following · 3 posts"));
         assert!(!text.contains("not following"));
+        assert!(!text.contains("✓ following"));
     }
 
     #[test]
@@ -1275,22 +1806,21 @@ mod tests {
             description: Some("a long external description that wraps cleanly".into()),
             thumb_url: None,
         };
-        let mut lines = Vec::new();
+        let lines = media_lines(&[Span::raw("  ")], 28, &images, &videos, Some(&external));
 
-        render_media_summary(&mut lines, "  ", 28, &images, &videos, Some(&external));
-
-        assert!(lines.len() > 3);
-        assert!(lines.iter().all(|line| line_width(line) <= 28));
+        // One line per attachment; long alt text is truncated, not wrapped.
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line.width() <= 28));
         assert!(lines.iter().any(|line| {
             line.spans
                 .iter()
                 .any(|span| span.style.fg == Some(Color::LightMagenta))
         }));
-        assert!(lines.iter().any(|line| {
-            line.spans
+        assert!(
+            lines
                 .iter()
-                .any(|span| span.style.fg == Some(Color::LightCyan))
-        }));
+                .any(|line| { line.spans.iter().any(|span| span.style.fg == Some(LINK)) })
+        );
     }
 
     #[test]
@@ -1376,14 +1906,18 @@ mod tests {
             vec![item_with_text("one"), item_with_text("two")],
         );
 
-        let _ = visible_feed_lines(&mut view, 80, 10);
+        let _ = visible_feed_lines_at(&mut view, 80, 10, 100);
         let first_builds = view.layout_cache.builds;
-        let _ = visible_feed_lines(&mut view, 80, 10);
+        let _ = visible_feed_lines_at(&mut view, 80, 10, 100);
 
         assert_eq!(first_builds, 1);
         assert_eq!(view.layout_cache.builds, first_builds);
 
-        let _ = visible_feed_lines(&mut view, 40, 10);
+        let _ = visible_feed_lines_at(&mut view, 40, 10, 100);
         assert_eq!(view.layout_cache.builds, first_builds + 1);
+
+        // Relative timestamps age: a new minute rebuilds the rows.
+        let _ = visible_feed_lines_at(&mut view, 40, 10, 101);
+        assert_eq!(view.layout_cache.builds, first_builds + 2);
     }
 }

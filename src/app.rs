@@ -8,8 +8,8 @@ use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -26,9 +26,9 @@ use crate::{
     },
     model::{
         FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, NotificationItem,
-        NotificationTarget, PostRef, ProfileSummary, QuotePost, ViewItem, feed_item_from_quote,
-        feed_sources_for_account, item_links, notification_items, profile_summary, thread_items,
-        timeline_items,
+        NotificationTarget, PostRef, ProfileSummary, QuotePost, ViewItem, apply_feed_display_names,
+        feed_item_from_quote, feed_sources_for_account, item_links, notification_items,
+        profile_summary, thread_items, timeline_items,
     },
     navigation::{NavigationStack, ViewKind, ViewState},
     ui,
@@ -47,6 +47,13 @@ pub enum Overlay {
     Links(LinkPickerState),
     Composer(ComposerState),
     ConfirmDelete(ConfirmDeleteState),
+    Switcher(SwitcherState),
+}
+
+/// Feeds first, then accounts; nothing switches until Enter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SwitcherState {
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,86 +61,12 @@ pub struct ConfirmDeleteState {
     pub uri: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The menu (Esc on the timeline, or `?`): feeds and accounts, the key
+/// reference and settings together. `selected` indexes feeds then
+/// accounts; nothing switches until Enter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MenuState {
-    pub section: MenuSection,
-}
-
-impl Default for MenuState {
-    fn default() -> Self {
-        Self {
-            section: MenuSection::Keys,
-        }
-    }
-}
-
-impl MenuState {
-    pub fn settings() -> Self {
-        Self {
-            section: MenuSection::Settings,
-        }
-    }
-
-    pub fn next(&mut self) {
-        self.section = self.section.next();
-    }
-
-    pub fn previous(&mut self) {
-        self.section = self.section.previous();
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuSection {
-    Keys,
-    Accounts,
-    Feeds,
-    Settings,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MenuTabAction {
-    MoveSection(isize),
-    SwitchAccount(isize),
-    SwitchFeed(isize),
-}
-
-impl MenuSection {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Keys => "Keys",
-            Self::Accounts => "Accounts",
-            Self::Feeds => "Feeds",
-            Self::Settings => "Settings",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Keys => Self::Accounts,
-            Self::Accounts => Self::Feeds,
-            Self::Feeds => Self::Settings,
-            Self::Settings => Self::Keys,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Keys => Self::Settings,
-            Self::Accounts => Self::Keys,
-            Self::Feeds => Self::Accounts,
-            Self::Settings => Self::Feeds,
-        }
-    }
-}
-
-fn menu_tab_action(section: MenuSection, reverse: bool) -> MenuTabAction {
-    let delta = if reverse { -1 } else { 1 };
-    match section {
-        MenuSection::Accounts => MenuTabAction::SwitchAccount(delta),
-        MenuSection::Feeds => MenuTabAction::SwitchFeed(delta),
-        MenuSection::Keys | MenuSection::Settings => MenuTabAction::MoveSection(delta),
-    }
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +80,7 @@ pub enum Action {
     PageDown,
     PageUp,
     OpenMenu,
+    OpenSwitcher,
     PreviewMedia,
     OpenLinks,
     PreviousFeed,
@@ -190,6 +124,7 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::Char('?') => Some(Action::OpenMenu),
+        KeyCode::Tab => Some(Action::OpenSwitcher),
         KeyCode::Char(' ') => Some(Action::PreviewMedia),
         KeyCode::Char('o') => Some(Action::OpenLinks),
         KeyCode::Char('[') => Some(Action::PreviousFeed),
@@ -217,13 +152,65 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
-pub fn normal_key_help_lines() -> Vec<&'static str> {
-    vec![
-        "  j/k or arrows: move · Ctrl-d/Ctrl-u half page · PgUp/PgDn page",
-        "  l/Enter/Right: open selected · h/Left back · q back, quit at root",
-        "  P profile · N notifications · Space media · o links · e quoted post",
-        "  f like · b repost · F follow · p post · r reply · Q quote · d delete",
-        "  / search · n next · R reload · u load pending · Ctrl-C quit",
+pub type KeyHelpGroup = (&'static str, &'static [(&'static str, &'static str)]);
+
+/// The help card, grouped which-key style. Lives beside the keymap so the
+/// two change together (and the registry test checks both).
+pub fn key_help_groups() -> [KeyHelpGroup; 6] {
+    [
+        (
+            "MOVE",
+            &[
+                ("j k ↓ ↑", "next / prev"),
+                ("^d ^u", "half page"),
+                ("PgDn PgUp", "page"),
+                ("g G", "top / bottom"),
+                ("u", "new posts"),
+            ],
+        ),
+        (
+            "OPEN",
+            &[
+                ("l ⏎ →", "thread"),
+                ("h ← q", "back"),
+                ("e", "quoted post"),
+                ("P", "profile"),
+                ("N", "notifications"),
+            ],
+        ),
+        (
+            "ACT",
+            &[
+                ("f", "like"),
+                ("b", "repost"),
+                ("F", "follow"),
+                ("d", "delete yours"),
+                ("o", "open link"),
+            ],
+        ),
+        (
+            "WRITE",
+            &[("p", "new post"), ("r", "reply"), ("Q", "quote post")],
+        ),
+        (
+            "VIEW",
+            &[
+                ("Tab", "feeds/accounts"),
+                ("[ ]", "prev/next feed"),
+                ("␣", "media"),
+                ("/ n", "search/next"),
+                ("R", "reload"),
+            ],
+        ),
+        (
+            "APP",
+            &[
+                ("?", "menu"),
+                ("Esc", "back / menu"),
+                ("q", "quit at root"),
+                ("^C", "quit"),
+            ],
+        ),
     ]
 }
 
@@ -379,6 +366,10 @@ enum AppEvent {
     WriteCompleted {
         result: AppTaskResult<WriteResult>,
     },
+    PostCompleted {
+        draft: ComposerState,
+        result: AppTaskResult<String>,
+    },
     NotificationCountLoaded {
         request_id: RequestId,
         account_did: String,
@@ -465,9 +456,6 @@ enum WriteResult {
         followed: bool,
         record_uri: Option<String>,
     },
-    Posted {
-        uri: String,
-    },
     Deleted {
         uri: String,
     },
@@ -489,18 +477,26 @@ pub struct App {
     pub active_feed: usize,
     pub home_feed_prefs: HomeFeedPrefs,
     pub status: String,
+    pub status_is_error: bool,
     status_expires_at: Option<Instant>,
     pub input_mode: InputMode,
     pub overlay: Option<Overlay>,
     pub should_quit: bool,
     pub pending_new_items: Vec<FeedItem>,
+    /// Composer text kept across Esc and failed sends, restored when the
+    /// composer reopens for the same target.
+    saved_draft: Option<ComposerState>,
+    /// Draft waiting to be opened in $EDITOR by the run loop.
+    editor_request: Option<ComposerState>,
     pub unread_notifications: u64,
     consecutive_poll_failures: u32,
     events_tx: UnboundedSender<AppEvent>,
     events_rx: UnboundedReceiver<AppEvent>,
     next_request_id: RequestId,
     pending_feed: Option<RequestId>,
-    pending_pagination: Option<RequestId>,
+    /// Feed to fall back to if an in-flight feed switch fails, so the label
+    /// and pagination source keep matching what the root view shows.
+    feed_load_fallback: Option<usize>,
     pending_refresh: Option<RequestId>,
     pending_notification_count: Option<RequestId>,
     pending_notifications: Option<RequestId>,
@@ -518,6 +514,8 @@ pub struct App {
 }
 
 const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+const STATUS_TTL: Duration = Duration::from_secs(2);
+const ERROR_STATUS_TTL: Duration = Duration::from_secs(8);
 
 impl App {
     pub async fn bootstrap(mut client: BskyClient, media: MediaCache) -> Result<Self> {
@@ -542,6 +540,9 @@ impl App {
                 Some(format!("Preferences unavailable: {error:#}")),
             ),
         };
+        let home_feed_prefs = home_feed_prefs.with_viewer(client.session().did);
+        let mut feeds = feeds;
+        resolve_feed_names(&mut client, &mut feeds).await;
         let (items, cursor) =
             load_feed_page(&mut client, &feeds[0], &home_feed_prefs, None).await?;
         let mut timeline = ViewState::new(feeds[0].label.clone(), ViewKind::Timeline, items);
@@ -560,18 +561,21 @@ impl App {
             active_feed: 0,
             home_feed_prefs,
             status,
+            status_is_error: false,
             status_expires_at: Some(now + Duration::from_secs(2)),
             input_mode: InputMode::Normal,
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
+            saved_draft: None,
+            editor_request: None,
             unread_notifications: 0,
             consecutive_poll_failures: 0,
             events_tx,
             events_rx,
             next_request_id: 1,
             pending_feed: None,
-            pending_pagination: None,
+            feed_load_fallback: None,
             pending_refresh: None,
             pending_notification_count: None,
             pending_notifications: None,
@@ -617,7 +621,16 @@ impl App {
 
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
-        self.status_expires_at = Some(Instant::now() + Duration::from_secs(2));
+        self.status_is_error = false;
+        self.status_expires_at = Some(Instant::now() + STATUS_TTL);
+    }
+
+    /// Failures stay readable long enough to notice; a two-second flash is
+    /// easy to miss for a post that did not send.
+    pub fn set_error_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.status_is_error = true;
+        self.status_expires_at = Some(Instant::now() + ERROR_STATUS_TTL);
     }
 
     pub fn visible_status(&self) -> Option<&str> {
@@ -654,7 +667,7 @@ impl App {
                 self.media.finish_video_load(playlist_url.clone(), result);
                 match self.media.video_state_name(&playlist_url) {
                     "ready" => self.set_status("Video frames ready"),
-                    "failed" => self.set_status("Video decode failed"),
+                    "failed" => self.set_error_status("Video decode failed"),
                     _ => {}
                 }
             }
@@ -682,32 +695,19 @@ impl App {
                 request_id,
                 source,
                 result,
-            } => {
-                if self.pending_pagination == Some(request_id) {
-                    self.pending_pagination = None;
-                    self.apply_page_loaded(source, result);
-                }
-            }
+            } => self.apply_page_loaded(request_id, source, result),
             AppEvent::ProfilePageLoaded {
                 request_id,
                 actor,
                 result,
-            } => {
-                if self.pending_pagination == Some(request_id) {
-                    self.pending_pagination = None;
-                    self.apply_profile_page_loaded(actor, result);
-                }
-            }
+            } => self.apply_profile_page_loaded(request_id, actor, result),
             AppEvent::NotificationsPageLoaded {
                 request_id,
                 account_did,
                 result,
             } => {
-                if self.pending_pagination == Some(request_id) {
-                    self.pending_pagination = None;
-                    if account_did == self.client.session().did {
-                        self.apply_notifications_page_loaded(result);
-                    }
+                if account_did == self.client.session().did {
+                    self.apply_notifications_page_loaded(request_id, result);
                 }
             }
             AppEvent::ThreadLoaded {
@@ -750,11 +750,34 @@ impl App {
             }
             AppEvent::LinkOpened { uri, result } => match result {
                 Ok(()) => self.set_status(format!("Opened {uri}")),
-                Err(error) => self.set_status(format!("Could not open link: {error}")),
+                Err(error) => self.set_error_status(format!("Could not open link: {error}")),
             },
             AppEvent::WriteCompleted { result } => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 self.apply_write_result(result);
+            }
+            AppEvent::PostCompleted { draft, result } => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
+                match result {
+                    Ok(_uri) => {
+                        // Say what happened in words; the record's at:// URI
+                        // means nothing to a reader.
+                        self.set_status(match draft.kind {
+                            ComposerKind::Post => "Posted",
+                            ComposerKind::Reply { .. } => "Reply posted",
+                            ComposerKind::Quote { .. } => "Quote posted",
+                        });
+                        self.last_refresh = Instant::now() - self.refresh_interval;
+                    }
+                    Err(error) => {
+                        // The overlay closed on send; keep the text so a
+                        // failed post is one keypress from a retry.
+                        self.saved_draft = Some(draft);
+                        self.set_error_status(format!(
+                            "Post failed (draft kept, reopen to retry): {error}"
+                        ));
+                    }
+                }
             }
             AppEvent::NotificationCountLoaded {
                 request_id,
@@ -786,6 +809,12 @@ impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Kitty-protocol terminals and Windows also deliver Release/Repeat.
         if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+        // Documented as "quit from anywhere"; search and every overlay used
+        // to swallow it.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
             return Ok(());
         }
         if self.overlay.is_some() {
@@ -822,6 +851,24 @@ impl App {
         }
 
         self.after_input().await
+    }
+
+    /// Bracketed paste arrives as one event. Without it a paste into the
+    /// timeline replays every character as a command (f likes, b reposts,
+    /// F follows), so text only lands where text is expected.
+    pub fn handle_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(Overlay::Composer(state)) = self.overlay.as_mut() {
+            state.buffer.push_str(&text);
+            return;
+        }
+        if self.overlay.is_none()
+            && let InputMode::Search { buffer } = &mut self.input_mode
+        {
+            buffer.push_str(text.lines().next().unwrap_or_default());
+            return;
+        }
+        self.set_status("Paste ignored outside the composer and search");
     }
 
     pub async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
@@ -861,10 +908,10 @@ impl App {
         enum Action {
             None,
             Close,
-            SwitchAccount(isize),
-            SwitchFeed(isize),
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
+            CloseComposer(ComposerState),
+            SwitchTo(usize),
             PlayVideo(Option<PreviewVideo>),
             SubmitComposer(Option<ComposerState>),
             DeletePost(String),
@@ -872,28 +919,26 @@ impl App {
 
         let mut action = Action::None;
         match self.overlay.as_mut() {
-            Some(Overlay::Menu(state)) => match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
-                    action = Action::Close;
-                }
-                KeyCode::Char('j') | KeyCode::Down => state.next(),
-                KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                KeyCode::Tab | KeyCode::BackTab => {
-                    match menu_tab_action(state.section, matches!(key.code, KeyCode::BackTab)) {
-                        MenuTabAction::MoveSection(delta) if delta > 0 => state.next(),
-                        MenuTabAction::MoveSection(_) => state.previous(),
-                        MenuTabAction::SwitchAccount(delta) => {
-                            action = Action::SwitchAccount(delta);
-                        }
-                        MenuTabAction::SwitchFeed(delta) => {
-                            action = Action::SwitchFeed(delta);
-                        }
+            Some(Overlay::Menu(state)) => {
+                let total = self.feeds.len() + self.accounts.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                        action = Action::Close;
                     }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        state.selected = (state.selected + 1).min(total.saturating_sub(1));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    // On the current feed this switches nothing and closes,
+                    // as Enter always did here.
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        action = Action::SwitchTo(state.selected)
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('[') => action = Action::SwitchFeed(-1),
-                KeyCode::Char(']') => action = Action::SwitchFeed(1),
-                _ => {}
-            },
+            }
             Some(Overlay::Media(state)) => match key.code {
                 KeyCode::Esc | KeyCode::Char(' ') | KeyCode::Char('q') => {
                     action = Action::Close;
@@ -929,6 +974,22 @@ impl App {
                 }
                 _ => {}
             },
+            Some(Overlay::Switcher(state)) => {
+                let total = self.feeds.len() + self.accounts.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => action = Action::Close,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        state.selected = (state.selected + 1).min(total.saturating_sub(1));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        action = Action::SwitchTo(state.selected)
+                    }
+                    _ => {}
+                }
+            }
             Some(Overlay::ConfirmDelete(state)) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     action = Action::DeletePost(state.uri.clone());
@@ -937,9 +998,22 @@ impl App {
                 _ => action = Action::Close,
             },
             Some(Overlay::Composer(state)) => match key.code {
-                KeyCode::Esc => action = Action::Close,
+                KeyCode::Esc => action = Action::CloseComposer(state.clone()),
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     action = Action::SubmitComposer(Some(state.clone()));
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Hand the draft to $EDITOR (mutt/git style); the run
+                    // loop owns the terminal, so it performs the suspend.
+                    self.editor_request = Some(state.clone());
+                    action = Action::Close;
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    delete_last_word(&mut state.buffer);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let keep = state.buffer.rfind('\n').map_or(0, |index| index + 1);
+                    state.buffer.truncate(keep);
                 }
                 KeyCode::Enter => state.buffer.push('\n'),
                 KeyCode::Backspace => {
@@ -958,8 +1032,26 @@ impl App {
         match action {
             Action::None => {}
             Action::Close => self.overlay = None,
-            Action::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
-            Action::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
+            Action::CloseComposer(state) => {
+                self.overlay = None;
+                if !state.buffer.trim().is_empty() {
+                    self.saved_draft = Some(state);
+                    self.set_status("Draft kept; reopen the composer to continue");
+                }
+            }
+            Action::SwitchTo(index) => {
+                self.overlay = None;
+                if index < self.feeds.len() {
+                    let delta = index as isize - self.active_feed as isize;
+                    if delta != 0 {
+                        self.switch_feed_delta(delta).await?;
+                    }
+                } else if let Some(account) = self.accounts.get(index - self.feeds.len()).cloned()
+                    && account.session.did != self.client.session().did
+                {
+                    self.queue_account_switch(account);
+                }
+            }
             Action::OpenLink(link) => {
                 if let Some(link) = link {
                     self.open_link(link);
@@ -1012,7 +1104,12 @@ impl App {
             Action::HalfPageUp => self.nav.current_mut().move_by(-5),
             Action::PageDown => self.nav.current_mut().move_by(10),
             Action::PageUp => self.nav.current_mut().move_by(-10),
-            Action::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
+            Action::OpenMenu => self.open_menu(),
+            Action::OpenSwitcher => {
+                self.overlay = Some(Overlay::Switcher(SwitcherState {
+                    selected: self.active_feed,
+                }));
+            }
             Action::PreviewMedia => self.open_media_overlay_for_selected().await?,
             Action::OpenLinks => self.open_links_for_selected(),
             Action::PreviousFeed => self.switch_feed_delta(-1).await?,
@@ -1057,7 +1154,7 @@ impl App {
                 if self.nav.pop() {
                     self.set_status("Back");
                 } else {
-                    self.overlay = Some(Overlay::Menu(MenuState::settings()));
+                    self.open_menu();
                 }
             }
             Action::OpenSelected => self.open_selected_detail().await?,
@@ -1067,6 +1164,12 @@ impl App {
             Action::Reload => self.reload_current().await?,
         }
         Ok(())
+    }
+
+    fn open_menu(&mut self) {
+        self.overlay = Some(Overlay::Menu(MenuState {
+            selected: self.active_feed,
+        }));
     }
 
     async fn open_media_overlay_for_selected(&mut self) -> Result<()> {
@@ -1192,6 +1295,12 @@ impl App {
     }
 
     fn open_uri(&mut self, uri: String) {
+        // Facet URIs are author-controlled and need not match the visible
+        // text; never hand a custom scheme (file:, app handlers) to the OS.
+        if !is_web_uri(&uri) {
+            self.set_error_status(format!("Refusing to open non-web link: {uri}"));
+            return;
+        }
         self.set_status(format!("Opening {uri}"));
         self.spawn_event(async move {
             let opened_uri = uri.clone();
@@ -1217,30 +1326,14 @@ impl App {
 
         let len = self.feeds.len() as isize;
         let next = (self.active_feed as isize + delta).rem_euclid(len) as usize;
+        if self.pending_feed.is_none() {
+            self.feed_load_fallback = Some(self.active_feed);
+        }
         self.active_feed = next;
         self.queue_feed_load(
             self.feeds[next].clone(),
             format!("Loading {}", self.feeds[next].label),
         );
-        Ok(())
-    }
-
-    async fn switch_account_delta(&mut self, delta: isize) -> Result<()> {
-        if self.accounts.len() <= 1 {
-            self.set_status("No other accounts saved");
-            return Ok(());
-        }
-
-        let current_did = self.client.session().did.clone();
-        let current = self
-            .accounts
-            .iter()
-            .position(|account| account.session.did == current_did)
-            .unwrap_or(0);
-        let len = self.accounts.len() as isize;
-        let next = (current as isize + delta).rem_euclid(len) as usize;
-        let account = self.accounts[next].clone();
-        self.queue_account_switch(account);
         Ok(())
     }
 
@@ -1251,7 +1344,7 @@ impl App {
         self.nav.root_mut().loading = true;
         self.set_status(status);
         let mut client = self.client.clone();
-        let prefs = self.home_feed_prefs;
+        let prefs = self.home_feed_prefs.clone();
         self.spawn_event(async move {
             let result = load_feed_page(&mut client, &source, &prefs, None)
                 .await
@@ -1326,6 +1419,7 @@ impl App {
             let result = async {
                 let root = client.list_notifications(None, 50).await?;
                 let (items, cursor, _) = notification_items(&root);
+                let items = enrich_notifications(&mut client, items).await;
                 let seen_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
                 let seen_result = client.update_seen(&seen_at).await;
                 Ok::<_, anyhow::Error>(NotificationsLoadData {
@@ -1355,12 +1449,14 @@ impl App {
             let result = async {
                 client.refresh_session().await?;
                 let root = client.get_preferences().await?;
-                let home_feed_prefs = HomeFeedPrefs::from_preferences_response(&root);
-                let feeds = feed_sources_for_account(
+                let home_feed_prefs = HomeFeedPrefs::from_preferences_response(&root)
+                    .with_viewer(client.session().did);
+                let mut feeds = feed_sources_for_account(
                     &root,
                     &client.session().handle,
                     &client.session().did,
                 );
+                resolve_feed_names(&mut client, &mut feeds).await;
                 let source = feeds.first().cloned().unwrap_or_else(FeedSource::home);
                 let (items, cursor) =
                     load_feed_page(&mut client, &source, &home_feed_prefs, None).await?;
@@ -1394,90 +1490,90 @@ impl App {
                 view.cursor = cursor;
                 self.nav.replace_root(view);
                 self.pending_new_items.clear();
+                self.feed_load_fallback = None;
                 self.last_refresh = Instant::now();
                 self.set_status(format!("Loaded {}", source.label));
             }
             Err(error) => {
+                if let Some(previous) = self.feed_load_fallback.take() {
+                    self.active_feed = previous;
+                }
                 self.nav.root_mut().error = Some(error);
-                self.set_status("Feed load failed");
+                self.set_error_status(format!("Could not load {}", source.label));
             }
         }
     }
 
     fn apply_profile_page_loaded(
         &mut self,
+        request_id: RequestId,
         actor: String,
         result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
     ) {
-        let current = self.nav.current_mut();
-        current.loading = false;
-        if !matches!(&current.kind, ViewKind::Profile { actor: current_actor } if current_actor == &actor)
-        {
+        let Some(view) = self.nav.view_with_page_request_mut(request_id) else {
+            return;
+        };
+        view.page_request = None;
+        if !matches!(&view.kind, ViewKind::Profile { actor: view_actor } if view_actor == &actor) {
             return;
         }
-
-        match result {
-            Ok((mut items, cursor)) => {
-                current.append_posts(&mut items);
-                current.cursor = cursor;
-                self.set_status("Loaded more posts");
-            }
-            Err(error) => {
-                current.error = Some(error);
-                self.set_status("Pagination failed");
-            }
-        }
+        let status = append_page(
+            view,
+            result.map(|(items, cursor)| (items.into_iter().map(ViewItem::from).collect(), cursor)),
+        );
+        self.set_page_status(status, "Loaded more posts");
     }
 
     fn apply_notifications_page_loaded(
         &mut self,
+        request_id: RequestId,
         result: AppTaskResult<(Vec<NotificationItem>, Option<String>)>,
     ) {
-        let current = self.nav.current_mut();
-        current.loading = false;
-        if !matches!(current.kind, ViewKind::Notifications) {
+        let Some(view) = self.nav.view_with_page_request_mut(request_id) else {
+            return;
+        };
+        view.page_request = None;
+        if !matches!(view.kind, ViewKind::Notifications) {
             return;
         }
-
-        match result {
-            Ok((items, cursor)) => {
+        let status = append_page(
+            view,
+            result.map(|(items, cursor)| {
                 let rows = items
                     .into_iter()
                     .map(|item| ViewItem::Notification(Box::new(item)))
-                    .collect::<Vec<_>>();
-                current.append_rows(rows);
-                current.cursor = cursor;
-                self.set_status("Loaded more notifications");
-            }
-            Err(error) => {
-                current.error = Some(error);
-                self.set_status("Pagination failed");
-            }
-        }
+                    .collect();
+                (rows, cursor)
+            }),
+        );
+        self.set_page_status(status, "Loaded more notifications");
     }
 
     fn apply_page_loaded(
         &mut self,
+        request_id: RequestId,
         source: FeedSource,
         result: AppTaskResult<(Vec<FeedItem>, Option<String>)>,
     ) {
-        let active_source = self.feeds.get(self.active_feed);
-        let current = self.nav.current_mut();
-        current.loading = false;
-        if active_source != Some(&source) || !matches!(current.kind, ViewKind::Timeline) {
+        let active_source = self.feeds.get(self.active_feed).cloned();
+        let Some(view) = self.nav.view_with_page_request_mut(request_id) else {
+            return;
+        };
+        view.page_request = None;
+        if active_source.as_ref() != Some(&source) || !matches!(view.kind, ViewKind::Timeline) {
             return;
         }
+        let status = append_page(
+            view,
+            result.map(|(items, cursor)| (items.into_iter().map(ViewItem::from).collect(), cursor)),
+        );
+        self.set_page_status(status, "Loaded more timeline posts");
+    }
 
+    fn set_page_status(&mut self, result: std::result::Result<(), ()>, success: &str) {
         match result {
-            Ok((mut items, cursor)) => {
-                current.append_posts(&mut items);
-                current.cursor = cursor;
-                self.set_status("Loaded more timeline posts");
-            }
-            Err(error) => {
-                current.error = Some(error);
-                self.set_status("Pagination failed");
-            }
+            Ok(()) => self.set_status(success),
+            Err(()) => self.set_error_status("Pagination failed"),
         }
     }
 
@@ -1590,15 +1686,11 @@ impl App {
                     format!("Unfollowed @{target_handle}")
                 });
             }
-            Ok(WriteResult::Posted { uri }) => {
-                self.set_status(format!("Posted {uri}"));
-                self.last_refresh = Instant::now() - self.refresh_interval;
-            }
             Ok(WriteResult::Deleted { uri }) => {
                 self.nav.retain_items(|item| item.uri() != uri);
                 self.set_status("Post deleted");
             }
-            Err(error) => self.set_status(format!("Write failed: {error}")),
+            Err(error) => self.set_error_status(format!("Write failed: {error}")),
         }
     }
 
@@ -1651,7 +1743,7 @@ impl App {
                     self.nav.push(view);
                     self.set_status("Thread loaded");
                 }
-                Err(error) => self.set_status(format!("Thread load failed: {error}")),
+                Err(error) => self.set_error_status(format!("Thread load failed: {error}")),
             },
             ThreadAction::OpenQuote { quote } => match result {
                 Ok(mut items) => {
@@ -1693,7 +1785,7 @@ impl App {
                     );
                     self.set_status("View refreshed");
                 }
-                Err(error) => self.set_status(format!("Refresh failed: {error}")),
+                Err(error) => self.set_error_status(format!("Refresh failed: {error}")),
             },
         }
     }
@@ -1720,7 +1812,7 @@ impl App {
                 }
                 self.set_status("Profile loaded");
             }
-            Err(error) => self.set_status(format!("Profile load failed: {error}")),
+            Err(error) => self.set_error_status(format!("Profile load failed: {error}")),
         }
     }
 
@@ -1744,7 +1836,7 @@ impl App {
                     self.last_notification_poll = Instant::now();
                     self.set_status("Notifications loaded");
                 } else {
-                    self.set_status(format!(
+                    self.set_error_status(format!(
                         "Notifications loaded; seen update failed{}",
                         data.seen_error
                             .as_deref()
@@ -1753,7 +1845,7 @@ impl App {
                     ));
                 }
             }
-            Err(error) => self.set_status(format!("Notifications failed: {error}")),
+            Err(error) => self.set_error_status(format!("Notifications failed: {error}")),
         }
     }
 
@@ -1781,7 +1873,7 @@ impl App {
                 self.last_notification_poll = Instant::now() - self.notification_interval;
                 self.set_status(format!("Switched to @{}", self.client.session().handle));
             }
-            Err(error) => self.set_status(format!("Account switch failed: {error}")),
+            Err(error) => self.set_error_status(format!("Account switch failed: {error}")),
         }
         Ok(())
     }
@@ -1953,12 +2045,20 @@ impl App {
         Ok(())
     }
 
+    fn open_composer(&mut self, kind: ComposerKind, status: &str) {
+        let buffer = match self.saved_draft.take() {
+            Some(draft) if draft.kind == kind => draft.buffer,
+            other => {
+                self.saved_draft = other;
+                String::new()
+            }
+        };
+        self.overlay = Some(Overlay::Composer(ComposerState { kind, buffer }));
+        self.set_status(status);
+    }
+
     fn open_post_composer(&mut self) {
-        self.overlay = Some(Overlay::Composer(ComposerState {
-            kind: ComposerKind::Post,
-            buffer: String::new(),
-        }));
-        self.set_status("Compose post");
+        self.open_composer(ComposerKind::Post, "Compose post");
     }
 
     fn open_reply_composer(&mut self) {
@@ -1971,15 +2071,14 @@ impl App {
             return;
         };
         let root = item.reply_root.clone().unwrap_or_else(|| parent.clone());
-        self.overlay = Some(Overlay::Composer(ComposerState {
-            kind: ComposerKind::Reply {
+        self.open_composer(
+            ComposerKind::Reply {
                 root,
                 parent,
                 parent_handle: item.author_handle,
             },
-            buffer: String::new(),
-        }));
-        self.set_status("Compose reply");
+            "Compose reply",
+        );
     }
 
     fn open_quote_composer(&mut self) {
@@ -1991,14 +2090,13 @@ impl App {
             self.set_status("Selected post is missing a CID; cannot quote");
             return;
         };
-        self.overlay = Some(Overlay::Composer(ComposerState {
-            kind: ComposerKind::Quote {
+        self.open_composer(
+            ComposerKind::Quote {
                 quote,
                 quote_handle: item.author_handle,
             },
-            buffer: String::new(),
-        }));
-        self.set_status("Compose quote");
+            "Compose quote",
+        );
     }
 
     fn submit_composer(&mut self, state: ComposerState) {
@@ -2013,7 +2111,7 @@ impl App {
             return;
         }
 
-        let (reply, quote) = match state.kind {
+        let (reply, quote) = match state.kind.clone() {
             ComposerKind::Post => (None, None),
             ComposerKind::Reply { root, parent, .. } => (Some((root, parent)), None),
             ComposerKind::Quote { quote, .. } => (None, Some(quote)),
@@ -2027,9 +2125,12 @@ impl App {
             let result = client
                 .create_post(&text, reply, quote)
                 .await
-                .map(|record| WriteResult::Posted { uri: record.uri })
+                .map(|record| record.uri)
                 .map_err(|error| format!("{error:#}"));
-            AppEvent::WriteCompleted { result }
+            AppEvent::PostCompleted {
+                draft: state,
+                result,
+            }
         });
     }
 
@@ -2203,6 +2304,7 @@ impl App {
             let current = self.nav.current();
             current.cursor.is_some()
                 && !current.loading
+                && current.page_request.is_none()
                 && current.selected.saturating_add(5) >= current.items.len()
         };
 
@@ -2216,12 +2318,11 @@ impl App {
 
         match self.nav.current().kind.clone() {
             ViewKind::Timeline => {
-                self.nav.current_mut().loading = true;
                 let source = self.feeds[self.active_feed].clone();
                 let id = self.next_request_id();
-                self.pending_pagination = Some(id);
+                self.nav.current_mut().page_request = Some(id);
                 let mut client = self.client.clone();
-                let prefs = self.home_feed_prefs;
+                let prefs = self.home_feed_prefs.clone();
                 self.spawn_event(async move {
                     let result = load_feed_page(&mut client, &source, &prefs, Some(&cursor))
                         .await
@@ -2234,9 +2335,8 @@ impl App {
                 });
             }
             ViewKind::Profile { actor } => {
-                self.nav.current_mut().loading = true;
                 let id = self.next_request_id();
-                self.pending_pagination = Some(id);
+                self.nav.current_mut().page_request = Some(id);
                 let mut client = self.client.clone();
                 self.spawn_event(async move {
                     let result = client
@@ -2252,22 +2352,21 @@ impl App {
                 });
             }
             ViewKind::Notifications => {
-                self.nav.current_mut().loading = true;
                 let id = self.next_request_id();
-                self.pending_pagination = Some(id);
+                self.nav.current_mut().page_request = Some(id);
                 let account_did = self.client.session().did.clone();
                 let mut client = self.client.clone();
                 self.spawn_event(async move {
                     // Deliberately no updateSeen here: reading history is
                     // not the same as acknowledging new notifications.
-                    let result = client
-                        .list_notifications(Some(&cursor), 50)
-                        .await
-                        .map(|root| {
-                            let (items, cursor, _) = notification_items(&root);
-                            (items, cursor)
-                        })
-                        .map_err(|error| format!("{error:#}"));
+                    let result = async {
+                        let root = client.list_notifications(Some(&cursor), 50).await?;
+                        let (items, cursor, _) = notification_items(&root);
+                        let items = enrich_notifications(&mut client, items).await;
+                        Ok::<_, anyhow::Error>((items, cursor))
+                    }
+                    .await
+                    .map_err(|error| format!("{error:#}"));
                     AppEvent::NotificationsPageLoaded {
                         request_id: id,
                         account_did,
@@ -2293,7 +2392,7 @@ impl App {
         let id = self.next_request_id();
         self.pending_refresh = Some(id);
         let mut client = self.client.clone();
-        let prefs = self.home_feed_prefs;
+        let prefs = self.home_feed_prefs.clone();
         self.spawn_event(async move {
             let result = load_feed_page(&mut client, &source, &prefs, None)
                 .await
@@ -2368,7 +2467,7 @@ impl App {
 
     pub fn has_pending_tasks(&self) -> bool {
         self.pending_feed.is_some()
-            || self.pending_pagination.is_some()
+            || self.nav.any_page_request()
             || self.pending_refresh.is_some()
             || self.pending_notification_count.is_some()
             || self.pending_notifications.is_some()
@@ -2389,7 +2488,7 @@ impl App {
             Some("Loading profile")
         } else if self.pending_notifications.is_some() {
             Some("Loading notifications")
-        } else if self.pending_pagination.is_some() {
+        } else if self.nav.any_page_request() {
             Some("Loading more")
         } else if self.pending_writes > 0 {
             Some("Writing")
@@ -2451,9 +2550,67 @@ impl App {
     }
 }
 
+/// Applies one page of rows to the view that requested it; errors stay on
+/// the view (rendered inline) and a later good page clears them.
+fn append_page(
+    view: &mut ViewState,
+    result: AppTaskResult<(Vec<ViewItem>, Option<String>)>,
+) -> std::result::Result<(), ()> {
+    match result {
+        Ok((rows, cursor)) => {
+            view.append_rows(rows);
+            view.cursor = cursor;
+            view.error = None;
+            Ok(())
+        }
+        Err(error) => {
+            view.error = Some(error);
+            Err(())
+        }
+    }
+}
+
+fn delete_last_word(buffer: &mut String) {
+    let trimmed = buffer.trim_end_matches([' ', '\t']).len();
+    buffer.truncate(trimmed);
+    let start = buffer
+        .rfind(|c: char| c.is_whitespace())
+        .map_or(0, |index| index + 1);
+    buffer.truncate(start);
+}
+
+/// Suspends the TUI, edits `text` in $VISUAL/$EDITOR (vi if unset) and
+/// returns the result. Errors leave the draft untouched.
+fn edit_externally(text: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!("at-tui-draft-{}.txt", std::process::id()));
+    // Trailing newline like git/mutt drafts; editors expect one.
+    std::fs::write(&path, format!("{text}\n"))?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(&path)
+        .status();
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(status) if status.success() => Ok(edited?.trim_end_matches('\n').to_owned()),
+        Ok(status) => Err(anyhow::anyhow!("{program} exited with {status}")),
+        Err(error) => Err(anyhow::anyhow!("could not run {program}: {error}")),
+    }
+}
+
 pub fn post_grapheme_count(text: &str) -> usize {
     use unicode_segmentation::UnicodeSegmentation;
     text.graphemes(true).count()
+}
+
+fn is_web_uri(uri: &str) -> bool {
+    let lower = uri.trim_start().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
 }
 
 fn post_ref_from_item(item: &FeedItem) -> Option<PostRef> {
@@ -2491,6 +2648,36 @@ fn new_items_before_current(
     new_items
 }
 
+/// Attaches the liked/reposted post's text (best effort) and folds repeated
+/// likes/reposts/follows into single rows.
+async fn enrich_notifications(
+    client: &mut BskyClient,
+    mut items: Vec<NotificationItem>,
+) -> Vec<NotificationItem> {
+    let uris = crate::model::notification_subject_uris(&items);
+    if !uris.is_empty()
+        && let Ok(posts) = client.get_posts(&uris).await
+    {
+        crate::model::attach_subject_texts(&mut items, &posts);
+    }
+    crate::model::group_notifications(items)
+}
+
+/// Best effort: saved feeds keep their rkey labels if the lookup fails.
+async fn resolve_feed_names(client: &mut BskyClient, feeds: &mut [FeedSource]) {
+    let uris = feeds
+        .iter()
+        .filter_map(FeedSource::uri)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if uris.is_empty() {
+        return;
+    }
+    if let Ok(root) = client.get_feed_generators(&uris).await {
+        apply_feed_display_names(feeds, &root);
+    }
+}
+
 async fn load_feed_page(
     client: &mut BskyClient,
     source: &FeedSource,
@@ -2522,7 +2709,12 @@ pub async fn run_tui(
     let _session = TerminalSession;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2532,9 +2724,12 @@ pub async fn run_tui(
         MediaCache::new(true, requested_protocol)?
     };
 
+    let handle = client.session().handle;
+    terminal.draw(|frame| ui::render_splash(frame, &handle))?;
     let mut app = App::bootstrap(client, media).await?;
     let mut dirty = true;
     let mut status_was_visible = app.visible_status().is_some();
+    let mut drawn_minute = ui::current_minute();
 
     loop {
         if app.drain_events()? > 0 {
@@ -2557,12 +2752,42 @@ pub async fn run_tui(
             // Keep progress indicators animating while work is in flight.
             dirty = true;
         }
+        if ui::current_minute() != drawn_minute {
+            // Relative timestamps ("5m") age even when nothing else moves.
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
+            drawn_minute = ui::current_minute();
             dirty = false;
         }
         if app.should_quit {
             break;
+        }
+        if let Some(mut draft) = app.editor_request.take() {
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            let edited = edit_externally(&draft.buffer);
+            enable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste
+            )?;
+            terminal.clear()?;
+            match edited {
+                Ok(text) => draft.buffer = text,
+                Err(error) => app.set_error_status(format!("Editor failed: {error:#}")),
+            }
+            app.overlay = Some(Overlay::Composer(draft));
+            dirty = true;
+            continue;
         }
         let poll_timeout = if app.video_playing() || app.has_pending_tasks() {
             Duration::from_millis(50)
@@ -2581,6 +2806,10 @@ pub async fn run_tui(
                         dirty = true;
                     }
                 }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                    dirty = true;
+                }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -2597,7 +2826,12 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
     }
 }
 
@@ -2637,39 +2871,6 @@ mod tests {
         assert_eq!(state.selected, 1);
         assert!(
             matches!(state.selected_media(), Some(PreviewMedia::Image(image)) if image.url == "two")
-        );
-    }
-
-    #[test]
-    fn menu_state_cycles_sections() {
-        let mut state = MenuState::default();
-
-        assert_eq!(state.section, MenuSection::Keys);
-        state.next();
-        assert_eq!(state.section, MenuSection::Accounts);
-        state.next();
-        assert_eq!(state.section, MenuSection::Feeds);
-        state.previous();
-        assert_eq!(state.section, MenuSection::Accounts);
-    }
-
-    #[test]
-    fn menu_tab_maps_to_section_account_and_feed_actions() {
-        assert_eq!(
-            menu_tab_action(MenuSection::Keys, false),
-            MenuTabAction::MoveSection(1)
-        );
-        assert_eq!(
-            menu_tab_action(MenuSection::Settings, true),
-            MenuTabAction::MoveSection(-1)
-        );
-        assert_eq!(
-            menu_tab_action(MenuSection::Accounts, false),
-            MenuTabAction::SwitchAccount(1)
-        );
-        assert_eq!(
-            menu_tab_action(MenuSection::Feeds, true),
-            MenuTabAction::SwitchFeed(-1)
         );
     }
 
@@ -2756,7 +2957,7 @@ mod tests {
     #[test]
     fn stale_pagination_event_is_ignored() {
         let mut app = app_with_items(vec![item("original", "hello")]);
-        app.pending_pagination = Some(2);
+        app.nav.current_mut().page_request = Some(2);
 
         app.apply_event(AppEvent::PageLoaded {
             request_id: 1,
@@ -2767,6 +2968,301 @@ mod tests {
 
         assert_eq!(app.nav.current().items.len(), 1);
         assert_eq!(app.nav.current().items[0].uri(), "original");
+        assert_eq!(app.nav.current().page_request, Some(2));
+    }
+
+    #[test]
+    fn timeline_page_lands_on_root_after_user_navigates_away() {
+        // Repro from a live session: G (page load starts), l (thread
+        // pushed), page lands, h. The root used to keep `loading = true`
+        // forever and never paginate again.
+        let mut app = app_with_items(vec![item("one", "one")]);
+        app.nav.current_mut().cursor = Some("page-2".into());
+        app.nav.current_mut().page_request = Some(7);
+        app.nav.push(ViewState::new(
+            "Thread @alice.test",
+            ViewKind::Thread {
+                root_uri: "one".into(),
+            },
+            vec![item("one", "one")],
+        ));
+
+        app.apply_event(AppEvent::PageLoaded {
+            request_id: 7,
+            source: FeedSource::home(),
+            result: Ok((vec![item("two", "two")], Some("page-3".into()))),
+        })
+        .unwrap();
+
+        assert!(!app.has_pending_tasks());
+        assert!(app.nav.pop());
+        let root = app.nav.current();
+        assert_eq!(root.items.len(), 2);
+        assert_eq!(root.cursor.as_deref(), Some("page-3"));
+        assert_eq!(root.page_request, None);
+        assert!(!root.loading);
+    }
+
+    fn render_to_text(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn view_error_stays_visible_when_list_fills_the_screen() {
+        let mut app = app_with_items((0..20).map(|i| item(&i.to_string(), "filler")).collect());
+        app.nav.current_mut().error = Some("Bluesky API returned 502:\n gateway".into());
+
+        let rows = render_to_text(&mut app, 60, 14);
+
+        // Last row is the statusline, the one above the bottom border; the
+        // error sits on the final content row.
+        assert!(
+            rows[11].contains("⚠ Bluesky API returned 502: gateway"),
+            "{rows:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_outside_text_fields_fires_no_actions() {
+        let mut item = item("post", "hello");
+        item.cid = Some("cid".into());
+        let mut app = app_with_items(vec![item]);
+
+        app.handle_paste("fbFdp stuff");
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.pending_writes, 0);
+        assert_eq!(app.status, "Paste ignored outside the composer and search");
+    }
+
+    #[test]
+    fn paste_lands_in_composer_with_normalized_newlines() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.open_post_composer();
+
+        app.handle_paste("one\r\ntwo\rthree");
+
+        let Some(Overlay::Composer(state)) = &app.overlay else {
+            panic!("composer closed");
+        };
+        assert_eq!(state.buffer, "one\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_from_search_and_overlays() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.input_mode = InputMode::Search {
+            buffer: String::new(),
+        };
+        app.handle_key(ctrl_c).await.unwrap();
+        assert!(app.should_quit);
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.overlay = Some(Overlay::Menu(MenuState::default()));
+        app.handle_key(ctrl_c).await.unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn only_web_links_are_handed_to_the_os() {
+        assert!(is_web_uri("https://example.com"));
+        assert!(is_web_uri("HTTP://example.com"));
+        assert!(!is_web_uri("file:///etc/passwd"));
+        assert!(!is_web_uri(
+            "x-apple.systempreferences:com.apple.preference"
+        ));
+        assert!(!is_web_uri("javascript:alert(1)"));
+
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.open_uri("file:///Applications/Calculator.app".into());
+        assert!(app.status.starts_with("Refusing to open non-web link"));
+    }
+
+    #[tokio::test]
+    async fn escaped_draft_returns_only_for_the_same_target() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.open_post_composer();
+        app.handle_paste("half-written thought");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+
+        app.open_post_composer();
+        let Some(Overlay::Composer(state)) = &app.overlay else {
+            panic!("composer closed");
+        };
+        assert_eq!(state.buffer, "half-written thought");
+    }
+
+    #[test]
+    fn successful_reply_reports_in_words() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.pending_writes = 1;
+        let parent = PostRef {
+            uri: "at://did:plc:bob/app.bsky.feed.post/1".into(),
+            cid: "cid".into(),
+        };
+        app.apply_event(AppEvent::PostCompleted {
+            draft: ComposerState {
+                kind: ComposerKind::Reply {
+                    root: parent.clone(),
+                    parent,
+                    parent_handle: "bob.test".into(),
+                },
+                buffer: "hi".into(),
+            },
+            result: Ok("at://did:plc:alice/app.bsky.feed.post/new".into()),
+        })
+        .unwrap();
+
+        assert_eq!(app.status, "Reply posted");
+        assert_eq!(app.pending_writes, 0);
+    }
+
+    #[test]
+    fn failed_post_keeps_its_draft() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.pending_writes = 1;
+        let draft = ComposerState {
+            kind: ComposerKind::Post,
+            buffer: "important words".into(),
+        };
+
+        app.apply_event(AppEvent::PostCompleted {
+            draft,
+            result: Err("Bluesky API returned 502".into()),
+        })
+        .unwrap();
+
+        assert_eq!(app.pending_writes, 0);
+        app.open_post_composer();
+        let Some(Overlay::Composer(state)) = &app.overlay else {
+            panic!("composer closed");
+        };
+        assert_eq!(state.buffer, "important words");
+    }
+
+    #[tokio::test]
+    async fn failed_feed_switch_restores_the_shown_feed() {
+        let mut app = app_with_items(vec![item("home", "home")]);
+        let news = FeedSource {
+            label: "News".into(),
+            kind: FeedSourceKind::Generator {
+                uri: "at://did:plc:x/app.bsky.feed.generator/news".into(),
+            },
+        };
+        app.feeds.push(news.clone());
+        app.nav.current_mut().cursor = Some("home-page-2".into());
+
+        app.switch_feed_delta(1).await.unwrap();
+        assert_eq!(app.active_feed, 1);
+        let request_id = app.pending_feed.unwrap();
+        app.apply_event(AppEvent::FeedLoaded {
+            request_id,
+            source: news,
+            result: Err("feed generator offline".into()),
+        })
+        .unwrap();
+
+        // Root still shows Following, so the active feed (used for labels
+        // and the next page's source) must say Following too.
+        assert_eq!(app.active_feed, 0);
+        assert_eq!(ui::current_location_label(&app), "Following");
+        assert_eq!(app.nav.current().items[0].uri(), "home");
+    }
+
+    #[test]
+    fn readline_word_delete_in_composer() {
+        let mut buffer = "hello brave  new world  ".to_owned();
+        delete_last_word(&mut buffer);
+        assert_eq!(buffer, "hello brave  new ");
+        delete_last_word(&mut buffer);
+        assert_eq!(buffer, "hello brave  ");
+    }
+
+    #[tokio::test]
+    async fn menu_lists_feeds_and_switches_only_on_enter() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.feeds.push(FeedSource {
+            label: "News".into(),
+            kind: FeedSourceKind::Generator {
+                uri: "at://did:plc:x/app.bsky.feed.generator/news".into(),
+            },
+        });
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // Esc on the timeline opens the menu on the current feed.
+        app.handle_key(press(KeyCode::Esc)).await.unwrap();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Menu(MenuState { selected: 0 }))
+        ));
+
+        // Moving never switches; stray keys are ignored.
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char(']'),
+            KeyCode::BackTab,
+            KeyCode::Tab,
+        ] {
+            app.handle_key(press(code)).await.unwrap();
+        }
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Menu(MenuState { selected: 1 }))
+        ));
+        assert_eq!(app.active_feed, 0);
+        assert!(app.pending_feed.is_none());
+
+        // Enter switches to the highlighted feed and closes the menu.
+        app.handle_key(press(KeyCode::Enter)).await.unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.active_feed, 1);
+        assert!(app.pending_feed.is_some());
+    }
+
+    #[tokio::test]
+    async fn enter_on_current_feed_just_closes_the_menu() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.overlay.is_none());
+        assert!(app.pending_feed.is_none());
+    }
+
+    #[test]
+    fn failed_page_shows_error_until_next_good_page() {
+        let mut app = app_with_items(vec![item("one", "one")]);
+        app.nav.current_mut().page_request = Some(3);
+        app.apply_event(AppEvent::PageLoaded {
+            request_id: 3,
+            source: FeedSource::home(),
+            result: Err("timed out".into()),
+        })
+        .unwrap();
+        assert_eq!(app.nav.current().error.as_deref(), Some("timed out"));
+
+        app.nav.current_mut().page_request = Some(4);
+        app.apply_event(AppEvent::PageLoaded {
+            request_id: 4,
+            source: FeedSource::home(),
+            result: Ok((vec![item("two", "two")], None)),
+        })
+        .unwrap();
+        assert_eq!(app.nav.current().error, None);
     }
 
     #[test]
@@ -2780,8 +3276,8 @@ mod tests {
             vec![item("bob-1", "one")],
         );
         profile_view.cursor = Some("page-2".into());
+        profile_view.page_request = Some(9);
         app.nav.push(profile_view);
-        app.pending_pagination = Some(9);
 
         app.apply_event(AppEvent::ProfilePageLoaded {
             request_id: 9,
@@ -2805,8 +3301,8 @@ mod tests {
             )))],
         );
         view.cursor = Some("page-2".into());
+        view.page_request = Some(9);
         app.nav.push(view);
-        app.pending_pagination = Some(9);
 
         app.apply_event(AppEvent::NotificationsPageLoaded {
             request_id: 9,
@@ -3158,16 +3654,17 @@ mod tests {
         assert_eq!(normal_action_for_key(key(KeyCode::Char('U'))), None);
         assert_eq!(normal_action_for_key(key(KeyCode::Char('c'))), None);
 
-        assert!(
-            normal_key_help_lines()
-                .iter()
-                .any(|line| line.contains("P profile") && line.contains("N notifications"))
-        );
-        assert!(
-            normal_key_help_lines()
-                .iter()
-                .any(|line| line.contains("F follow") && line.contains("f like"))
-        );
+        let documented = |key: &str, label: &str| {
+            key_help_groups().iter().any(|(_, rows)| {
+                rows.iter()
+                    .any(|(keys, text)| keys.split(' ').any(|k| k == key) && text.contains(label))
+            })
+        };
+        assert!(documented("P", "profile"));
+        assert!(documented("N", "notifications"));
+        assert!(documented("F", "follow"));
+        assert!(documented("f", "like"));
+        assert!(documented("Tab", "feeds"));
     }
 
     #[tokio::test]
@@ -3240,9 +3737,7 @@ mod tests {
 
         assert!(matches!(
             app.overlay,
-            Some(Overlay::Menu(MenuState {
-                section: MenuSection::Settings
-            }))
+            Some(Overlay::Menu(MenuState { selected: 0 }))
         ));
     }
 
@@ -3262,8 +3757,7 @@ mod tests {
 
         assert_eq!(ui::current_location_label(&app), "Thread @bob.test");
         let line = line_text(&ui::status_left_line(&app, 200));
-        assert!(line.contains("Thread @bob.test"));
-        assert!(!line.contains("Following"));
+        assert!(line.contains("Following › Thread @bob.test"), "{line}");
     }
 
     #[test]
@@ -3278,8 +3772,8 @@ mod tests {
         assert!(!narrow.contains("Loaded a surprisingly long status message"));
 
         let right = ui::status_right_line(&app);
-        assert_eq!(line_text(&right), " 1/1 ");
-        assert_eq!(ui::line_width(&right), 5);
+        assert_eq!(line_text(&right), "1/1  ? menu ");
+        assert_eq!(ui::line_width(&right), 12);
     }
 
     fn line_text(line: &ratatui::text::Line<'_>) -> String {
@@ -3582,18 +4076,21 @@ mod tests {
             active_feed: 0,
             home_feed_prefs: HomeFeedPrefs::default(),
             status: String::new(),
+            status_is_error: false,
             status_expires_at: None,
             input_mode: InputMode::Normal,
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
+            saved_draft: None,
+            editor_request: None,
             unread_notifications: 0,
             consecutive_poll_failures: 0,
             events_tx,
             events_rx,
             next_request_id: 1,
             pending_feed: None,
-            pending_pagination: None,
+            feed_load_fallback: None,
             pending_refresh: None,
             pending_notification_count: None,
             pending_notifications: None,
@@ -3656,6 +4153,8 @@ mod tests {
             indexed_at: "2026-05-22T00:00:00Z".into(),
             is_read: false,
             target,
+            others: Vec::new(),
+            subject_text: None,
         }
     }
 }

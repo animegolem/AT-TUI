@@ -21,6 +21,9 @@ pub struct ViewState {
     pub scroll: usize,
     pub cursor: Option<String>,
     pub loading: bool,
+    /// In-flight pagination request for this view. Owned per view so a page
+    /// that lands after the user navigated elsewhere still finds its view.
+    pub page_request: Option<u64>,
     pub error: Option<String>,
     pub search_query: Option<String>,
     pub layout_cache: LayoutCache,
@@ -29,6 +32,9 @@ pub struct ViewState {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutCache {
     pub width: Option<usize>,
+    /// Wall-clock minute the lines were built in; rows embed relative
+    /// times ("5m"), so a new minute invalidates them.
+    pub minute: Option<i64>,
     pub items: Vec<CachedItemLines>,
     pub builds: usize,
 }
@@ -36,6 +42,7 @@ pub struct LayoutCache {
 impl LayoutCache {
     pub fn clear(&mut self) {
         self.width = None;
+        self.minute = None;
         self.items.clear();
     }
 }
@@ -61,6 +68,7 @@ impl ViewState {
             scroll: 0,
             cursor: None,
             loading: false,
+            page_request: None,
             error: None,
             search_query: None,
             layout_cache: LayoutCache::default(),
@@ -247,6 +255,16 @@ impl NavigationStack {
         self.views
             .first_mut()
             .expect("navigation stack always has a root view")
+    }
+
+    pub fn view_with_page_request_mut(&mut self, request_id: u64) -> Option<&mut ViewState> {
+        self.views
+            .iter_mut()
+            .find(|view| view.page_request == Some(request_id))
+    }
+
+    pub fn any_page_request(&self) -> bool {
+        self.views.iter().any(|view| view.page_request.is_some())
     }
 
     pub fn pop(&mut self) -> bool {

@@ -1,4 +1,8 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
@@ -22,6 +26,30 @@ pub struct BskyClient {
     refresh_gate: Arc<Mutex<()>>,
 }
 
+/// Builds the shared HTTP client. Without timeouts a request stranded by
+/// laptop sleep or a network change never resolves, and its pending slot
+/// (feed refresh, notification poll) blocks every later attempt forever.
+pub fn http_client() -> Client {
+    Client::builder()
+        .user_agent(concat!("at-tui/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
+/// The saved refresh token is no longer accepted; only a new login helps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExpired;
+
+impl fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Bluesky session expired; run `at-tui login` to sign in again")
+    }
+}
+
+impl std::error::Error for SessionExpired {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedRecord {
     pub uri: String,
@@ -31,7 +59,7 @@ pub struct CreatedRecord {
 impl BskyClient {
     pub fn new(session: Session, store: SessionStore) -> Self {
         Self {
-            http: Client::new(),
+            http: http_client(),
             store,
             session: Arc::new(RwLock::new(session)),
             refresh_gate: Arc::new(Mutex::new(())),
@@ -54,7 +82,7 @@ impl BskyClient {
         identifier: &str,
         app_password: &str,
     ) -> Result<Session> {
-        let http = Client::new();
+        let http = http_client();
         let url = xrpc_url(service, "com.atproto.server.createSession");
         let response = http
             .post(url)
@@ -135,6 +163,30 @@ impl BskyClient {
         self.get("app.bsky.actor.getPreferences", &query).await
     }
 
+    pub async fn get_feed_generators(&mut self, feeds: &[String]) -> Result<Value> {
+        let query = feeds
+            .iter()
+            .map(|uri| ("feeds".to_owned(), uri.clone()))
+            .collect::<Vec<_>>();
+        self.get("app.bsky.feed.getFeedGenerators", &query).await
+    }
+
+    /// `app.bsky.feed.getPosts`; the endpoint takes at most 25 URIs.
+    pub async fn get_posts(&mut self, uris: &[String]) -> Result<Value> {
+        let mut posts = Vec::new();
+        for chunk in uris.chunks(25) {
+            let query = chunk
+                .iter()
+                .map(|uri| ("uris".to_owned(), uri.clone()))
+                .collect::<Vec<_>>();
+            let root = self.get("app.bsky.feed.getPosts", &query).await?;
+            if let Some(batch) = root.get("posts").and_then(Value::as_array) {
+                posts.extend(batch.iter().cloned());
+            }
+        }
+        Ok(json!({ "posts": posts }))
+    }
+
     pub async fn get_post_thread(&mut self, uri: &str) -> Result<Value> {
         let query = post_thread_query(uri);
         self.get("app.bsky.feed.getPostThread", &query).await
@@ -172,19 +224,62 @@ impl BskyClient {
             return Ok(());
         }
 
-        let (service, refresh_jwt) = {
-            let session = self.session.read().expect("session lock poisoned");
-            (session.service.clone(), session.refresh_jwt.clone())
-        };
+        let refresh_jwt = self
+            .session
+            .read()
+            .expect("session lock poisoned")
+            .refresh_jwt
+            .clone();
+        match self.request_refresh(&refresh_jwt).await {
+            Err(error) if error.is::<SessionExpired>() => {
+                // A second at-tui instance may have rotated the token and
+                // saved the new one; adopt it rather than giving up.
+                match self.newer_saved_refresh_jwt(&refresh_jwt) {
+                    Some(saved) => self.request_refresh(&saved).await,
+                    None => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn newer_saved_refresh_jwt(&self, in_memory: &str) -> Option<String> {
+        let did = self
+            .session
+            .read()
+            .expect("session lock poisoned")
+            .did
+            .clone();
+        self.store
+            .load_config()
+            .ok()?
+            .accounts
+            .into_iter()
+            .find(|account| account.session.did == did)
+            .map(|account| account.session.refresh_jwt)
+            .filter(|saved| saved != in_memory)
+    }
+
+    async fn request_refresh(&mut self, refresh_jwt: &str) -> Result<()> {
+        let service = self
+            .session
+            .read()
+            .expect("session lock poisoned")
+            .service
+            .clone();
         let response = self
             .http
             .post(xrpc_url(&service, "com.atproto.server.refreshSession"))
-            .bearer_auth(&refresh_jwt)
+            .bearer_auth(refresh_jwt)
             .send()
             .await
             .context("could not refresh Bluesky session")?;
 
-        let value = response_json(response).await?;
+        let (status, text) = read_response(response).await?;
+        if refresh_token_rejected(status, &text) {
+            return Err(SessionExpired.into());
+        }
+        let value = parse_response(status, text)?;
         let access_jwt = required_string(&value, "accessJwt")?;
         let refresh_jwt = required_string(&value, "refreshJwt")?;
         let handle = value.get("handle").and_then(Value::as_str);
@@ -272,22 +367,24 @@ impl BskyClient {
 
     async fn get(&mut self, endpoint: &str, query: &[(String, String)]) -> Result<Value> {
         let response = self.send_get(endpoint, query).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
+        let (status, text) = read_response(response).await?;
+        if access_token_expired(status, &text) {
             self.refresh_session().await?;
             let retry = self.send_get(endpoint, query).await?;
             return response_json(retry).await;
         }
-        response_json(response).await
+        parse_response(status, text)
     }
 
     async fn post_json(&mut self, endpoint: &str, body: Value) -> Result<Value> {
         let response = self.send_post(endpoint, &body).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
+        let (status, text) = read_response(response).await?;
+        if access_token_expired(status, &text) {
             self.refresh_session().await?;
             let retry = self.send_post(endpoint, &body).await?;
             return response_json(retry).await;
         }
-        response_json(response).await
+        parse_response(status, text)
     }
 
     async fn post_empty(&mut self, endpoint: &str, body: Value) -> Result<()> {
@@ -566,15 +663,48 @@ fn is_plausible_handle(handle: &str) -> bool {
 }
 
 async fn response_json(response: Response) -> Result<Value> {
+    let (status, text) = read_response(response).await?;
+    parse_response(status, text)
+}
+
+async fn read_response(response: Response) -> Result<(StatusCode, String)> {
     let status = response.status();
     let text = response
         .text()
         .await
         .context("could not read response body")?;
+    Ok((status, text))
+}
+
+fn parse_response(status: StatusCode, text: String) -> Result<Value> {
     if !status.is_success() {
         return Err(anyhow!("Bluesky API returned {status}: {text}"));
     }
     serde_json::from_str(&text).context("could not parse Bluesky API response")
+}
+
+fn xrpc_error_name(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+/// PDSes answer an expired access token with `400 ExpiredToken`, not 401;
+/// keying refresh on 401 alone leaves the app offline two hours in.
+fn access_token_expired(status: StatusCode, text: &str) -> bool {
+    status == StatusCode::UNAUTHORIZED
+        || (status == StatusCode::BAD_REQUEST
+            && xrpc_error_name(text).as_deref() == Some("ExpiredToken"))
+}
+
+fn refresh_token_rejected(status: StatusCode, text: &str) -> bool {
+    matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED)
+        && matches!(
+            xrpc_error_name(text).as_deref(),
+            Some("ExpiredToken" | "InvalidToken" | "AuthenticationRequired")
+        )
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String> {
@@ -823,6 +953,62 @@ mod tests {
 
         waiting.await.unwrap().unwrap();
         assert_eq!(client.session().access_jwt, "new-access");
+    }
+
+    #[test]
+    fn expired_access_token_is_a_400_not_a_401() {
+        // Body captured live from bsky.social for a two-hour-old token.
+        let body = r#"{"error":"ExpiredToken","message":"Token has expired"}"#;
+        assert!(access_token_expired(StatusCode::BAD_REQUEST, body));
+        assert!(access_token_expired(StatusCode::UNAUTHORIZED, ""));
+        assert!(!access_token_expired(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"InvalidRequest","message":"bad cursor"}"#
+        ));
+        assert!(!access_token_expired(StatusCode::BAD_REQUEST, "not json"));
+        assert!(!access_token_expired(StatusCode::OK, body));
+    }
+
+    #[test]
+    fn rejected_refresh_token_means_session_expired() {
+        assert!(refresh_token_rejected(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"ExpiredToken","message":"Token has expired"}"#
+        ));
+        assert!(refresh_token_rejected(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"InvalidToken","message":"Token has been revoked"}"#
+        ));
+        assert!(!refresh_token_rejected(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"InternalServerError"}"#
+        ));
+    }
+
+    #[test]
+    fn adopts_refresh_token_rotated_by_another_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::config::SessionStore::from_path(dir.path().join("accounts.json"));
+        let session = Session {
+            service: "https://bsky.social".into(),
+            handle: "alice.test".into(),
+            did: "did:plc:alice".into(),
+            access_jwt: "access".into(),
+            refresh_jwt: "stale-refresh".into(),
+        };
+        let client = BskyClient::new(session.clone(), store.clone());
+        assert_eq!(client.newer_saved_refresh_jwt("stale-refresh"), None);
+
+        store
+            .save(&Session {
+                refresh_jwt: "rotated-refresh".into(),
+                ..session
+            })
+            .unwrap();
+        assert_eq!(
+            client.newer_saved_refresh_jwt("stale-refresh").as_deref(),
+            Some("rotated-refresh")
+        );
     }
 
     #[test]

@@ -60,6 +60,10 @@ pub struct NotificationItem {
     pub indexed_at: String,
     pub is_read: bool,
     pub target: NotificationTarget,
+    /// Other actors folded into this row by `group_notifications`.
+    pub others: Vec<String>,
+    /// Text of the post this notification is about (likes, reposts).
+    pub subject_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +196,14 @@ pub struct ReplyContext {
     pub parent_text: String,
     pub grandparent_author_handle: Option<String>,
     pub parent_status: Option<ReplyParentStatus>,
+    /// Parent, grandparent and root authors, for the followed-only filter.
+    pub participants: Vec<ReplyParticipant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyParticipant {
+    pub did: String,
+    pub following: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,16 +323,23 @@ pub enum FeedSourceKind {
     Generator { uri: String },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `Default` means "filter nothing" (used for non-home feeds); the home
+/// feed's server-side defaults come from `from_preferences_response`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HomeFeedPrefs {
     pub hide_replies: bool,
     pub hide_replies_by_unfollowed: bool,
     pub hide_replies_by_like_count: Option<u64>,
     pub hide_reposts: bool,
     pub hide_quote_posts: bool,
+    /// The signed-in account; replies to yourself count as followed.
+    pub viewer_did: Option<String>,
 }
 
 impl HomeFeedPrefs {
+    /// Mirrors `FEED_VIEW_PREF_DEFAULTS` in `@atproto/api`: with no saved
+    /// preference, the home feed shows replies only between people you
+    /// follow (`hideRepliesByUnfollowed: true`).
     pub fn from_preferences_response(root: &Value) -> Self {
         root.get("preferences")
             .and_then(Value::as_array)
@@ -332,7 +351,12 @@ impl HomeFeedPrefs {
                     && string_field(pref, "feed").is_some_and(|value| value == "home")
             })
             .map(Self::from_feed_view_pref)
-            .unwrap_or_default()
+            .unwrap_or_else(|| Self::from_feed_view_pref(&Value::Null))
+    }
+
+    pub fn with_viewer(mut self, did: impl Into<String>) -> Self {
+        self.viewer_did = Some(did.into());
+        self
     }
 
     pub fn status_label(&self) -> String {
@@ -351,11 +375,11 @@ impl HomeFeedPrefs {
     fn from_feed_view_pref(pref: &Value) -> Self {
         Self {
             hide_replies: bool_field(pref, "hideReplies").unwrap_or(false),
-            hide_replies_by_unfollowed: bool_field(pref, "hideRepliesByUnfollowed")
-                .unwrap_or(false),
+            hide_replies_by_unfollowed: bool_field(pref, "hideRepliesByUnfollowed").unwrap_or(true),
             hide_replies_by_like_count: number_field_opt(pref, "hideRepliesByLikeCount"),
             hide_reposts: bool_field(pref, "hideReposts").unwrap_or(false),
             hide_quote_posts: bool_field(pref, "hideQuotePosts").unwrap_or(false),
+            viewer_did: None,
         }
     }
 
@@ -373,7 +397,13 @@ impl HomeFeedPrefs {
                 return false;
             }
 
-            if self.hide_replies_by_unfollowed && item.author_following == Some(false) {
+            // The reply's own author is always followed on the home feed;
+            // the question is who they are talking to. A repost is an
+            // explicit share and stays.
+            if self.hide_replies_by_unfollowed
+                && !matches!(item.reason, Some(FeedReason::Repost { .. }))
+                && !self.reply_involves_followed(item)
+            {
                 return false;
             }
 
@@ -385,6 +415,51 @@ impl HomeFeedPrefs {
         }
 
         true
+    }
+}
+
+impl HomeFeedPrefs {
+    fn reply_involves_followed(&self, item: &FeedItem) -> bool {
+        let Some(reply) = &item.reply else {
+            return true;
+        };
+        let mut others = reply
+            .participants
+            .iter()
+            .filter(|participant| item.author_did.as_deref() != Some(participant.did.as_str()))
+            .peekable();
+        // Self-threads, or no usable context: nothing to filter on.
+        if others.peek().is_none() {
+            return true;
+        }
+        others.any(|participant| {
+            participant.following || self.viewer_did.as_deref() == Some(participant.did.as_str())
+        })
+    }
+}
+
+/// Swaps saved-feed rkeys ("whats-hot") for their display names
+/// ("Discover") from `app.bsky.feed.getFeedGenerators`.
+pub fn apply_feed_display_names(sources: &mut [FeedSource], generators: &Value) {
+    let names = generators
+        .get("feeds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|feed| {
+            Some((
+                string_field(feed, "uri")?,
+                string_field(feed, "displayName")?,
+            ))
+        })
+        .filter(|(_, name)| !name.trim().is_empty())
+        .collect::<std::collections::HashMap<_, _>>();
+    for source in sources {
+        if let FeedSourceKind::Generator { uri } = &source.kind
+            && let Some(name) = names.get(uri)
+        {
+            source.label = name.trim().to_owned();
+        }
     }
 }
 
@@ -459,6 +534,76 @@ pub fn notification_items(root: &Value) -> (Vec<NotificationItem>, Option<String
     let cursor = string_field(root, "cursor");
     let seen_at = string_field(root, "seenAt");
     (items, cursor, seen_at)
+}
+
+/// Folds likes/reposts of the same post (and follows) into one row, the way
+/// the official client does: "Alice, Bob and 10 others liked your post".
+/// Rows keep the position of their most recent member.
+pub fn group_notifications(items: Vec<NotificationItem>) -> Vec<NotificationItem> {
+    let mut grouped: Vec<NotificationItem> = Vec::new();
+    for item in items {
+        let groupable = matches!(
+            item.reason,
+            NotificationReason::Like
+                | NotificationReason::Repost
+                | NotificationReason::LikeViaRepost
+                | NotificationReason::RepostViaRepost
+                | NotificationReason::Follow
+        );
+        let existing = groupable
+            .then(|| {
+                grouped.iter_mut().find(|row| {
+                    row.reason == item.reason && row.reason_subject == item.reason_subject
+                })
+            })
+            .flatten();
+        match existing {
+            Some(row) => {
+                let name = if item.author_name.trim().is_empty() {
+                    format!("@{}", item.author_handle)
+                } else {
+                    item.author_name.clone()
+                };
+                row.others.push(name);
+                row.is_read &= item.is_read;
+            }
+            None => grouped.push(item),
+        }
+    }
+    grouped
+}
+
+/// Fills `subject_text` from an `app.bsky.feed.getPosts` response.
+pub fn attach_subject_texts(items: &mut [NotificationItem], posts: &Value) {
+    let texts = posts
+        .get("posts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|post| Some((string_field(post, "uri")?, post_text(post))))
+        .collect::<std::collections::HashMap<_, _>>();
+    for item in items {
+        if let Some(subject) = &item.reason_subject
+            && let Some(text) = texts.get(subject)
+            && !text.trim().is_empty()
+        {
+            item.subject_text = Some(text.clone());
+        }
+    }
+}
+
+pub fn notification_subject_uris(items: &[NotificationItem]) -> Vec<String> {
+    let mut uris = Vec::new();
+    for item in items {
+        if item.text.trim().is_empty()
+            && let Some(subject) = &item.reason_subject
+            && subject.contains("/app.bsky.feed.post/")
+            && !uris.contains(subject)
+        {
+            uris.push(subject.clone());
+        }
+    }
+    uris
 }
 
 fn saved_feed_uris(root: &Value) -> Vec<String> {
@@ -653,6 +798,8 @@ fn notification_item(value: &Value) -> NotificationItem {
         indexed_at: string_field(value, "indexedAt").unwrap_or_default(),
         is_read: bool_field(value, "isRead").unwrap_or(false),
         target,
+        others: Vec::new(),
+        subject_text: None,
     }
 }
 
@@ -727,6 +874,24 @@ fn parse_reply_context(reply: Option<&Value>) -> Option<ReplyContext> {
     let grandparent_author_handle = reply
         .get("grandparentAuthor")
         .and_then(|author| string_field(author, "handle"));
+    let mut participants: Vec<ReplyParticipant> = Vec::new();
+    for author in [
+        parent.get("author"),
+        reply.get("grandparentAuthor"),
+        root.get("author"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(did) = string_field(author, "did")
+            && !participants.iter().any(|known| known.did == did)
+        {
+            participants.push(ReplyParticipant {
+                did,
+                following: viewer_following_uri(author).is_some(),
+            });
+        }
+    }
 
     Some(ReplyContext {
         root_uri,
@@ -736,6 +901,7 @@ fn parse_reply_context(reply: Option<&Value>) -> Option<ReplyContext> {
         parent_text: parent_summary.text,
         grandparent_author_handle,
         parent_status: parent_summary.status,
+        participants,
     })
 }
 
@@ -790,18 +956,18 @@ fn post_union_uri(value: &Value) -> Option<String> {
     string_field(value, "uri")
 }
 
+/// Ancestors render flat at depth 0 (one connected column down to the
+/// opened post) instead of a staircase that runs off a narrow terminal.
 fn flatten_thread_parents(node: &Value, items: &mut Vec<FeedItem>) -> usize {
     let Some(parent) = node.get("parent") else {
         return 0;
     };
 
-    let depth = flatten_thread_parents(parent, items);
+    flatten_thread_parents(parent, items);
     if let Some(post) = thread_post(parent) {
-        items.push(feed_item_from_post(post, depth));
-        depth + 1
-    } else {
-        depth
+        items.push(feed_item_from_post(post, 0));
     }
+    0
 }
 
 fn flatten_thread(node: &Value, depth: usize, items: &mut Vec<FeedItem>) {
@@ -1676,57 +1842,124 @@ mod tests {
         assert_eq!(items[0].uri, "normal");
     }
 
+    fn reply_entry(uri: &str, author: Value, parent_author: Value, likes: u64) -> Value {
+        json!({
+            "post": {"uri": uri, "author": author, "record": {"text": "reply"}, "likeCount": likes},
+            "reply": {
+                "root": {"uri": "root", "author": parent_author.clone(), "record": {"text": "root"}},
+                "parent": {"uri": "parent", "author": parent_author, "record": {"text": "parent"}}
+            }
+        })
+    }
+
     #[test]
-    fn filters_replies_by_like_count_and_follow_state() {
-        let root = json!({
-            "feed": [
-                {
-                    "post": {
-                        "uri": "unfollowed",
-                        "author": {"handle": "bob.test", "viewer": {"following": null}},
-                        "record": {"text": "reply"},
-                        "likeCount": 10
-                    },
-                    "reply": {
-                        "root": {"uri": "root", "author": {"handle": "alice.test"}, "record": {"text": "root"}},
-                        "parent": {"uri": "parent", "author": {"handle": "alice.test"}, "record": {"text": "parent"}}
-                    }
-                },
-                {
-                    "post": {
-                        "uri": "low-like",
-                        "author": {"handle": "carol.test", "viewer": {"following": "at://follow"}},
-                        "record": {"text": "reply"},
-                        "likeCount": 1
-                    },
-                    "reply": {
-                        "root": {"uri": "root", "author": {"handle": "alice.test"}, "record": {"text": "root"}},
-                        "parent": {"uri": "parent", "author": {"handle": "alice.test"}, "record": {"text": "parent"}}
-                    }
-                },
-                {
-                    "post": {
-                        "uri": "kept",
-                        "author": {"handle": "dana.test", "viewer": {"following": "at://follow"}},
-                        "record": {"text": "reply"},
-                        "likeCount": 5
-                    },
-                    "reply": {
-                        "root": {"uri": "root", "author": {"handle": "alice.test"}, "record": {"text": "root"}},
-                        "parent": {"uri": "parent", "author": {"handle": "alice.test"}, "record": {"text": "parent"}}
-                    }
+    fn filters_replies_to_unfollowed_people_and_by_like_count() {
+        let followed_author = |did: &str| json!({"did": did, "handle": format!("{did}.test"), "viewer": {"following": "at://follow"}});
+        let stranger = json!({"did": "did:plc:stranger", "handle": "stranger.test", "viewer": {}});
+        let friend = followed_author("did:plc:friend");
+        let me = json!({"did": "did:plc:me", "handle": "me.test", "viewer": {}});
+        let root = json!({"feed": [
+            reply_entry("to-stranger", followed_author("did:plc:bob"), stranger.clone(), 10),
+            reply_entry("to-friend", followed_author("did:plc:carol"), friend.clone(), 10),
+            reply_entry("to-me", followed_author("did:plc:dana"), me, 10),
+            reply_entry("self-thread", followed_author("did:plc:erin"), followed_author("did:plc:erin"), 10),
+            reply_entry("low-like", followed_author("did:plc:fay"), friend, 1),
+            {
+                "post": {"uri": "reposted-to-stranger", "author": stranger.clone(), "record": {"text": "reply"}, "likeCount": 10},
+                "reason": {"$type": "app.bsky.feed.defs#reasonRepost", "by": {"handle": "bob.test"}},
+                "reply": {
+                    "root": {"uri": "root", "author": stranger.clone(), "record": {"text": "root"}},
+                    "parent": {"uri": "parent", "author": stranger, "record": {"text": "parent"}}
                 }
-            ]
-        });
+            }
+        ]});
         let prefs = HomeFeedPrefs {
             hide_replies_by_unfollowed: true,
             hide_replies_by_like_count: Some(3),
             ..HomeFeedPrefs::default()
-        };
+        }
+        .with_viewer("did:plc:me");
 
         let (items, _) = timeline_items(&root, &prefs);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].uri, "kept");
+        let uris = items
+            .iter()
+            .map(|item| item.uri.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uris,
+            vec!["to-friend", "to-me", "self-thread", "reposted-to-stranger"]
+        );
+    }
+
+    #[test]
+    fn absent_home_pref_uses_official_followed_only_default() {
+        let prefs = HomeFeedPrefs::from_preferences_response(&json!({"preferences": []}));
+        assert!(prefs.hide_replies_by_unfollowed);
+        assert!(!prefs.hide_replies);
+        assert!(!HomeFeedPrefs::default().hide_replies_by_unfollowed);
+    }
+
+    #[test]
+    fn groups_likes_on_the_same_post_and_attaches_subject_text() {
+        let root = json!({"notifications": [
+            {"uri": "l1", "cid": "c", "author": {"handle": "a.test", "displayName": "Ann"}, "reason": "like", "reasonSubject": "at://me/app.bsky.feed.post/1", "isRead": false, "indexedAt": "2026-05-22T00:03:00Z"},
+            {"uri": "f1", "cid": "c", "author": {"did": "did:plc:f", "handle": "f.test"}, "reason": "follow", "isRead": true, "indexedAt": "2026-05-22T00:02:30Z"},
+            {"uri": "l2", "cid": "c", "author": {"handle": "b.test", "displayName": "Ben"}, "reason": "like", "reasonSubject": "at://me/app.bsky.feed.post/1", "isRead": true, "indexedAt": "2026-05-22T00:02:00Z"},
+            {"uri": "r1", "cid": "c", "author": {"handle": "c.test"}, "reason": "reply", "reasonSubject": "at://me/app.bsky.feed.post/1", "record": {"text": "nice"}, "isRead": true, "indexedAt": "2026-05-22T00:01:00Z"},
+            {"uri": "l3", "cid": "c", "author": {"handle": "d.test"}, "reason": "like", "reasonSubject": "at://me/app.bsky.feed.post/2", "isRead": true, "indexedAt": "2026-05-22T00:00:00Z"}
+        ]});
+        let (mut items, _, _) = notification_items(&root);
+        assert_eq!(
+            notification_subject_uris(&items),
+            vec![
+                "at://me/app.bsky.feed.post/1",
+                "at://me/app.bsky.feed.post/2"
+            ]
+        );
+        attach_subject_texts(
+            &mut items,
+            &json!({"posts": [{"uri": "at://me/app.bsky.feed.post/1", "record": {"text": "my post"}}]}),
+        );
+
+        let rows = group_notifications(items);
+
+        let summary = rows
+            .iter()
+            .map(|row| (row.uri.as_str(), row.others.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(summary, vec![("l1", 1), ("f1", 0), ("r1", 0), ("l3", 0)]);
+        assert_eq!(rows[0].others, vec!["Ben"]);
+        assert!(!rows[0].is_read, "a group is unread if any member is");
+        assert_eq!(rows[0].subject_text.as_deref(), Some("my post"));
+    }
+
+    #[test]
+    fn saved_feeds_take_generator_display_names() {
+        let mut sources = vec![
+            FeedSource::home(),
+            FeedSource {
+                label: "whats-hot".into(),
+                kind: FeedSourceKind::Generator {
+                    uri: "at://did:plc:z72/app.bsky.feed.generator/whats-hot".into(),
+                },
+            },
+            FeedSource {
+                label: "aaao6g552b33o".into(),
+                kind: FeedSourceKind::Generator {
+                    uri: "at://did:plc:x/app.bsky.feed.generator/aaao6g552b33o".into(),
+                },
+            },
+        ];
+        let generators = json!({"feeds": [
+            {"uri": "at://did:plc:z72/app.bsky.feed.generator/whats-hot", "displayName": "Discover"},
+            {"uri": "at://did:plc:x/app.bsky.feed.generator/aaao6g552b33o", "displayName": "  "}
+        ]});
+
+        apply_feed_display_names(&mut sources, &generators);
+
+        assert_eq!(sources[0].label, "Following");
+        assert_eq!(sources[1].label, "Discover");
+        assert_eq!(sources[2].label, "aaao6g552b33o");
     }
 
     #[test]
@@ -1947,7 +2180,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             uris,
-            vec![("root", 0), ("parent", 1), ("selected", 2), ("reply", 3)]
+            vec![("root", 0), ("parent", 0), ("selected", 0), ("reply", 1)]
         );
     }
 

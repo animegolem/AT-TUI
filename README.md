@@ -2,6 +2,10 @@
 
 A Bluesky terminal client prototype.
 
+![at-tui: timeline, media viewer, thread tree, profile, grouped notifications, the menu, replying and liking](demo/at-tui-demo.gif)
+
+<sub>Recorded with [VHS](https://github.com/charmbracelet/vhs) against a local mock server with made-up accounts; re-record with `demo/record.sh`.</sub>
+
 ## What Works
 
 - App-password login against Bluesky's XRPC API.
@@ -67,7 +71,7 @@ cargo run -- --no-images
 - `g`: top
 - `G`: bottom
 - `l` / Right / Enter: open replies/thread for the selected post
-- `h` / Left / Esc: go back
+- `h` / Left / Esc: go back; Esc on the timeline opens the menu
 - `q`: go back; quits when already at the timeline root
 - `[` / `]`: previous/next saved feed
 - Space: open media overlay for selected post
@@ -85,17 +89,23 @@ cargo run -- --no-images
 - `/`: search within loaded posts in the current view
 - `n`: next search match
 - `R`: reload current view
-- `?`: menu with keys, account, feed, and image settings
+- `P`: open the selected author's profile
+- `N`: open notifications
+- Tab: quick feed/account switcher
+- `?`: menu
 - `Ctrl-C`: quit from anywhere
 
-Menu:
+Menu (`?`, or Esc on the timeline): your feeds and accounts at the top, the key reference below, and the image setting at the bottom.
 
-- `j` / Down: next section
-- `k` / Up: previous section
-- Tab: next account/feed when the Accounts or Feeds section is selected
-- Shift-Tab: previous account/feed when the Accounts or Feeds section is selected
-- `[` / `]`: previous/next feed
-- Esc / `?` / Enter / `q`: close menu
+- `j` / Down, `k` / Up: move through feeds and accounts
+- Enter / `l`: switch to the highlighted feed or account (on the current feed, just closes)
+- Esc / `?` / `q`: close
+
+Feed and account switcher (Tab):
+
+- `j` / Down, `k` / Up: move
+- Enter / `l`: switch to the selected feed or account
+- Esc / Tab / `q`: close without switching
 
 Media overlay:
 
@@ -107,9 +117,14 @@ Media overlay:
 
 Composer:
 
-- Type normally; Enter inserts a newline
-- Ctrl-S: send
-- Esc: cancel
+- Type or paste normally; Enter inserts a newline
+- Ctrl-S: send (if sending fails, the draft is kept)
+- Ctrl-W: delete the previous word; Ctrl-U: clear the current line
+- Ctrl-E: edit the draft in `$VISUAL` / `$EDITOR` (vi if unset), then return to the composer
+- Esc: close; a non-empty draft is kept and returns when you reopen the composer for the same post
+
+Pasting only goes into the composer or the search prompt; a paste anywhere else is ignored.
+Links open in the browser only if they are http(s).
 
 Link picker:
 
