@@ -107,9 +107,12 @@ Media overlay:
 
 Composer:
 
-- Type normally; Enter inserts a newline
-- Ctrl-S: send
-- Esc: cancel
+- Type or paste normally; Enter inserts a newline
+- Ctrl-S: send (if sending fails, the draft is kept)
+- Esc: close; a non-empty draft is kept and returns when you reopen the composer for the same post
+
+Pasting only goes into the composer or the search prompt; a paste anywhere else is ignored.
+Links open in the browser only if they are http(s).
 
 Link picker:
 
