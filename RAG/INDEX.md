@@ -6,12 +6,22 @@
 
 | Status | EPICs | IMPs |
 |--------|-------|------|
-| In Progress | 0 | 0 |
-| Planned | 1 | 1 |
+| In Progress | 1 | 0 |
+| Planned | 1 | 2 |
 | Deferred | 0 | 0 |
 | Cancelled | 0 | 0 |
-| Completed | 1 | 9 |
-| **Total** | **2** | **10** |
+| Completed | 1 | 10 |
+| **Total** | **3** | **12** |
+
+## In Progress
+
+### [[AI-EPIC-003-at-tui-release-review|EPIC-003: At tui release review]]
+
+**IMPs:**
+- [[AI-IMP-003-1-release-review-fixes|IMP-003-1]] 1 release review fixes — completed
+- [[AI-IMP-003-2-ui-refresh-proposals|IMP-003-2]] 2 ui refresh proposals — planned
+
+---
 
 ## Planned
 
@@ -48,7 +58,7 @@ Generated from tracked files; binary assets excluded.
 
 ## Completed
 <details>
-<summary>1 EPICs, 9 IMPs completed</summary>
+<summary>1 EPICs, 10 IMPs completed</summary>
 
 - [[AI-EPIC-002-at-tui-stabilization-daily-driver|EPIC-002]] At tui stabilization daily driver — 2026-07-06
   - [[AI-IMP-002-1-session-sharing-failure-visibility|IMP-002-1]] 1 session sharing failure visibility — completed
