@@ -141,24 +141,7 @@ impl MediaCache {
             let _ = prune_disk_cache(&prune_dir, DISK_CACHE_MAX_AGE, DISK_CACHE_MAX_BYTES);
         });
 
-        let picker = if enabled {
-            let mut picker = match requested {
-                RequestedImageProtocol::Halfblocks => Picker::halfblocks(),
-                _ => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
-            };
-            match requested {
-                RequestedImageProtocol::Auto => {}
-                RequestedImageProtocol::Kitty => picker.set_protocol_type(ProtocolType::Kitty),
-                RequestedImageProtocol::Sixel => picker.set_protocol_type(ProtocolType::Sixel),
-                RequestedImageProtocol::Iterm2 => picker.set_protocol_type(ProtocolType::Iterm2),
-                RequestedImageProtocol::Halfblocks => {
-                    picker.set_protocol_type(ProtocolType::Halfblocks)
-                }
-            }
-            Some(picker)
-        } else {
-            None
-        };
+        let picker = enabled.then(|| pick_protocol(requested));
 
         Ok(Self {
             enabled,
@@ -200,13 +183,9 @@ impl MediaCache {
     }
 
     pub fn protocol_name(&self) -> &'static str {
-        match self.picker.as_ref().map(Picker::protocol_type) {
-            Some(ProtocolType::Kitty) => "kitty",
-            Some(ProtocolType::Sixel) => "sixel",
-            Some(ProtocolType::Iterm2) => "iterm2",
-            Some(ProtocolType::Halfblocks) => "halfblocks",
-            None => "off",
-        }
+        self.picker
+            .as_ref()
+            .map_or("off", |picker| protocol_type_name(picker.protocol_type()))
     }
 
     pub fn should_load(&self, image: &PreviewImage) -> bool {
@@ -470,6 +449,70 @@ impl MediaCache {
             }
         }
     }
+}
+
+/// Chooses the image protocol: queries the terminal (font size, and the
+/// protocol itself for `Auto`), then applies any `--image-protocol` override.
+/// Writes a query to stdout, so only call it on a terminal.
+fn pick_protocol(requested: RequestedImageProtocol) -> Picker {
+    let mut picker = match requested {
+        RequestedImageProtocol::Halfblocks => Picker::halfblocks(),
+        _ => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+    };
+    if let Some(forced) = forced_protocol(requested) {
+        picker.set_protocol_type(forced);
+    }
+    picker
+}
+
+fn forced_protocol(requested: RequestedImageProtocol) -> Option<ProtocolType> {
+    match requested {
+        RequestedImageProtocol::Auto => None,
+        RequestedImageProtocol::Kitty => Some(ProtocolType::Kitty),
+        RequestedImageProtocol::Sixel => Some(ProtocolType::Sixel),
+        RequestedImageProtocol::Iterm2 => Some(ProtocolType::Iterm2),
+        RequestedImageProtocol::Halfblocks => Some(ProtocolType::Halfblocks),
+    }
+}
+
+fn protocol_type_name(protocol: ProtocolType) -> &'static str {
+    match protocol {
+        ProtocolType::Kitty => "kitty",
+        ProtocolType::Sixel => "sixel",
+        ProtocolType::Iterm2 => "iterm2",
+        ProtocolType::Halfblocks => "halfblocks",
+    }
+}
+
+/// The image line for `at-tui session`: what the TUI would use with the same
+/// flags. Only `Auto` queries the terminal, and only when stdin and stdout
+/// are both terminals; piped output gets a hint instead of escape codes.
+pub fn describe_image_support(
+    no_images: bool,
+    requested: RequestedImageProtocol,
+    on_terminal: bool,
+) -> String {
+    describe_image_support_with(no_images, requested, on_terminal, || {
+        protocol_type_name(pick_protocol(RequestedImageProtocol::Auto).protocol_type())
+    })
+}
+
+fn describe_image_support_with(
+    no_images: bool,
+    requested: RequestedImageProtocol,
+    on_terminal: bool,
+    detect: impl FnOnce() -> &'static str,
+) -> String {
+    if no_images {
+        return "off (--no-images)".into();
+    }
+    if let Some(forced) = forced_protocol(requested) {
+        return format!("{} (--image-protocol)", protocol_type_name(forced));
+    }
+    if !on_terminal {
+        return "auto (run in a terminal to detect)".into();
+    }
+    format!("{} (detected)", detect())
 }
 
 impl ImageLoadJob {
@@ -900,6 +943,27 @@ mod tests {
         assert!(!dir.path().join("older.img").exists());
         assert!(dir.path().join("newer.img").exists());
         assert!(dir.path().join("videos/abc").exists());
+    }
+
+    #[test]
+    fn session_image_line_matches_flags_and_never_queries_off_terminal() {
+        let never = || -> &'static str { panic!("must not query the terminal") };
+        assert_eq!(
+            describe_image_support_with(true, RequestedImageProtocol::Kitty, true, never),
+            "off (--no-images)"
+        );
+        assert_eq!(
+            describe_image_support_with(false, RequestedImageProtocol::Sixel, true, never),
+            "sixel (--image-protocol)"
+        );
+        assert_eq!(
+            describe_image_support_with(false, RequestedImageProtocol::Auto, false, never),
+            "auto (run in a terminal to detect)"
+        );
+        assert_eq!(
+            describe_image_support_with(false, RequestedImageProtocol::Auto, true, || "kitty"),
+            "kitty (detected)"
+        );
     }
 
     #[test]
