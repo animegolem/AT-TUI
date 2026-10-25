@@ -42,7 +42,13 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    /// `AT_TUI_ACCOUNTS_FILE` points the store at another file, for scratch
+    /// accounts, tests and the README demo.
     pub fn new() -> Result<Self> {
+        if let Some(config_path) = std::env::var_os("AT_TUI_ACCOUNTS_FILE") {
+            return Ok(Self::from_path(PathBuf::from(config_path)));
+        }
+
         let dirs = ProjectDirs::from("dev", "haiti-plan", "at-tui")
             .ok_or_else(|| anyhow!("could not resolve a config directory"))?;
         Ok(Self {
@@ -51,7 +57,6 @@ impl SessionStore {
         })
     }
 
-    #[cfg(test)]
     pub fn from_path(config_path: PathBuf) -> Self {
         let legacy_session_path = config_path.with_file_name("session.json");
         Self {

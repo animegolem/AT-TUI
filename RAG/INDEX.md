@@ -52,7 +52,7 @@ Generated from tracked files; binary assets excluded.
 
 - RAG/scripts/generate-index.sh (575 LOC)
 - src/navigation.rs (521 LOC)
-- src/config.rs (398 LOC)
+- src/config.rs (403 LOC)
 - demo/mock_server.py (394 LOC)
 
 ---
