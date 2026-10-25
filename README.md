@@ -2,6 +2,10 @@
 
 A Bluesky terminal client prototype.
 
+![at-tui: timeline, media viewer, thread tree, profile, grouped notifications, the menu, replying and liking](demo/at-tui-demo.gif)
+
+<sub>Recorded with [VHS](https://github.com/charmbracelet/vhs) against a local mock server with made-up accounts; re-record with `demo/record.sh`.</sub>
+
 ## What Works
 
 - App-password login against Bluesky's XRPC API.

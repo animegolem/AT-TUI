@@ -41,8 +41,8 @@ Generated from tracked files; binary assets excluded.
 
 ### > 600 LOC
 
+- src/app.rs (4160 LOC)
 - Cargo.lock (4146 LOC)
-- src/app.rs (4133 LOC)
 - src/model.rs (2209 LOC)
 - src/ui.rs (1923 LOC)
 - src/media.rs (1052 LOC)
@@ -53,6 +53,7 @@ Generated from tracked files; binary assets excluded.
 - RAG/scripts/generate-index.sh (575 LOC)
 - src/navigation.rs (521 LOC)
 - src/config.rs (398 LOC)
+- demo/mock_server.py (390 LOC)
 
 ---
 

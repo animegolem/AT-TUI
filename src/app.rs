@@ -456,9 +456,6 @@ enum WriteResult {
         followed: bool,
         record_uri: Option<String>,
     },
-    Posted {
-        uri: String,
-    },
     Deleted {
         uri: String,
     },
@@ -762,7 +759,16 @@ impl App {
             AppEvent::PostCompleted { draft, result } => {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 match result {
-                    Ok(uri) => self.apply_write_result(Ok(WriteResult::Posted { uri })),
+                    Ok(_uri) => {
+                        // Say what happened in words; the record's at:// URI
+                        // means nothing to a reader.
+                        self.set_status(match draft.kind {
+                            ComposerKind::Post => "Posted",
+                            ComposerKind::Reply { .. } => "Reply posted",
+                            ComposerKind::Quote { .. } => "Quote posted",
+                        });
+                        self.last_refresh = Instant::now() - self.refresh_interval;
+                    }
                     Err(error) => {
                         // The overlay closed on send; keep the text so a
                         // failed post is one keypress from a retry.
@@ -1679,10 +1685,6 @@ impl App {
                 } else {
                     format!("Unfollowed @{target_handle}")
                 });
-            }
-            Ok(WriteResult::Posted { uri }) => {
-                self.set_status(format!("Posted {uri}"));
-                self.last_refresh = Instant::now() - self.refresh_interval;
             }
             Ok(WriteResult::Deleted { uri }) => {
                 self.nav.retain_items(|item| item.uri() != uri);
@@ -3099,6 +3101,31 @@ mod tests {
             panic!("composer closed");
         };
         assert_eq!(state.buffer, "half-written thought");
+    }
+
+    #[test]
+    fn successful_reply_reports_in_words() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.pending_writes = 1;
+        let parent = PostRef {
+            uri: "at://did:plc:bob/app.bsky.feed.post/1".into(),
+            cid: "cid".into(),
+        };
+        app.apply_event(AppEvent::PostCompleted {
+            draft: ComposerState {
+                kind: ComposerKind::Reply {
+                    root: parent.clone(),
+                    parent,
+                    parent_handle: "bob.test".into(),
+                },
+                buffer: "hi".into(),
+            },
+            result: Ok("at://did:plc:alice/app.bsky.feed.post/new".into()),
+        })
+        .unwrap();
+
+        assert_eq!(app.status, "Reply posted");
+        assert_eq!(app.pending_writes, 0);
     }
 
     #[test]
