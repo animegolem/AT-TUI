@@ -26,9 +26,9 @@ use crate::{
     },
     model::{
         FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, NotificationItem,
-        NotificationTarget, PostRef, ProfileSummary, QuotePost, ViewItem, feed_item_from_quote,
-        feed_sources_for_account, item_links, notification_items, profile_summary, thread_items,
-        timeline_items,
+        NotificationTarget, PostRef, ProfileSummary, QuotePost, ViewItem, apply_feed_display_names,
+        feed_item_from_quote, feed_sources_for_account, item_links, notification_items,
+        profile_summary, thread_items, timeline_items,
     },
     navigation::{NavigationStack, ViewKind, ViewState},
     ui,
@@ -507,6 +507,9 @@ pub struct App {
     events_rx: UnboundedReceiver<AppEvent>,
     next_request_id: RequestId,
     pending_feed: Option<RequestId>,
+    /// Feed to fall back to if an in-flight feed switch fails, so the label
+    /// and pagination source keep matching what the root view shows.
+    feed_load_fallback: Option<usize>,
     pending_refresh: Option<RequestId>,
     pending_notification_count: Option<RequestId>,
     pending_notifications: Option<RequestId>,
@@ -550,6 +553,9 @@ impl App {
                 Some(format!("Preferences unavailable: {error:#}")),
             ),
         };
+        let home_feed_prefs = home_feed_prefs.with_viewer(client.session().did);
+        let mut feeds = feeds;
+        resolve_feed_names(&mut client, &mut feeds).await;
         let (items, cursor) =
             load_feed_page(&mut client, &feeds[0], &home_feed_prefs, None).await?;
         let mut timeline = ViewState::new(feeds[0].label.clone(), ViewKind::Timeline, items);
@@ -580,6 +586,7 @@ impl App {
             events_rx,
             next_request_id: 1,
             pending_feed: None,
+            feed_load_fallback: None,
             pending_refresh: None,
             pending_notification_count: None,
             pending_notifications: None,
@@ -1271,6 +1278,9 @@ impl App {
 
         let len = self.feeds.len() as isize;
         let next = (self.active_feed as isize + delta).rem_euclid(len) as usize;
+        if self.pending_feed.is_none() {
+            self.feed_load_fallback = Some(self.active_feed);
+        }
         self.active_feed = next;
         self.queue_feed_load(
             self.feeds[next].clone(),
@@ -1305,7 +1315,7 @@ impl App {
         self.nav.root_mut().loading = true;
         self.set_status(status);
         let mut client = self.client.clone();
-        let prefs = self.home_feed_prefs;
+        let prefs = self.home_feed_prefs.clone();
         self.spawn_event(async move {
             let result = load_feed_page(&mut client, &source, &prefs, None)
                 .await
@@ -1409,12 +1419,14 @@ impl App {
             let result = async {
                 client.refresh_session().await?;
                 let root = client.get_preferences().await?;
-                let home_feed_prefs = HomeFeedPrefs::from_preferences_response(&root);
-                let feeds = feed_sources_for_account(
+                let home_feed_prefs = HomeFeedPrefs::from_preferences_response(&root)
+                    .with_viewer(client.session().did);
+                let mut feeds = feed_sources_for_account(
                     &root,
                     &client.session().handle,
                     &client.session().did,
                 );
+                resolve_feed_names(&mut client, &mut feeds).await;
                 let source = feeds.first().cloned().unwrap_or_else(FeedSource::home);
                 let (items, cursor) =
                     load_feed_page(&mut client, &source, &home_feed_prefs, None).await?;
@@ -1448,12 +1460,16 @@ impl App {
                 view.cursor = cursor;
                 self.nav.replace_root(view);
                 self.pending_new_items.clear();
+                self.feed_load_fallback = None;
                 self.last_refresh = Instant::now();
                 self.set_status(format!("Loaded {}", source.label));
             }
             Err(error) => {
+                if let Some(previous) = self.feed_load_fallback.take() {
+                    self.active_feed = previous;
+                }
                 self.nav.root_mut().error = Some(error);
-                self.set_error_status("Feed load failed");
+                self.set_error_status(format!("Could not load {}", source.label));
             }
         }
     }
@@ -2280,7 +2296,7 @@ impl App {
                 let id = self.next_request_id();
                 self.nav.current_mut().page_request = Some(id);
                 let mut client = self.client.clone();
-                let prefs = self.home_feed_prefs;
+                let prefs = self.home_feed_prefs.clone();
                 self.spawn_event(async move {
                     let result = load_feed_page(&mut client, &source, &prefs, Some(&cursor))
                         .await
@@ -2350,7 +2366,7 @@ impl App {
         let id = self.next_request_id();
         self.pending_refresh = Some(id);
         let mut client = self.client.clone();
-        let prefs = self.home_feed_prefs;
+        let prefs = self.home_feed_prefs.clone();
         self.spawn_event(async move {
             let result = load_feed_page(&mut client, &source, &prefs, None)
                 .await
@@ -2573,6 +2589,21 @@ fn new_items_before_current(
     new_items
 }
 
+/// Best effort: saved feeds keep their rkey labels if the lookup fails.
+async fn resolve_feed_names(client: &mut BskyClient, feeds: &mut [FeedSource]) {
+    let uris = feeds
+        .iter()
+        .filter_map(FeedSource::uri)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if uris.is_empty() {
+        return;
+    }
+    if let Ok(root) = client.get_feed_generators(&uris).await {
+        apply_feed_display_names(feeds, &root);
+    }
+}
+
 async fn load_feed_page(
     client: &mut BskyClient,
     source: &FeedSource,
@@ -2622,6 +2653,7 @@ pub async fn run_tui(
     let mut app = App::bootstrap(client, media).await?;
     let mut dirty = true;
     let mut status_was_visible = app.visible_status().is_some();
+    let mut drawn_minute = ui::current_minute();
 
     loop {
         if app.drain_events()? > 0 {
@@ -2644,8 +2676,13 @@ pub async fn run_tui(
             // Keep progress indicators animating while work is in flight.
             dirty = true;
         }
+        if ui::current_minute() != drawn_minute {
+            // Relative timestamps ("5m") age even when nothing else moves.
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
+            drawn_minute = ui::current_minute();
             dirty = false;
         }
         if app.should_quit {
@@ -3019,6 +3056,35 @@ mod tests {
             panic!("composer closed");
         };
         assert_eq!(state.buffer, "important words");
+    }
+
+    #[tokio::test]
+    async fn failed_feed_switch_restores_the_shown_feed() {
+        let mut app = app_with_items(vec![item("home", "home")]);
+        let news = FeedSource {
+            label: "News".into(),
+            kind: FeedSourceKind::Generator {
+                uri: "at://did:plc:x/app.bsky.feed.generator/news".into(),
+            },
+        };
+        app.feeds.push(news.clone());
+        app.nav.current_mut().cursor = Some("home-page-2".into());
+
+        app.switch_feed_delta(1).await.unwrap();
+        assert_eq!(app.active_feed, 1);
+        let request_id = app.pending_feed.unwrap();
+        app.apply_event(AppEvent::FeedLoaded {
+            request_id,
+            source: news,
+            result: Err("feed generator offline".into()),
+        })
+        .unwrap();
+
+        // Root still shows Following, so the active feed (used for labels
+        // and the next page's source) must say Following too.
+        assert_eq!(app.active_feed, 0);
+        assert_eq!(ui::current_location_label(&app), "Following");
+        assert_eq!(app.nav.current().items[0].uri(), "home");
     }
 
     #[test]
@@ -3868,6 +3934,7 @@ mod tests {
             events_rx,
             next_request_id: 1,
             pending_feed: None,
+            feed_load_fallback: None,
             pending_refresh: None,
             pending_notification_count: None,
             pending_notifications: None,

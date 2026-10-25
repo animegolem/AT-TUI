@@ -68,12 +68,25 @@ fn render_feed(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
+pub(crate) fn current_minute() -> i64 {
+    chrono::Utc::now().timestamp() / 60
+}
+
 fn visible_feed_lines(
     view: &mut ViewState,
     width: usize,
     available_lines: usize,
 ) -> Vec<Line<'static>> {
-    ensure_layout_cache(view, width);
+    visible_feed_lines_at(view, width, available_lines, current_minute())
+}
+
+fn visible_feed_lines_at(
+    view: &mut ViewState,
+    width: usize,
+    available_lines: usize,
+    minute: i64,
+) -> Vec<Line<'static>> {
+    ensure_layout_cache(view, width, minute);
     ensure_selected_rendered(view, width, available_lines);
 
     if view.items.is_empty() {
@@ -103,14 +116,16 @@ fn visible_feed_lines(
     lines
 }
 
-fn ensure_layout_cache(view: &mut ViewState, width: usize) {
-    let needs_rebuild =
-        view.layout_cache.width != Some(width) || view.layout_cache.items.len() != view.items.len();
+fn ensure_layout_cache(view: &mut ViewState, width: usize, minute: i64) {
+    let needs_rebuild = view.layout_cache.width != Some(width)
+        || view.layout_cache.minute != Some(minute)
+        || view.layout_cache.items.len() != view.items.len();
     if !needs_rebuild {
         return;
     }
 
     view.layout_cache.width = Some(width);
+    view.layout_cache.minute = Some(minute);
     view.layout_cache.items = view
         .items
         .iter()
@@ -1384,14 +1399,18 @@ mod tests {
             vec![item_with_text("one"), item_with_text("two")],
         );
 
-        let _ = visible_feed_lines(&mut view, 80, 10);
+        let _ = visible_feed_lines_at(&mut view, 80, 10, 100);
         let first_builds = view.layout_cache.builds;
-        let _ = visible_feed_lines(&mut view, 80, 10);
+        let _ = visible_feed_lines_at(&mut view, 80, 10, 100);
 
         assert_eq!(first_builds, 1);
         assert_eq!(view.layout_cache.builds, first_builds);
 
-        let _ = visible_feed_lines(&mut view, 40, 10);
+        let _ = visible_feed_lines_at(&mut view, 40, 10, 100);
         assert_eq!(view.layout_cache.builds, first_builds + 1);
+
+        // Relative timestamps age: a new minute rebuilds the rows.
+        let _ = visible_feed_lines_at(&mut view, 40, 10, 101);
+        assert_eq!(view.layout_cache.builds, first_builds + 2);
     }
 }

@@ -32,6 +32,9 @@ pub struct ViewState {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutCache {
     pub width: Option<usize>,
+    /// Wall-clock minute the lines were built in; rows embed relative
+    /// times ("5m"), so a new minute invalidates them.
+    pub minute: Option<i64>,
     pub items: Vec<CachedItemLines>,
     pub builds: usize,
 }
@@ -39,6 +42,7 @@ pub struct LayoutCache {
 impl LayoutCache {
     pub fn clear(&mut self) {
         self.width = None;
+        self.minute = None;
         self.items.clear();
     }
 }
