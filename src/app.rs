@@ -21,9 +21,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::{
     api::BskyClient,
     config::{AccountSession, Session},
-    media::{
-        MediaCache, PreviewImage, PreviewMedia, PreviewVideo, RequestedImageProtocol, preview_media,
-    },
+    media::{MediaCache, PreviewImage, PreviewMedia, RequestedImageProtocol, preview_media},
     model::{
         FeedItem, FeedSource, FeedSourceKind, HomeFeedPrefs, LinkRef, NotificationItem,
         NotificationTarget, PostRef, ProfileSummary, QuotePost, ViewItem, apply_feed_display_names,
@@ -32,6 +30,7 @@ use crate::{
     },
     navigation::{NavigationStack, ViewKind, ViewState},
     ui,
+    video_player::MpvPlayer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,16 +217,11 @@ pub fn key_help_groups() -> [KeyHelpGroup; 6] {
 pub struct MediaOverlayState {
     pub media: Vec<PreviewMedia>,
     pub selected: usize,
-    pub playing: bool,
 }
 
 impl MediaOverlayState {
     pub fn new(media: Vec<PreviewMedia>) -> Self {
-        Self {
-            media,
-            selected: 0,
-            playing: false,
-        }
+        Self { media, selected: 0 }
     }
 
     pub fn selected_media(&self) -> Option<&PreviewMedia> {
@@ -237,13 +231,11 @@ impl MediaOverlayState {
     pub fn next(&mut self) {
         if !self.media.is_empty() {
             self.selected = (self.selected + 1).min(self.media.len() - 1);
-            self.playing = false;
         }
     }
 
     pub fn previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
-        self.playing = false;
     }
 }
 
@@ -310,10 +302,6 @@ enum AppEvent {
     ImageLoaded {
         url: String,
         result: std::result::Result<DynamicImage, String>,
-    },
-    VideoLoaded {
-        playlist_url: String,
-        result: std::result::Result<Vec<DynamicImage>, String>,
     },
     FeedLoaded {
         request_id: RequestId,
@@ -508,7 +496,8 @@ pub struct App {
     refresh_interval: Duration,
     last_notification_poll: Instant,
     notification_interval: Duration,
-    last_video_frame: Instant,
+    /// Video waiting for the run loop to hand the terminal to mpv.
+    pending_video: Option<String>,
     spinner_index: usize,
     last_spinner_tick: Instant,
 }
@@ -587,7 +576,7 @@ impl App {
             refresh_interval: Duration::from_secs(60),
             last_notification_poll: now - Duration::from_secs(60),
             notification_interval: Duration::from_secs(60),
-            last_video_frame: now,
+            pending_video: None,
             spinner_index: 0,
             last_spinner_tick: now,
         })
@@ -658,17 +647,6 @@ impl App {
                 self.media.finish_load(url.clone(), result);
                 if matches!(self.media.state_name(&url), "ready") {
                     self.set_status("Image loaded");
-                }
-            }
-            AppEvent::VideoLoaded {
-                playlist_url,
-                result,
-            } => {
-                self.media.finish_video_load(playlist_url.clone(), result);
-                match self.media.video_state_name(&playlist_url) {
-                    "ready" => self.set_status("Video frames ready"),
-                    "failed" => self.set_error_status("Video decode failed"),
-                    _ => {}
                 }
             }
             AppEvent::FeedLoaded {
@@ -912,7 +890,7 @@ impl App {
             OpenUri(Option<String>),
             CloseComposer(ComposerState),
             SwitchTo(usize),
-            PlayVideo(Option<PreviewVideo>),
+            PlayVideo(Option<String>),
             SubmitComposer(Option<ComposerState>),
             DeletePost(String),
         }
@@ -946,14 +924,10 @@ impl App {
                 KeyCode::Char('h') | KeyCode::Left => state.previous(),
                 KeyCode::Char('l') | KeyCode::Right => state.next(),
                 KeyCode::Enter | KeyCode::Char('p') => {
-                    let video = match state.selected_media() {
-                        Some(PreviewMedia::Video(video)) => Some(video.clone()),
+                    action = Action::PlayVideo(match state.selected_media() {
+                        Some(PreviewMedia::Video(video)) => Some(video.playlist_url.clone()),
                         _ => None,
-                    };
-                    if video.is_some() {
-                        state.playing = true;
-                    }
-                    action = Action::PlayVideo(video);
+                    });
                 }
                 KeyCode::Char('u') => {
                     action = Action::OpenUri(match state.selected_media() {
@@ -1064,9 +1038,10 @@ impl App {
                     self.set_status("No external media URL for selected item");
                 }
             }
-            Action::PlayVideo(video) => {
-                if let Some(video) = video {
-                    self.queue_video_load(&video);
+            Action::PlayVideo(playlist_url) => {
+                if let Some(playlist_url) = playlist_url {
+                    self.pending_video = Some(playlist_url);
+                    self.set_status("Opening video in mpv");
                 } else {
                     self.set_status("Selected media is not a video");
                 }
@@ -1249,32 +1224,6 @@ impl App {
                 .collect::<Vec<_>>()
         };
         self.queue_image_url_loads(urls);
-    }
-
-    fn queue_video_load(&mut self, video: &PreviewVideo) {
-        if !self.media.should_load_video(video) {
-            match self.media.video_state_name(&video.playlist_url) {
-                "ready" => self.set_status("Video frames ready"),
-                "loading" => self.set_status("Video decode already running"),
-                "failed" => self.set_status("Video decode previously failed"),
-                _ => {}
-            }
-            return;
-        }
-
-        self.media.mark_video_loading(video);
-        let Some(job) = self.media.video_job(video) else {
-            self.set_status("Video rendering disabled");
-            return;
-        };
-        self.set_status("Decoding video frames");
-        self.spawn_event(async move {
-            let (playlist_url, result) = job.run().await;
-            AppEvent::VideoLoaded {
-                playlist_url,
-                result,
-            }
-        });
     }
 
     fn open_links_for_selected(&mut self) {
@@ -2510,29 +2459,6 @@ impl App {
         }
     }
 
-    pub fn advance_video_frame(&mut self) -> bool {
-        if self.last_video_frame.elapsed() < Duration::from_millis(125) {
-            return false;
-        }
-        let Some(Overlay::Media(state)) = self.overlay.as_ref() else {
-            return false;
-        };
-        if !state.playing {
-            return false;
-        }
-        let Some(PreviewMedia::Video(video)) = state.selected_media() else {
-            return false;
-        };
-        let playlist_url = video.playlist_url.clone();
-        self.media.advance_video(&playlist_url);
-        self.last_video_frame = Instant::now();
-        true
-    }
-
-    pub fn video_playing(&self) -> bool {
-        matches!(self.overlay.as_ref(), Some(Overlay::Media(state)) if state.playing)
-    }
-
     pub fn advance_spinner(&mut self) -> bool {
         if !self.has_pending_tasks() {
             return false;
@@ -2737,9 +2663,6 @@ pub async fn run_tui(
         }
         app.maybe_refresh_active_feed();
         app.maybe_poll_notifications();
-        if app.advance_video_frame() {
-            dirty = true;
-        }
         if app.advance_spinner() {
             dirty = true;
         }
@@ -2764,23 +2687,30 @@ pub async fn run_tui(
         if app.should_quit {
             break;
         }
+        if let Some(playlist_url) = app.pending_video.take() {
+            match MpvPlayer::discover() {
+                None => {
+                    app.set_error_status("mpv not found: install mpv, or press u to open the video")
+                }
+                Some(player) if app.media.terminal_supports_kitty() => {
+                    match with_terminal_released(&mut terminal, || player.play(&playlist_url))? {
+                        Ok(status) if status.success() => app.set_status("Video playback ended"),
+                        Ok(status) => app.set_error_status(format!("mpv exited with {status}")),
+                        Err(error) => {
+                            app.set_error_status(format!("mpv playback failed: {error:#}"))
+                        }
+                    }
+                }
+                Some(player) => match player.spawn_windowed(&playlist_url) {
+                    Ok(()) => app.set_status("Playing in an mpv window"),
+                    Err(error) => app.set_error_status(format!("mpv playback failed: {error:#}")),
+                },
+            }
+            dirty = true;
+            continue;
+        }
         if let Some(mut draft) = app.editor_request.take() {
-            disable_raw_mode()?;
-            execute!(
-                terminal.backend_mut(),
-                DisableBracketedPaste,
-                LeaveAlternateScreen,
-                DisableMouseCapture
-            )?;
-            let edited = edit_externally(&draft.buffer);
-            enable_raw_mode()?;
-            execute!(
-                terminal.backend_mut(),
-                EnterAlternateScreen,
-                EnableMouseCapture,
-                EnableBracketedPaste
-            )?;
-            terminal.clear()?;
+            let edited = with_terminal_released(&mut terminal, || edit_externally(&draft.buffer))?;
             match edited {
                 Ok(text) => draft.buffer = text,
                 Err(error) => app.set_error_status(format!("Editor failed: {error:#}")),
@@ -2789,7 +2719,7 @@ pub async fn run_tui(
             dirty = true;
             continue;
         }
-        let poll_timeout = if app.video_playing() || app.has_pending_tasks() {
+        let poll_timeout = if app.has_pending_tasks() {
             Duration::from_millis(50)
         } else {
             Duration::from_millis(250)
@@ -2818,6 +2748,31 @@ pub async fn run_tui(
 
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Gives the terminal to a child program (mpv, $EDITOR) and takes it back,
+/// restoring raw mode, the alternate screen, mouse capture and paste mode.
+fn with_terminal_released<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    run: impl FnOnce() -> T,
+) -> Result<T> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    let result = run();
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
+    terminal.clear()?;
+    Ok(result)
 }
 
 struct TerminalSession;
@@ -4102,7 +4057,7 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             last_notification_poll: Instant::now(),
             notification_interval: Duration::from_secs(60),
-            last_video_frame: Instant::now(),
+            pending_video: None,
             spinner_index: 0,
             last_spinner_tick: Instant::now(),
         }

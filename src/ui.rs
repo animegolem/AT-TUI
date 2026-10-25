@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{App, ComposerKind, ComposerState, InputMode, KeyHelpGroup, Overlay, key_help_groups},
-    media::{PreviewImage, PreviewMedia},
+    media::PreviewMedia,
     model::{
         ExternalRef, FeedItem, FeedReason, ImageRef, NotificationItem, NotificationReason,
         ProfileSummary, QuotePost, ReplyParentStatus, ViewItem, compact_time,
@@ -483,25 +483,12 @@ fn render_media_overlay(
                 video.source.label(),
                 video.alt.as_deref(),
             );
-            if app.media.video_state_name(&video.playlist_url) == "missing"
-                && let Some(thumb_url) = &video.thumb_url
-            {
-                let image = PreviewImage {
-                    url: thumb_url.clone(),
-                    thumb_url: None,
-                    alt: video.alt.clone(),
-                    source: video.source,
-                };
-                app.media
-                    .render_preview_image(frame, chunks[0], &image, title);
-            } else {
-                app.media
-                    .render_preview_video(frame, chunks[0], video, title);
-            }
+            app.media
+                .render_preview_video(frame, chunks[0], video, title);
         }
     }
     frame.render_widget(
-        Paragraph::new(" h/l switch · Enter/p play video · u open · Space/Esc close ")
+        Paragraph::new(" h/l switch · Enter/p play video in mpv · u open · Space/Esc close ")
             .style(Style::default().fg(Color::Black).bg(Color::Gray)),
         chunks[1],
     );

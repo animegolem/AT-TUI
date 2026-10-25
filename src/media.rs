@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, SystemTime},
 };
 
@@ -83,7 +82,6 @@ impl PreviewImageSource {
 }
 
 const IMAGE_CACHE_CAP: usize = 48;
-const VIDEO_CACHE_CAP: usize = 4;
 const DISK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DISK_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -93,10 +91,8 @@ pub struct MediaCache {
     http: Client,
     picker: Option<Picker>,
     images: HashMap<String, ImageState>,
-    videos: HashMap<String, VideoState>,
     // Access-ordered keys backing the LRU bound; disk cache makes re-loads cheap.
     image_order: VecDeque<String>,
-    video_order: VecDeque<String>,
 }
 
 enum ImageState {
@@ -105,26 +101,11 @@ enum ImageState {
     Failed(String),
 }
 
-enum VideoState {
-    Loading,
-    Ready {
-        frames: Vec<StatefulProtocol>,
-        frame: usize,
-    },
-    Failed(String),
-}
-
 #[derive(Debug, Clone)]
 pub struct ImageLoadJob {
     url: String,
     cache_dir: PathBuf,
     http: Client,
-}
-
-#[derive(Debug, Clone)]
-pub struct VideoLoadJob {
-    playlist_url: String,
-    cache_dir: PathBuf,
 }
 
 impl MediaCache {
@@ -149,9 +130,7 @@ impl MediaCache {
             http: crate::api::http_client(),
             picker,
             images: HashMap::new(),
-            videos: HashMap::new(),
             image_order: VecDeque::new(),
-            video_order: VecDeque::new(),
         })
     }
 
@@ -162,9 +141,7 @@ impl MediaCache {
             http: crate::api::http_client(),
             picker: None,
             images: HashMap::new(),
-            videos: HashMap::new(),
             image_order: VecDeque::new(),
-            video_order: VecDeque::new(),
         }
     }
 
@@ -176,10 +153,15 @@ impl MediaCache {
             http: Client::new(),
             picker: Some(Picker::halfblocks()),
             images: HashMap::new(),
-            videos: HashMap::new(),
             image_order: VecDeque::new(),
-            video_order: VecDeque::new(),
         }
+    }
+
+    /// mpv draws in the terminal only through the kitty graphics protocol.
+    pub fn terminal_supports_kitty(&self) -> bool {
+        self.picker
+            .as_ref()
+            .is_some_and(|picker| picker.protocol_type() == ProtocolType::Kitty)
     }
 
     pub fn protocol_name(&self) -> &'static str {
@@ -240,25 +222,6 @@ impl MediaCache {
         }
     }
 
-    pub fn should_load_video(&self, video: &PreviewVideo) -> bool {
-        self.enabled && !self.videos.contains_key(&video.playlist_url)
-    }
-
-    pub fn mark_video_loading(&mut self, video: &PreviewVideo) {
-        if self.enabled {
-            self.videos
-                .entry(video.playlist_url.clone())
-                .or_insert(VideoState::Loading);
-        }
-    }
-
-    pub fn video_job(&self, video: &PreviewVideo) -> Option<VideoLoadJob> {
-        self.enabled.then(|| VideoLoadJob {
-            playlist_url: video.playlist_url.clone(),
-            cache_dir: self.cache_dir.join("videos"),
-        })
-    }
-
     pub fn finish_load(&mut self, url: String, result: std::result::Result<DynamicImage, String>) {
         if !self.enabled {
             return;
@@ -274,64 +237,12 @@ impl MediaCache {
         self.record_image(url, state);
     }
 
-    pub fn finish_video_load(
-        &mut self,
-        playlist_url: String,
-        result: std::result::Result<Vec<DynamicImage>, String>,
-    ) {
-        if !self.enabled {
-            return;
-        }
-
-        let state = match result {
-            Ok(frames) if frames.is_empty() => {
-                VideoState::Failed("Video did not produce terminal frames".into())
-            }
-            Ok(frames) => match self.picker.as_ref() {
-                Some(picker) => VideoState::Ready {
-                    frames: frames
-                        .into_iter()
-                        .map(|frame| picker.new_resize_protocol(frame))
-                        .collect(),
-                    frame: 0,
-                },
-                None => VideoState::Failed("Video rendering disabled".into()),
-            },
-            Err(error) => VideoState::Failed(error),
-        };
-        if self.videos.insert(playlist_url.clone(), state).is_none() {
-            self.video_order.push_back(playlist_url);
-        }
-        while self.video_order.len() > VIDEO_CACHE_CAP {
-            if let Some(evicted) = self.video_order.pop_front() {
-                self.videos.remove(&evicted);
-            }
-        }
-    }
-
     pub fn state_name(&self, url: &str) -> &'static str {
         match self.images.get(url) {
             Some(ImageState::Loading) => "loading",
             Some(ImageState::Ready(_)) => "ready",
             Some(ImageState::Failed(_)) => "failed",
             None => "missing",
-        }
-    }
-
-    pub fn video_state_name(&self, playlist_url: &str) -> &'static str {
-        match self.videos.get(playlist_url) {
-            Some(VideoState::Loading) => "loading",
-            Some(VideoState::Ready { .. }) => "ready",
-            Some(VideoState::Failed(_)) => "failed",
-            None => "missing",
-        }
-    }
-
-    pub fn advance_video(&mut self, playlist_url: &str) {
-        if let Some(VideoState::Ready { frames, frame }) = self.videos.get_mut(playlist_url)
-            && !frames.is_empty()
-        {
-            *frame = (*frame + 1) % frames.len();
         }
     }
 
@@ -396,6 +307,8 @@ impl MediaCache {
         );
     }
 
+    /// Videos play in mpv (see `video_player`); the overlay shows the
+    /// thumbnail, or a hint when there is none.
     pub fn render_preview_video(
         &mut self,
         frame: &mut Frame<'_>,
@@ -404,49 +317,21 @@ impl MediaCache {
         title: impl Into<String>,
     ) {
         let title = title.into();
-        if !self.enabled {
-            frame.render_widget(
-                Paragraph::new("Video rendering disabled").block(media_block(title)),
-                area,
-            );
-            return;
-        }
-
-        match self.videos.get_mut(&video.playlist_url) {
-            Some(VideoState::Ready {
-                frames,
-                frame: frame_index,
-            }) if !frames.is_empty() => {
-                let block = media_block(title);
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
-                let frame_index = (*frame_index).min(frames.len() - 1);
-                frame.render_stateful_widget(
-                    StatefulImage::default().resize(Resize::Fit(None)),
-                    inner,
-                    &mut frames[frame_index],
-                );
-            }
-            Some(VideoState::Loading) => {
-                frame.render_widget(
-                    Paragraph::new("Video decoding with ffmpeg").block(media_block(title)),
-                    area,
-                );
-            }
-            Some(VideoState::Failed(error)) => {
-                frame.render_widget(
-                    Paragraph::new(error.clone()).block(media_block(title)),
-                    area,
-                );
-            }
-            _ => {
-                let message = if video.thumb_url.is_some() {
-                    "Press Enter or p to decode terminal frames"
-                } else {
-                    "No thumbnail available. Press Enter or p to decode terminal frames"
+        match &video.thumb_url {
+            Some(thumb_url) => {
+                let image = PreviewImage {
+                    url: thumb_url.clone(),
+                    thumb_url: None,
+                    alt: video.alt.clone(),
+                    source: video.source,
                 };
-                frame.render_widget(Paragraph::new(message).block(media_block(title)), area);
+                self.render_preview_image(frame, area, &image, title);
             }
+            None => frame.render_widget(
+                Paragraph::new("No thumbnail · Enter or p plays it in mpv · u opens it externally")
+                    .block(media_block(title)),
+                area,
+            ),
         }
     }
 }
@@ -581,62 +466,6 @@ async fn decode_image_bytes(bytes: Vec<u8>, url: String) -> Result<DynamicImage>
             .with_context(|| format!("could not decode image from {url}"))
     })
     .await?
-}
-
-impl VideoLoadJob {
-    pub async fn run(self) -> (String, std::result::Result<Vec<DynamicImage>, String>) {
-        let playlist_url = self.playlist_url.clone();
-        let result = tokio::task::spawn_blocking(move || self.decode_frames())
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-        (playlist_url, result)
-    }
-
-    fn decode_frames(self) -> Result<Vec<DynamicImage>> {
-        fs::create_dir_all(&self.cache_dir)
-            .with_context(|| format!("could not create {}", self.cache_dir.display()))?;
-        let frame_dir = self.cache_dir.join(cache_stem(&self.playlist_url));
-        fs::create_dir_all(&frame_dir)
-            .with_context(|| format!("could not create {}", frame_dir.display()))?;
-
-        let output = frame_dir.join("frame_%04d.jpg");
-        let status = Command::new("ffmpeg")
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-y")
-            .arg("-i")
-            .arg(&self.playlist_url)
-            .arg("-vf")
-            .arg("fps=8,scale=640:-2:force_original_aspect_ratio=decrease")
-            .arg("-vframes")
-            .arg("120")
-            .arg(&output)
-            .status()
-            .with_context(|| "could not run ffmpeg; install ffmpeg or open the video externally")?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "ffmpeg could not decode this video; open it externally with u"
-            ));
-        }
-
-        let mut paths = fs::read_dir(&frame_dir)
-            .with_context(|| format!("could not read {}", frame_dir.display()))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jpg"))
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        paths
-            .into_iter()
-            .take(120)
-            .map(|path| {
-                image::open(&path).with_context(|| format!("could not decode {}", path.display()))
-            })
-            .collect()
-    }
 }
 
 struct CacheEntry {
