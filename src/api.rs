@@ -171,6 +171,22 @@ impl BskyClient {
         self.get("app.bsky.feed.getFeedGenerators", &query).await
     }
 
+    /// `app.bsky.feed.getPosts`; the endpoint takes at most 25 URIs.
+    pub async fn get_posts(&mut self, uris: &[String]) -> Result<Value> {
+        let mut posts = Vec::new();
+        for chunk in uris.chunks(25) {
+            let query = chunk
+                .iter()
+                .map(|uri| ("uris".to_owned(), uri.clone()))
+                .collect::<Vec<_>>();
+            let root = self.get("app.bsky.feed.getPosts", &query).await?;
+            if let Some(batch) = root.get("posts").and_then(Value::as_array) {
+                posts.extend(batch.iter().cloned());
+            }
+        }
+        Ok(json!({ "posts": posts }))
+    }
+
     pub async fn get_post_thread(&mut self, uri: &str) -> Result<Value> {
         let query = post_thread_query(uri);
         self.get("app.bsky.feed.getPostThread", &query).await

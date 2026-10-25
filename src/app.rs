@@ -47,6 +47,13 @@ pub enum Overlay {
     Links(LinkPickerState),
     Composer(ComposerState),
     ConfirmDelete(ConfirmDeleteState),
+    Switcher(SwitcherState),
+}
+
+/// Feeds first, then accounts; nothing switches until Enter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SwitcherState {
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +154,7 @@ pub enum Action {
     PageDown,
     PageUp,
     OpenMenu,
+    OpenSwitcher,
     PreviewMedia,
     OpenLinks,
     PreviousFeed,
@@ -190,6 +198,7 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::Char('?') => Some(Action::OpenMenu),
+        KeyCode::Tab => Some(Action::OpenSwitcher),
         KeyCode::Char(' ') => Some(Action::PreviewMedia),
         KeyCode::Char('o') => Some(Action::OpenLinks),
         KeyCode::Char('[') => Some(Action::PreviousFeed),
@@ -217,13 +226,60 @@ pub fn normal_action_for_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
-pub fn normal_key_help_lines() -> Vec<&'static str> {
-    vec![
-        "  j/k or arrows: move · Ctrl-d/Ctrl-u half page · PgUp/PgDn page",
-        "  l/Enter/Right: open selected · h/Left back · q back, quit at root",
-        "  P profile · N notifications · Space media · o links · e quoted post",
-        "  f like · b repost · F follow · p post · r reply · Q quote · d delete",
-        "  / search · n next · R reload · u load pending · Ctrl-C quit",
+pub type KeyHelpGroup = (&'static str, &'static [(&'static str, &'static str)]);
+
+/// The help card, grouped which-key style. Lives beside the keymap so the
+/// two change together (and the registry test checks both).
+pub fn key_help_groups() -> [KeyHelpGroup; 6] {
+    [
+        (
+            "MOVE",
+            &[
+                ("j k ↓ ↑", "next / prev"),
+                ("^d ^u", "half page"),
+                ("PgDn PgUp", "page"),
+                ("g G", "top / bottom"),
+                ("u", "new posts"),
+            ],
+        ),
+        (
+            "OPEN",
+            &[
+                ("l ⏎ →", "thread"),
+                ("h ← q", "back"),
+                ("e", "quoted post"),
+                ("P", "profile"),
+                ("N", "notifications"),
+            ],
+        ),
+        (
+            "ACT",
+            &[
+                ("f", "like"),
+                ("b", "repost"),
+                ("F", "follow"),
+                ("d", "delete yours"),
+                ("o", "open link"),
+            ],
+        ),
+        (
+            "WRITE",
+            &[("p", "new post"), ("r", "reply"), ("Q", "quote post")],
+        ),
+        (
+            "VIEW",
+            &[
+                ("Tab", "feeds/accounts"),
+                ("[ ]", "prev/next feed"),
+                ("␣", "media"),
+                ("/ n", "search/next"),
+                ("R", "reload"),
+            ],
+        ),
+        (
+            "APP",
+            &[("?", "help"), ("q", "quit at root"), ("^C", "quit")],
+        ),
     ]
 }
 
@@ -493,6 +549,7 @@ pub struct App {
     pub active_feed: usize,
     pub home_feed_prefs: HomeFeedPrefs,
     pub status: String,
+    pub status_is_error: bool,
     status_expires_at: Option<Instant>,
     pub input_mode: InputMode,
     pub overlay: Option<Overlay>,
@@ -501,6 +558,8 @@ pub struct App {
     /// Composer text kept across Esc and failed sends, restored when the
     /// composer reopens for the same target.
     saved_draft: Option<ComposerState>,
+    /// Draft waiting to be opened in $EDITOR by the run loop.
+    editor_request: Option<ComposerState>,
     pub unread_notifications: u64,
     consecutive_poll_failures: u32,
     events_tx: UnboundedSender<AppEvent>,
@@ -574,12 +633,14 @@ impl App {
             active_feed: 0,
             home_feed_prefs,
             status,
+            status_is_error: false,
             status_expires_at: Some(now + Duration::from_secs(2)),
             input_mode: InputMode::Normal,
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
             saved_draft: None,
+            editor_request: None,
             unread_notifications: 0,
             consecutive_poll_failures: 0,
             events_tx,
@@ -632,6 +693,7 @@ impl App {
 
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+        self.status_is_error = false;
         self.status_expires_at = Some(Instant::now() + STATUS_TTL);
     }
 
@@ -639,6 +701,7 @@ impl App {
     /// easy to miss for a post that did not send.
     pub fn set_error_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+        self.status_is_error = true;
         self.status_expires_at = Some(Instant::now() + ERROR_STATUS_TTL);
     }
 
@@ -913,6 +976,7 @@ impl App {
             OpenLink(Option<LinkRef>),
             OpenUri(Option<String>),
             CloseComposer(ComposerState),
+            SwitchTo(usize),
             PlayVideo(Option<PreviewVideo>),
             SubmitComposer(Option<ComposerState>),
             DeletePost(String),
@@ -977,6 +1041,22 @@ impl App {
                 }
                 _ => {}
             },
+            Some(Overlay::Switcher(state)) => {
+                let total = self.feeds.len() + self.accounts.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => action = Action::Close,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        state.selected = (state.selected + 1).min(total.saturating_sub(1));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        action = Action::SwitchTo(state.selected)
+                    }
+                    _ => {}
+                }
+            }
             Some(Overlay::ConfirmDelete(state)) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     action = Action::DeletePost(state.uri.clone());
@@ -988,6 +1068,19 @@ impl App {
                 KeyCode::Esc => action = Action::CloseComposer(state.clone()),
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     action = Action::SubmitComposer(Some(state.clone()));
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Hand the draft to $EDITOR (mutt/git style); the run
+                    // loop owns the terminal, so it performs the suspend.
+                    self.editor_request = Some(state.clone());
+                    action = Action::Close;
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    delete_last_word(&mut state.buffer);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let keep = state.buffer.rfind('\n').map_or(0, |index| index + 1);
+                    state.buffer.truncate(keep);
                 }
                 KeyCode::Enter => state.buffer.push('\n'),
                 KeyCode::Backspace => {
@@ -1014,6 +1107,19 @@ impl App {
                 }
             }
             Action::SwitchAccount(delta) => self.switch_account_delta(delta).await?,
+            Action::SwitchTo(index) => {
+                self.overlay = None;
+                if index < self.feeds.len() {
+                    let delta = index as isize - self.active_feed as isize;
+                    if delta != 0 {
+                        self.switch_feed_delta(delta).await?;
+                    }
+                } else if let Some(account) = self.accounts.get(index - self.feeds.len()).cloned()
+                    && account.session.did != self.client.session().did
+                {
+                    self.queue_account_switch(account);
+                }
+            }
             Action::SwitchFeed(delta) => self.switch_feed_delta(delta).await?,
             Action::OpenLink(link) => {
                 if let Some(link) = link {
@@ -1068,6 +1174,11 @@ impl App {
             Action::PageDown => self.nav.current_mut().move_by(10),
             Action::PageUp => self.nav.current_mut().move_by(-10),
             Action::OpenMenu => self.overlay = Some(Overlay::Menu(MenuState::default())),
+            Action::OpenSwitcher => {
+                self.overlay = Some(Overlay::Switcher(SwitcherState {
+                    selected: self.active_feed,
+                }));
+            }
             Action::PreviewMedia => self.open_media_overlay_for_selected().await?,
             Action::OpenLinks => self.open_links_for_selected(),
             Action::PreviousFeed => self.switch_feed_delta(-1).await?,
@@ -1390,6 +1501,7 @@ impl App {
             let result = async {
                 let root = client.list_notifications(None, 50).await?;
                 let (items, cursor, _) = notification_items(&root);
+                let items = enrich_notifications(&mut client, items).await;
                 let seen_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
                 let seen_result = client.update_seen(&seen_at).await;
                 Ok::<_, anyhow::Error>(NotificationsLoadData {
@@ -2333,14 +2445,14 @@ impl App {
                 self.spawn_event(async move {
                     // Deliberately no updateSeen here: reading history is
                     // not the same as acknowledging new notifications.
-                    let result = client
-                        .list_notifications(Some(&cursor), 50)
-                        .await
-                        .map(|root| {
-                            let (items, cursor, _) = notification_items(&root);
-                            (items, cursor)
-                        })
-                        .map_err(|error| format!("{error:#}"));
+                    let result = async {
+                        let root = client.list_notifications(Some(&cursor), 50).await?;
+                        let (items, cursor, _) = notification_items(&root);
+                        let items = enrich_notifications(&mut client, items).await;
+                        Ok::<_, anyhow::Error>((items, cursor))
+                    }
+                    .await
+                    .map_err(|error| format!("{error:#}"));
                     AppEvent::NotificationsPageLoaded {
                         request_id: id,
                         account_did,
@@ -2544,6 +2656,39 @@ fn append_page(
     }
 }
 
+fn delete_last_word(buffer: &mut String) {
+    let trimmed = buffer.trim_end_matches([' ', '\t']).len();
+    buffer.truncate(trimmed);
+    let start = buffer
+        .rfind(|c: char| c.is_whitespace())
+        .map_or(0, |index| index + 1);
+    buffer.truncate(start);
+}
+
+/// Suspends the TUI, edits `text` in $VISUAL/$EDITOR (vi if unset) and
+/// returns the result. Errors leave the draft untouched.
+fn edit_externally(text: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!("at-tui-draft-{}.txt", std::process::id()));
+    // Trailing newline like git/mutt drafts; editors expect one.
+    std::fs::write(&path, format!("{text}\n"))?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(&path)
+        .status();
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(status) if status.success() => Ok(edited?.trim_end_matches('\n').to_owned()),
+        Ok(status) => Err(anyhow::anyhow!("{program} exited with {status}")),
+        Err(error) => Err(anyhow::anyhow!("could not run {program}: {error}")),
+    }
+}
+
 pub fn post_grapheme_count(text: &str) -> usize {
     use unicode_segmentation::UnicodeSegmentation;
     text.graphemes(true).count()
@@ -2587,6 +2732,21 @@ fn new_items_before_current(
         }
     }
     new_items
+}
+
+/// Attaches the liked/reposted post's text (best effort) and folds repeated
+/// likes/reposts/follows into single rows.
+async fn enrich_notifications(
+    client: &mut BskyClient,
+    mut items: Vec<NotificationItem>,
+) -> Vec<NotificationItem> {
+    let uris = crate::model::notification_subject_uris(&items);
+    if !uris.is_empty()
+        && let Ok(posts) = client.get_posts(&uris).await
+    {
+        crate::model::attach_subject_texts(&mut items, &posts);
+    }
+    crate::model::group_notifications(items)
 }
 
 /// Best effort: saved feeds keep their rkey labels if the lookup fails.
@@ -2650,6 +2810,8 @@ pub async fn run_tui(
         MediaCache::new(true, requested_protocol)?
     };
 
+    let handle = client.session().handle;
+    terminal.draw(|frame| ui::render_splash(frame, &handle))?;
     let mut app = App::bootstrap(client, media).await?;
     let mut dirty = true;
     let mut status_was_visible = app.visible_status().is_some();
@@ -2687,6 +2849,31 @@ pub async fn run_tui(
         }
         if app.should_quit {
             break;
+        }
+        if let Some(mut draft) = app.editor_request.take() {
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            let edited = edit_externally(&draft.buffer);
+            enable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste
+            )?;
+            terminal.clear()?;
+            match edited {
+                Ok(text) => draft.buffer = text,
+                Err(error) => app.set_error_status(format!("Editor failed: {error:#}")),
+            }
+            app.overlay = Some(Overlay::Composer(draft));
+            dirty = true;
+            continue;
         }
         let poll_timeout = if app.video_playing() || app.has_pending_tasks() {
             Duration::from_millis(50)
@@ -3085,6 +3272,15 @@ mod tests {
         assert_eq!(app.active_feed, 0);
         assert_eq!(ui::current_location_label(&app), "Following");
         assert_eq!(app.nav.current().items[0].uri(), "home");
+    }
+
+    #[test]
+    fn readline_word_delete_in_composer() {
+        let mut buffer = "hello brave  new world  ".to_owned();
+        delete_last_word(&mut buffer);
+        assert_eq!(buffer, "hello brave  new ");
+        delete_last_word(&mut buffer);
+        assert_eq!(buffer, "hello brave  ");
     }
 
     #[test]
@@ -3498,16 +3694,17 @@ mod tests {
         assert_eq!(normal_action_for_key(key(KeyCode::Char('U'))), None);
         assert_eq!(normal_action_for_key(key(KeyCode::Char('c'))), None);
 
-        assert!(
-            normal_key_help_lines()
-                .iter()
-                .any(|line| line.contains("P profile") && line.contains("N notifications"))
-        );
-        assert!(
-            normal_key_help_lines()
-                .iter()
-                .any(|line| line.contains("F follow") && line.contains("f like"))
-        );
+        let documented = |key: &str, label: &str| {
+            key_help_groups().iter().any(|(_, rows)| {
+                rows.iter()
+                    .any(|(keys, text)| keys.split(' ').any(|k| k == key) && text.contains(label))
+            })
+        };
+        assert!(documented("P", "profile"));
+        assert!(documented("N", "notifications"));
+        assert!(documented("F", "follow"));
+        assert!(documented("f", "like"));
+        assert!(documented("Tab", "feeds"));
     }
 
     #[tokio::test]
@@ -3602,8 +3799,7 @@ mod tests {
 
         assert_eq!(ui::current_location_label(&app), "Thread @bob.test");
         let line = line_text(&ui::status_left_line(&app, 200));
-        assert!(line.contains("Thread @bob.test"));
-        assert!(!line.contains("Following"));
+        assert!(line.contains("Following › Thread @bob.test"), "{line}");
     }
 
     #[test]
@@ -3618,8 +3814,8 @@ mod tests {
         assert!(!narrow.contains("Loaded a surprisingly long status message"));
 
         let right = ui::status_right_line(&app);
-        assert_eq!(line_text(&right), " 1/1 ");
-        assert_eq!(ui::line_width(&right), 5);
+        assert_eq!(line_text(&right), "1/1  ? help ");
+        assert_eq!(ui::line_width(&right), 12);
     }
 
     fn line_text(line: &ratatui::text::Line<'_>) -> String {
@@ -3922,12 +4118,14 @@ mod tests {
             active_feed: 0,
             home_feed_prefs: HomeFeedPrefs::default(),
             status: String::new(),
+            status_is_error: false,
             status_expires_at: None,
             input_mode: InputMode::Normal,
             overlay: None,
             should_quit: false,
             pending_new_items: Vec::new(),
             saved_draft: None,
+            editor_request: None,
             unread_notifications: 0,
             consecutive_poll_failures: 0,
             events_tx,
@@ -3997,6 +4195,8 @@ mod tests {
             indexed_at: "2026-05-22T00:00:00Z".into(),
             is_read: false,
             target,
+            others: Vec::new(),
+            subject_text: None,
         }
     }
 }

@@ -60,6 +60,10 @@ pub struct NotificationItem {
     pub indexed_at: String,
     pub is_read: bool,
     pub target: NotificationTarget,
+    /// Other actors folded into this row by `group_notifications`.
+    pub others: Vec<String>,
+    /// Text of the post this notification is about (likes, reposts).
+    pub subject_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +536,76 @@ pub fn notification_items(root: &Value) -> (Vec<NotificationItem>, Option<String
     (items, cursor, seen_at)
 }
 
+/// Folds likes/reposts of the same post (and follows) into one row, the way
+/// the official client does: "Alice, Bob and 10 others liked your post".
+/// Rows keep the position of their most recent member.
+pub fn group_notifications(items: Vec<NotificationItem>) -> Vec<NotificationItem> {
+    let mut grouped: Vec<NotificationItem> = Vec::new();
+    for item in items {
+        let groupable = matches!(
+            item.reason,
+            NotificationReason::Like
+                | NotificationReason::Repost
+                | NotificationReason::LikeViaRepost
+                | NotificationReason::RepostViaRepost
+                | NotificationReason::Follow
+        );
+        let existing = groupable
+            .then(|| {
+                grouped.iter_mut().find(|row| {
+                    row.reason == item.reason && row.reason_subject == item.reason_subject
+                })
+            })
+            .flatten();
+        match existing {
+            Some(row) => {
+                let name = if item.author_name.trim().is_empty() {
+                    format!("@{}", item.author_handle)
+                } else {
+                    item.author_name.clone()
+                };
+                row.others.push(name);
+                row.is_read &= item.is_read;
+            }
+            None => grouped.push(item),
+        }
+    }
+    grouped
+}
+
+/// Fills `subject_text` from an `app.bsky.feed.getPosts` response.
+pub fn attach_subject_texts(items: &mut [NotificationItem], posts: &Value) {
+    let texts = posts
+        .get("posts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|post| Some((string_field(post, "uri")?, post_text(post))))
+        .collect::<std::collections::HashMap<_, _>>();
+    for item in items {
+        if let Some(subject) = &item.reason_subject
+            && let Some(text) = texts.get(subject)
+            && !text.trim().is_empty()
+        {
+            item.subject_text = Some(text.clone());
+        }
+    }
+}
+
+pub fn notification_subject_uris(items: &[NotificationItem]) -> Vec<String> {
+    let mut uris = Vec::new();
+    for item in items {
+        if item.text.trim().is_empty()
+            && let Some(subject) = &item.reason_subject
+            && subject.contains("/app.bsky.feed.post/")
+            && !uris.contains(subject)
+        {
+            uris.push(subject.clone());
+        }
+    }
+    uris
+}
+
 fn saved_feed_uris(root: &Value) -> Vec<String> {
     let mut uris = Vec::new();
     for pref in root
@@ -724,6 +798,8 @@ fn notification_item(value: &Value) -> NotificationItem {
         indexed_at: string_field(value, "indexedAt").unwrap_or_default(),
         is_read: bool_field(value, "isRead").unwrap_or(false),
         target,
+        others: Vec::new(),
+        subject_text: None,
     }
 }
 
@@ -880,18 +956,18 @@ fn post_union_uri(value: &Value) -> Option<String> {
     string_field(value, "uri")
 }
 
+/// Ancestors render flat at depth 0 (one connected column down to the
+/// opened post) instead of a staircase that runs off a narrow terminal.
 fn flatten_thread_parents(node: &Value, items: &mut Vec<FeedItem>) -> usize {
     let Some(parent) = node.get("parent") else {
         return 0;
     };
 
-    let depth = flatten_thread_parents(parent, items);
+    flatten_thread_parents(parent, items);
     if let Some(post) = thread_post(parent) {
-        items.push(feed_item_from_post(post, depth));
-        depth + 1
-    } else {
-        depth
+        items.push(feed_item_from_post(post, 0));
     }
+    0
 }
 
 fn flatten_thread(node: &Value, depth: usize, items: &mut Vec<FeedItem>) {
@@ -1824,6 +1900,40 @@ mod tests {
     }
 
     #[test]
+    fn groups_likes_on_the_same_post_and_attaches_subject_text() {
+        let root = json!({"notifications": [
+            {"uri": "l1", "cid": "c", "author": {"handle": "a.test", "displayName": "Ann"}, "reason": "like", "reasonSubject": "at://me/app.bsky.feed.post/1", "isRead": false, "indexedAt": "2026-05-22T00:03:00Z"},
+            {"uri": "f1", "cid": "c", "author": {"did": "did:plc:f", "handle": "f.test"}, "reason": "follow", "isRead": true, "indexedAt": "2026-05-22T00:02:30Z"},
+            {"uri": "l2", "cid": "c", "author": {"handle": "b.test", "displayName": "Ben"}, "reason": "like", "reasonSubject": "at://me/app.bsky.feed.post/1", "isRead": true, "indexedAt": "2026-05-22T00:02:00Z"},
+            {"uri": "r1", "cid": "c", "author": {"handle": "c.test"}, "reason": "reply", "reasonSubject": "at://me/app.bsky.feed.post/1", "record": {"text": "nice"}, "isRead": true, "indexedAt": "2026-05-22T00:01:00Z"},
+            {"uri": "l3", "cid": "c", "author": {"handle": "d.test"}, "reason": "like", "reasonSubject": "at://me/app.bsky.feed.post/2", "isRead": true, "indexedAt": "2026-05-22T00:00:00Z"}
+        ]});
+        let (mut items, _, _) = notification_items(&root);
+        assert_eq!(
+            notification_subject_uris(&items),
+            vec![
+                "at://me/app.bsky.feed.post/1",
+                "at://me/app.bsky.feed.post/2"
+            ]
+        );
+        attach_subject_texts(
+            &mut items,
+            &json!({"posts": [{"uri": "at://me/app.bsky.feed.post/1", "record": {"text": "my post"}}]}),
+        );
+
+        let rows = group_notifications(items);
+
+        let summary = rows
+            .iter()
+            .map(|row| (row.uri.as_str(), row.others.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(summary, vec![("l1", 1), ("f1", 0), ("r1", 0), ("l3", 0)]);
+        assert_eq!(rows[0].others, vec!["Ben"]);
+        assert!(!rows[0].is_read, "a group is unread if any member is");
+        assert_eq!(rows[0].subject_text.as_deref(), Some("my post"));
+    }
+
+    #[test]
     fn saved_feeds_take_generator_display_names() {
         let mut sources = vec![
             FeedSource::home(),
@@ -2070,7 +2180,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             uris,
-            vec![("root", 0), ("parent", 1), ("selected", 2), ("reply", 3)]
+            vec![("root", 0), ("parent", 0), ("selected", 0), ("reply", 1)]
         );
     }
 
