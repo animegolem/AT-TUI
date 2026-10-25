@@ -1067,8 +1067,11 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::BackOrQuit => {
+                let cancelled = self.cancel_pending_opens();
                 if self.nav.pop() {
                     self.set_status("Back");
+                } else if cancelled {
+                    self.set_status("Cancelled");
                 } else {
                     self.should_quit = true;
                 }
@@ -1119,15 +1122,21 @@ impl App {
                 }
             }
             Action::Back => {
+                let cancelled = self.cancel_pending_opens();
                 if self.nav.pop() {
                     self.set_status("Back");
+                } else if cancelled {
+                    self.set_status("Cancelled");
                 } else {
                     self.set_status("Already at timeline");
                 }
             }
             Action::Escape => {
+                let cancelled = self.cancel_pending_opens();
                 if self.nav.pop() {
                     self.set_status("Back");
+                } else if cancelled {
+                    self.set_status("Cancelled");
                 } else {
                     self.open_menu();
                 }
@@ -1139,6 +1148,16 @@ impl App {
             Action::Reload => self.reload_current().await?,
         }
         Ok(())
+    }
+
+    /// Going back abandons any thread, profile or notifications load still in
+    /// flight, so a late result can't push you back into a view you left (or
+    /// reload a view you're no longer on). Returns whether one was pending.
+    fn cancel_pending_opens(&mut self) -> bool {
+        // `|`, not `||`: every slot must be cleared, not just the first.
+        self.pending_thread.take().is_some()
+            | self.pending_profile.take().is_some()
+            | self.pending_notifications.take().is_some()
     }
 
     fn open_menu(&mut self) {
@@ -3196,6 +3215,62 @@ mod tests {
             .unwrap();
         assert!(app.overlay.is_none());
         assert!(app.pending_feed.is_none());
+    }
+
+    #[tokio::test]
+    async fn backing_out_before_a_thread_lands_stays_out() {
+        let mut item = item("post", "hello");
+        item.cid = Some("cid".into());
+        let mut app = app_with_items(vec![item]);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // Enter starts a thread load; h at the root abandons it.
+        app.handle_key(press(KeyCode::Enter)).await.unwrap();
+        let request_id = app.pending_thread.expect("thread load queued");
+        app.handle_key(press(KeyCode::Char('h'))).await.unwrap();
+        assert_eq!(app.status, "Cancelled");
+
+        // The late result is ignored instead of pushing the thread.
+        app.apply_event(AppEvent::ThreadLoaded {
+            request_id,
+            action: ThreadAction::OpenThread {
+                selected_uri: "post".into(),
+                title: "Thread".into(),
+                kind: ViewKind::Thread {
+                    root_uri: "post".into(),
+                },
+            },
+            result: Ok(vec![item_with_cid("post")]),
+        })
+        .unwrap();
+        assert_eq!(app.nav.depth(), 1);
+        assert!(!app.has_pending_tasks());
+    }
+
+    #[tokio::test]
+    async fn q_with_a_pending_open_cancels_instead_of_quitting() {
+        let mut app = app_with_items(vec![item("post", "hello")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.pending_notifications.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.should_quit);
+        assert!(app.pending_notifications.is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.should_quit);
+    }
+
+    fn item_with_cid(uri: &str) -> FeedItem {
+        let mut feed_item = item(uri, "text");
+        feed_item.cid = Some("cid".into());
+        feed_item
     }
 
     #[test]
