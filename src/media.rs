@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -83,6 +84,8 @@ impl PreviewImageSource {
 
 const IMAGE_CACHE_CAP: usize = 48;
 const VIDEO_CACHE_CAP: usize = 4;
+const DISK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const DISK_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub struct MediaCache {
     enabled: bool,
@@ -131,6 +134,12 @@ impl MediaCache {
         let cache_dir = dirs.cache_dir().join("images");
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("could not create {}", cache_dir.display()))?;
+        // Prefetch writes every nearby thumbnail to disk; without pruning a
+        // daily driver grows the cache without bound.
+        let prune_dir = cache_dir.clone();
+        std::thread::spawn(move || {
+            let _ = prune_disk_cache(&prune_dir, DISK_CACHE_MAX_AGE, DISK_CACHE_MAX_BYTES);
+        });
 
         let picker = if enabled {
             let mut picker = match requested {
@@ -503,7 +512,14 @@ async fn read_cached_image(path: &Path) -> Option<DynamicImage> {
     tokio::task::spawn_blocking(move || {
         let bytes = fs::read(&path).ok()?;
         match image::load_from_memory(&bytes) {
-            Ok(image) => Some(image),
+            Ok(image) => {
+                // mtime doubles as last-use time for pruning.
+                let _ = fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(SystemTime::now()));
+                Some(image)
+            }
             Err(_) => {
                 // Corrupt cache entry: drop it and fall back to the network.
                 let _ = fs::remove_file(&path);
@@ -578,6 +594,71 @@ impl VideoLoadJob {
             })
             .collect()
     }
+}
+
+struct CacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+/// Drops cache entries (image files and per-video frame directories) unused
+/// for `max_age`, then the least recently used until under `max_bytes`.
+fn prune_disk_cache(dir: &Path, max_age: Duration, max_bytes: u64) -> std::io::Result<usize> {
+    let mut entries = Vec::new();
+    collect_cache_entries(dir, &mut entries)?;
+    let videos = dir.join("videos");
+    if videos.is_dir() {
+        collect_cache_entries(&videos, &mut entries)?;
+    }
+
+    let now = SystemTime::now();
+    entries.sort_by_key(|entry| entry.modified);
+    let mut total: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let mut removed = 0;
+    for entry in entries {
+        let stale = now
+            .duration_since(entry.modified)
+            .is_ok_and(|age| age > max_age);
+        if !stale && total <= max_bytes {
+            continue;
+        }
+        let result = if entry.path.is_dir() {
+            fs::remove_dir_all(&entry.path)
+        } else {
+            fs::remove_file(&entry.path)
+        };
+        if result.is_ok() {
+            total = total.saturating_sub(entry.bytes);
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn collect_cache_entries(dir: &Path, entries: &mut Vec<CacheEntry>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if path.file_name().is_some_and(|name| name == "videos") {
+            continue;
+        }
+        let bytes = if metadata.is_dir() {
+            fs::read_dir(&path)?
+                .filter_map(|file| file.ok()?.metadata().ok())
+                .map(|meta| meta.len())
+                .sum()
+        } else {
+            metadata.len()
+        };
+        entries.push(CacheEntry {
+            path,
+            bytes,
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+    Ok(())
 }
 
 fn preview_image_from_ref(
@@ -789,6 +870,36 @@ mod tests {
 
         assert!(read_cached_image(&path).await.is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn prunes_stale_and_oversized_disk_cache_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: usize, age_days: u64| {
+            let path = dir.path().join(name);
+            fs::write(&path, vec![0u8; bytes]).unwrap();
+            let when = SystemTime::now() - Duration::from_secs(age_days * 24 * 60 * 60);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        write("ancient.img", 10, 90);
+        write("older.img", 600, 3);
+        write("newer.img", 600, 1);
+        fs::create_dir_all(dir.path().join("videos/abc")).unwrap();
+        fs::write(dir.path().join("videos/abc/frame_0001.jpg"), vec![0u8; 10]).unwrap();
+
+        let removed =
+            prune_disk_cache(dir.path(), Duration::from_secs(30 * 24 * 60 * 60), 1000).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!dir.path().join("ancient.img").exists());
+        assert!(!dir.path().join("older.img").exists());
+        assert!(dir.path().join("newer.img").exists());
+        assert!(dir.path().join("videos/abc").exists());
     }
 
     #[test]

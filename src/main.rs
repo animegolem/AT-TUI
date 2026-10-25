@@ -84,6 +84,8 @@ async fn main() -> Result<()> {
                 Some(handle) => handle,
                 None => prompt("Handle or email: ")?,
             };
+            // People type handles the way they read them: "@alice.bsky.social".
+            let handle = handle.trim().trim_start_matches('@').to_owned();
             let app_password = match app_password {
                 Some(app_password) => app_password,
                 None => rpassword::prompt_password("App password: ")?,

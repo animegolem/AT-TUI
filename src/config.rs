@@ -208,6 +208,11 @@ impl SessionStore {
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
 
+        // Write-then-rename: the refresh token lives here, and a crash
+        // halfway through a truncating write would force a re-login.
+        let temp_path = self
+            .config_path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
 
@@ -218,12 +223,15 @@ impl SessionStore {
         }
 
         let mut file = options
-            .open(&self.config_path)
-            .with_context(|| format!("could not open {}", self.config_path.display()))?;
-        let body = serde_json::to_vec_pretty(config)?;
+            .open(&temp_path)
+            .with_context(|| format!("could not open {}", temp_path.display()))?;
+        let mut body = serde_json::to_vec_pretty(config)?;
+        body.push(b'\n');
         file.write_all(&body)
-            .with_context(|| format!("could not write {}", self.config_path.display()))?;
-        file.write_all(b"\n")?;
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("could not write {}", temp_path.display()))?;
+        fs::rename(&temp_path, &self.config_path)
+            .with_context(|| format!("could not replace {}", self.config_path.display()))?;
         Ok(())
     }
 }
@@ -332,6 +340,36 @@ mod tests {
         assert_eq!(config.accounts[0].label, "main");
         assert_eq!(config.accounts[0].session.access_jwt, "new-access");
         assert_eq!(config.accounts[0].session.refresh_jwt, "new-refresh");
+    }
+
+    #[test]
+    fn save_replaces_file_atomically_with_private_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.json");
+        let store = SessionStore::from_path(path.clone());
+        let session = Session {
+            service: "https://bsky.social".into(),
+            handle: "alice.test".into(),
+            did: "did:plc:alice".into(),
+            access_jwt: "access".into(),
+            refresh_jwt: "refresh".into(),
+        };
+
+        store.save(&session).unwrap();
+        store.save(&session).unwrap();
+
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != "accounts.json")
+            .count();
+        assert_eq!(leftovers, 0, "temp file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
